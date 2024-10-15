@@ -797,14 +797,16 @@ def match_activation(search_activation, all_activations):
         raise ValueError("No matching vector found in the larger tensor.")
 
 
-def get_activation_color(value, min_value, max_value):
+def get_activation_color(value):
+    min_value = -1
+    max_value = 1
     normalized_value = (value - min_value) / (max_value - min_value) if max_value > min_value else 0
     red = int(255 * (1 - normalized_value))
     green = int(255 * normalized_value)
     return f"rgb({red},{green},0)"
 
 if __name__ == "__main__":
-    input_idx, token_idx = 0, 1
+    input_idx = 0
 
     for token_idx in range(16):
         title = highlight_string(tokens[TRAIN_SIZE + input_idx], token_idx)
@@ -823,9 +825,9 @@ if __name__ == "__main__":
         for a, i in sorted_activations_indices:
             atom_input_idx, atom_token_idx = match_activation(atoms[i], normed_activations)
             highlighted_string = highlight_string(tokens[atom_input_idx], atom_token_idx)
-            color = get_activation_color(a, min_activation, max_activation)
+            color = get_activation_color(a)
             activation_text = Text(f"{a:.2f}", style=color)
-            table.add_row(activation_text, highlighted_string)
+            table.add_row(atom_input_idx, activation_text, highlighted_string)
 
         console.print(table)
 
