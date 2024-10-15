@@ -232,6 +232,7 @@ def update_plot(
 
 
 TRAIN_SIZE = 10_000
+OMP_L0 = 8
 
 if MAIN:
     warnings.filterwarnings("ignore")
@@ -242,7 +243,6 @@ if MAIN:
         dim=2
     ).unsqueeze(2)
 
-    omp_l0 = 8
 
     try:
         atoms = torch.load(f"data/{model_name}/atoms.pt")
@@ -277,7 +277,7 @@ if MAIN:
             batch_activations = remaining_activations[:batch_size]
             remaining_activations = remaining_activations[batch_size:]
 
-            coefs, indices = omp_pytorch(atoms, batch_activations, omp_l0)
+            coefs, indices = omp_pytorch(atoms, batch_activations, OMP_L0)
             selected_atoms = atoms[indices]
             recon = torch.bmm(coefs.unsqueeze(1), selected_atoms).squeeze(1)
             loss = ((batch_activations - recon) ** 2).sum(dim=1)
@@ -347,7 +347,7 @@ if MAIN:
             flattened_batch = batch.flatten(end_dim=1)
 
             omp_batch = flattened_batch / flattened_batch.norm(dim=1).unsqueeze(1)
-            coefs, indices = omp_pytorch(atoms, omp_batch, omp_l0)
+            coefs, indices = omp_pytorch(atoms, omp_batch, OMP_L0)
             omp_activations.extend(coefs.cpu().tolist())
             omp_indices.extend(indices.cpu().tolist())
             selected_atoms = atoms[indices]
@@ -532,10 +532,10 @@ if __name__ == "__main__":
     sae_activations = sae_activations / sae_activations.max()
 
     omp_indices = omp_indices.reshape(
-        test_activations.size(0), test_activations.size(1), omp_l0
+        test_activations.size(0), test_activations.size(1), OMP_L0
     )
     omp_activations = omp_activations.reshape(
-        test_activations.size(0), test_activations.size(1), omp_l0
+        test_activations.size(0), test_activations.size(1), OMP_L0
     )
     omp_activations = np.clip(omp_activations, -1, 1)
     omp_features_array = np.array(omp_features)
@@ -827,7 +827,7 @@ if __name__ == "__main__":
             highlighted_string = highlight_string(tokens[atom_input_idx], atom_token_idx)
             color = get_activation_color(a)
             activation_text = Text(f"{a:.2f}", style=color)
-            table.add_row(atom_input_idx, activation_text, highlighted_string)
+            table.add_row(str(atom_input_idx), activation_text, highlighted_string)
 
         console.print(table)
 
