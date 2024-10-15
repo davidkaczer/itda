@@ -56,7 +56,7 @@ if MAIN:
 if MAIN:
 
     os.makedirs("data", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
+    os.makedirs(f"data/{model_name}", exist_ok=True)
 
 # %%
 # test the hypothesis that SAE features relate to text patterns requiring a
@@ -83,7 +83,7 @@ if __name__ == "__main__":
 
         def add_activations(acts, hook=None):
             model_activations.append(acts)
-        
+
         model.remove_all_hook_fns()
         model.add_hook(saes[0].cfg.hook_name, add_activations)
 
@@ -228,29 +228,26 @@ def update_plot(
     axes[1].set_xlabel("Plot Update Interval")
 
     plt.tight_layout()
-    plt.savefig("data/losses_and_ratio.png")
+    plt.savefig(f"data/{model_name}/losses_and_ratio.png")
 
 
-TRAIN_SIZE = 0
-# TRAIN_SIZE = 10_000
+TRAIN_SIZE = 10_000
 
 if MAIN:
     warnings.filterwarnings("ignore")
 
-    train_activations = model_activations
-    # train_activations = model_activations[:TRAIN_SIZE]
-    # test_activations = model_activations[TRAIN_SIZE:]
-    test_activations = model_activations
+    train_activations = model_activations[:TRAIN_SIZE]
+    test_activations = model_activations[TRAIN_SIZE:]
+    normed_activations = train_activations / train_activations.norm(
+        dim=2
+    ).unsqueeze(2)
 
     omp_l0 = 8
 
     try:
-        atoms = torch.load("data/atoms.pt")
-        atom_indices = torch.load("data/atom_indices.pt")
+        atoms = torch.load(f"data/{model_name}/atoms.pt")
+        atom_indices = torch.load(f"data/{model_name}/atom_indices.pt")
     except FileNotFoundError:
-        normed_activations = train_activations / train_activations.norm(
-            dim=2
-        ).unsqueeze(2)
         atoms = torch.cat(
             [
                 normed_activations[:, 0].unique(dim=0),
@@ -323,9 +320,9 @@ if MAIN:
 
         pbar.close()
 
-        torch.save(atoms, "data/atoms.pt")
-        torch.save(atom_indices, "data/atom_indices.pt")
-        with open("data/losses.pkl", "wb") as f:
+        torch.save(atoms, f"data/{model_name}/atoms.pt")
+        torch.save(atom_indices, f"data/{model_name}/atom_indices.pt")
+        with open(f"data/{model_name}/losses.pkl", "wb") as f:
             pickle.dump(losses, f)
 
 
@@ -335,14 +332,12 @@ if MAIN:
     sae = saes[5]
 
     try:
-        raise FileNotFoundError()
-        omp_losses = pickle.load(open(f"data/omp_losses.pkl", "rb"))
-        sae_losses = pickle.load(open(f"data/sae_losses.pkl", "rb"))
+        omp_losses = pickle.load(open(f"data/{model_name}/omp_losses.pkl", "rb"))
+        sae_losses = pickle.load(open(f"data/{model_name}/sae_losses.pkl", "rb"))
         # TODO: get these in a separate loop during evaluation
-        omp_activations = torch.load(f"data/omp_activations.pt")
-        omp_indices = torch.load(f"data/omp_indices.pt")
+        omp_activations = torch.load(f"data/{model_name}/omp_activations.pt")
+        omp_indices = torch.load(f"data/{model_name}/omp_indices.pt")
     except (pickle.UnpicklingError, FileNotFoundError) as e:
-        print(e)
         BATCH_SIZE = 32
         omp_losses = []
         omp_indices = []
@@ -376,12 +371,12 @@ if MAIN:
         omp_activations = np.array(omp_activations)
         omp_indices = np.array(omp_indices)
 
-        with open(f"data/omp_losses.pkl", "wb") as f:
+        with open(f"data/{model_name}/omp_losses.pkl", "wb") as f:
             pickle.dump(omp_losses, f)
-        with open(f"data/sae_losses.pkl", "wb") as f:
+        with open(f"data/{model_name}/sae_losses.pkl", "wb") as f:
             pickle.dump(sae_losses, f)
-        torch.save(omp_activations, f"data/omp_activations.pt")
-        torch.save(omp_indices, f"data/omp_indices.pt")
+        torch.save(omp_activations, f"data/{model_name}/omp_activations.pt")
+        torch.save(omp_indices, f"data/{model_name}/omp_indices.pt")
 
     omp_loss = np.mean(omp_losses)
     sae_loss = np.mean(sae_losses)
@@ -439,6 +434,17 @@ def get_strings(acts):
     return input_strings
 
 
+def highlight_string(tokens, idx):
+    str = ""
+    for i, token in enumerate(tokens):
+        token_str = model.to_string([token]).replace("\n", "")
+        if i == idx:
+            str += f"<<<{token_str}>>>"
+        else:
+            str += f"{token_str}"
+    return str
+
+
 def get_strings_activations(acts, tokens, n=20):
     non_zero_indices = np.argwhere(acts != 0)
     zero_indices = np.argwhere(acts == 0)
@@ -463,15 +469,6 @@ def get_strings_activations(acts, tokens, n=20):
             f"Not enough activations found to sample {n} values. Found {non_zero_indices.shape[0]} activations."
         )
 
-    def highlight_string(tokens, idx):
-        str = ""
-        for i, token in enumerate(tokens):
-            token_str = model.to_string([token]).replace("\n", "")
-            if i == idx:
-                str += f"<<<{token_str}>>>"
-            else:
-                str += f"{token_str}"
-        return str
 
     sample_strs, sample_acts = [], []
     for inp, tok in idxs[:-1]:
@@ -569,6 +566,9 @@ if __name__ == "__main__":
 
 # %%
 
+# TODO: this section depends on the specific model, but is a huge pain to update
+# as it's all manual. Trust for now I guess?
+
 OMP_SOURCE = 0
 SAE_SOURCE = 1
 
@@ -578,9 +578,9 @@ INTERPRETABLE = 2
 
 if MAIN:
     try:
-        with open("data/all_tests.pkl", "rb") as f:
+        with open(f"data/{model_name}/all_tests.pkl", "rb") as f:
             all_tests = pickle.load(f)
-        with open("data/source.pkl", "rb") as f:
+        with open(f"data/{model_name}/source.pkl", "rb") as f:
             source = pickle.load(f)
     except FileNotFoundError:
         source = [0] * len(omp_tests) + [1] * len(sae_tests)
@@ -590,9 +590,9 @@ if MAIN:
         random.shuffle(shuffled_tests)
         all_tests, source = zip(*shuffled_tests)
 
-        with open("data/all_tests.pkl", "wb") as f:
+        with open(f"data/{model_name}/all_tests.pkl", "wb") as f:
             pickle.dump(all_tests, f)
-        with open("data/source.pkl", "wb") as f:
+        with open(f"data/{model_name}/source.pkl", "wb") as f:
             pickle.dump(source, f)
 
     for i, t in enumerate(all_tests):
@@ -767,6 +767,71 @@ if MAIN:
     console.print(table)
 
 # %%
+
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
+
+def match_activation(search_activation, all_activations):
+    if all_activations.shape[-1] != search_activation.shape[0]:
+        raise ValueError("Target tensor dimensions do not match the last dimension of the larger tensor.")
+    
+    reshaped_tensor = all_activations.view(-1, all_activations.shape[-1])
+    matches = torch.all(reshaped_tensor == search_activation, dim=1)
+    matching_indices_flat = torch.nonzero(matches, as_tuple=False).squeeze()
+
+    if matching_indices_flat.numel() > 0:
+        try:
+            first_match_index = matching_indices_flat[0]
+        except IndexError:
+            first_match_index = matching_indices_flat
+        batch_index = torch.div(first_match_index, all_activations.shape[1], rounding_mode='floor')
+        sequence_index = first_match_index % all_activations.shape[1]
+        return batch_index.item(), sequence_index.item()
+    else:
+        raise ValueError("No matching vector found in the larger tensor.")
+
+
+def get_activation_color(value, min_value, max_value):
+    normalized_value = (value - min_value) / (max_value - min_value) if max_value > min_value else 0
+    red = int(255 * (1 - normalized_value))
+    green = int(255 * normalized_value)
+    return f"rgb({red},{green},0)"
+
+if __name__ == "__main__":
+    input_idx, token_idx = 0, 1
+
+    for token_idx in range(16):
+        title = highlight_string(tokens[TRAIN_SIZE + input_idx], token_idx)
+
+        table = Table(title=title)
+        table.add_column("Activation", justify="right")
+        table.add_column("String")
+
+        indices = omp_indices[input_idx][token_idx]
+        activations = omp_activations[input_idx][token_idx]
+
+        sorted_activations_indices = sorted(zip(activations, indices), key=lambda x: x[0], reverse=True)
+        min_activation = min(activations)
+        max_activation = max(activations)
+
+        for a, i in sorted_activations_indices:
+            atom_input_idx, atom_token_idx = match_activation(atoms[i], normed_activations)
+            highlighted_string = highlight_string(tokens[atom_input_idx], atom_token_idx)
+            color = get_activation_color(a, min_activation, max_activation)
+            activation_text = Text(f"{a:.2f}", style=color)
+            table.add_row(activation_text, highlighted_string)
+
+        console.print(table)
+
+
+
+# %%
 # TODO: Move this into a config file and recycle the key
 openai.api_key = "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"
 
@@ -798,22 +863,22 @@ openai.api_key = "sk-proj-Mkv2hr6m6kV08rfm-oGWQ9EWnJX4awWG0mgPOwQHZpbywbBg0lbwkV
 
 # if __name__ == "__main__":
 #     # save the tests for later
-#     with open("data/omp_tests.pkl", "wb") as f:
+#     with open(f"data/{model_name}/omp_tests.pkl", "wb") as f:
 #         pickle.dump(omp_tests, f)
-#     with open("data/sae_tests.pkl", "wb") as f:
+#     with open(f"data/{model_name}/sae_tests.pkl", "wb") as f:
 #         pickle.dump(sae_tests, f)
 
 #     try:
-#         omp_predictions = pickle.load(open("data/omp_predictions.pkl", "rb"))
-#         sae_predictions = pickle.load(open("data/sae_predictions.pkl", "rb"))
+#         omp_predictions = pickle.load(open(f"data/{model_name}/omp_predictions.pkl", "rb"))
+#         sae_predictions = pickle.load(open(f"data/{model_name}/sae_predictions.pkl", "rb"))
 #     except FileNotFoundError:
 #         omp_predictions = predict_activation(omp_tests)
 #         sae_predictions = predict_activation(sae_tests)
 
 #         # save the predictions
-#         with open("data/omp_predictions.pkl", "wb") as f:
+#         with open(f"data/{model_name}/omp_predictions.pkl", "wb") as f:
 #             pickle.dump(omp_predictions, f)
-#         with open("data/sae_predictions.pkl", "wb") as f:
+#         with open(f"data/{model_name}/sae_predictions.pkl", "wb") as f:
 #             pickle.dump(sae_predictions, f)
 
 #     omp_predictions = np.array(omp_predictions)
