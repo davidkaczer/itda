@@ -263,6 +263,18 @@ elif page == "test_samples":
     atom_index = int(params.get("atom_index", [0])[0])
     st.title(f"Test Samples for Atom {atom_index}")
 
+    # Provide UI control to select the atom index
+    atom_index = st.number_input(
+        "Atom index",
+        min_value=0,
+        max_value=omp_indices.max(),
+        value=atom_index,
+        step=1,
+    )
+
+    # Update the query parameters based on user input
+    st.query_params.atom_index = atom_index
+
     # Compute activations for this atom
     mask = omp_indices == atom_index
     feature_activations = omp_activations * mask
@@ -309,5 +321,6 @@ elif page == "test_samples":
         '<a href="?page=activation_interface" target="_self">Back to Activation Interface</a>',
         unsafe_allow_html=True,
     )
+
 else:
     st.error("Invalid page")
