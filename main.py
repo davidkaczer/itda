@@ -834,8 +834,8 @@ if __name__ == "__main__":
 
 
 # %%
-# TODO: Move this into a config file and recycle the key
-openai.api_key = "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"
+# TODO: Move this into a config file
+openai.api_key = "..."
 
 
 # # TODO: This is slow - convert to a batch job?
