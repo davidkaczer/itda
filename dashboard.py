@@ -155,7 +155,6 @@ tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 # Read query parameters
 params = st.query_params
 page = params.get("page", "activation_interface")
-print(page)
 
 if page == "activation_interface":
     # Activation Interface Page
@@ -196,7 +195,7 @@ if page == "activation_interface":
 
     # Get the title
     title = highlight_string(tokens[TRAIN_SIZE + input_idx], token_idx, tokenizer)
-    st.subheader(f"Selected Token: {title}")
+    st.subheader(title)
 
     # Build rows
     rows = []
@@ -223,15 +222,13 @@ if page == "activation_interface":
             st.write(f"Error: {e}")
             continue
 
-    header_col1, header_col2, header_col3, header_col4 = st.columns(4)
+    header_col1, header_col2, header_col3 = st.columns([1, 1, 10])
 
     with header_col1:
-        st.markdown("**Input Index**")
+        st.markdown("**Index**")
     with header_col2:
-        st.markdown("**Atom Index**")
-    with header_col3:
         st.markdown("**Activation**")
-    with header_col4:
+    with header_col3:
         st.markdown("**String**")
 
     # Create rows for each entry in the data
