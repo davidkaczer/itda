@@ -1,35 +1,62 @@
 # %%
 import pickle
+import random
+import os
 import warnings
 
 import matplotlib.pyplot as plt
-import pandas as pd
 import numpy as np
+import openai
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn.functional as F
-from rich import print
+from rich import print as rprint
+from rich.console import Console
+from rich.table import Table
 from rich.text import Text
 from sklearn.linear_model import orthogonal_mp
 from sklearn.preprocessing import QuantileTransformer
 from torch import nn
 from tqdm import tqdm
 
-from meta_saes.sae import load_feature_splitting_saes
+from meta_saes.sae import load_feature_splitting_saes, load_gemma_sae
 
 # %%
 
 MAIN = __name__ == "__main__"
+
+# model_name = "gemma2"
+model_name = "gpt2"
 
 if MAIN:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, saes, token_dataset = load_feature_splitting_saes(
-        device=device,
-        saes_idxs=list(range(1, 9)),
-    )
+    if model_name == "gpt2":
+        model, saes, token_dataset = load_feature_splitting_saes(
+            device=device,
+            saes_idxs=list(range(1, 9)),
+        )
+    elif model_name == "gemma2":
+        model, saes, token_dataset = load_gemma_sae(
+            release="gemma-scope-2b-pt-res",
+            sae_id="layer_12/width_16k/average_l0_41",
+            device=device,
+        )
+    else:
+        raise ValueError("Invalid model")
+
     torch.set_grad_enabled(False)
+
+# %%
+
+# create the data and model directories
+if MAIN:
+
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("models", exist_ok=True)
 
 # %%
 # test the hypothesis that SAE features relate to text patterns requiring a
@@ -50,23 +77,27 @@ if __name__ == "__main__":
     tokens = torch.stack([s["tokens"] for s in token_dataset])[:, :SEQ_LEN].to(device)
 
     try:
-        model_activations = torch.load("data/model_activations.pt")
+        model_activations = torch.load(f"data/{model_name}/model_activations.pt")
     except FileNotFoundError:
         model_activations = []
+
+        def add_activations(acts, hook=None):
+            model_activations.append(acts)
+        
+        model.remove_all_hook_fns()
+        model.add_hook(saes[0].cfg.hook_name, add_activations)
+
         for batch in tqdm(torch.split(tokens, BATCH_SIZE), desc="Model"):
-            model_activations.append(
-                model.run_with_cache(batch)[1][saes[0].cfg.hook_name]
-            )
+            model(batch)
         model_activations = torch.cat(model_activations)
-        torch.save(model_activations, "data/model_activations.pt")
-    print(model_activations.shape)
+        torch.save(model_activations, f"data/{model_name}/model_activations.pt")
 
     fig, axs = plt.subplots(2, 4, figsize=(20, 10))
 
     for i, sae in enumerate(saes):
         try:
             mean_acts = torch.load(
-                f"data/mean_acts_{sae.W_dec.size(0)}.pt", weights_only=True
+                f"data/{model_name}/mean_acts_{sae.W_dec.size(0)}.pt", weights_only=True
             )
         except FileNotFoundError:
             mean_acts = torch.zeros(SEQ_LEN, sae.W_dec.size(0))
@@ -76,7 +107,7 @@ if __name__ == "__main__":
                 sae_acts = (sae.encode(model_acts) > 0).float().sum(dim=0).cpu()
                 mean_acts += sae_acts
             mean_acts /= len(tokens)
-            torch.save(mean_acts, f"data/mean_acts_{sae.W_dec.size(0)}.pt")
+            torch.save(mean_acts, f"data/{model_name}/mean_acts_{sae.W_dec.size(0)}.pt")
 
         normed = mean_acts / mean_acts.sum(dim=0)
         ordered_rows = sort_rows_by_weighted_mean(normed.T)
@@ -90,6 +121,41 @@ if __name__ == "__main__":
 
     plt.tight_layout()
     plt.show()
+
+# %%
+
+if MAIN:
+    cs = []
+    for sae in tqdm(saes):
+        W_dec = F.normalize(sae.W_dec, p=2, dim=-1)
+        acts_norm = F.normalize(model_activations, p=2, dim=-1)
+
+        n = W_dec.size(0)
+        m = acts_norm.size(0)
+
+        batch_size = 256
+        maxes = []
+        for i in range(0, n, batch_size):
+            W_dec_batch = W_dec[i : i + batch_size]
+            m = (
+                torch.mm(W_dec_batch, acts_norm.flatten(end_dim=1).t())
+                .max(dim=-1)
+                .values
+            )
+            maxes.append(m)
+        maxes = torch.cat(maxes)
+        cs.append(maxes.cpu().numpy())
+
+    plt.figure(figsize=(10, 6))
+    for i, c in enumerate(cs):
+        sns.kdeplot(c, bw_adjust=1.0, label=f"SAE {i+1}", alpha=0.3)
+    plt.title("Cosine Similarity between SAE Decoder Directions and Model Activations")
+    plt.xlabel("Cosine Similarity")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
 
 # %%
 
@@ -165,11 +231,16 @@ def update_plot(
     plt.savefig("data/losses_and_ratio.png")
 
 
+TRAIN_SIZE = 0
+# TRAIN_SIZE = 10_000
+
 if MAIN:
     warnings.filterwarnings("ignore")
 
-    train_activations = model_activations[:10000]
-    test_activations = model_activations[10000:]
+    train_activations = model_activations
+    # train_activations = model_activations[:TRAIN_SIZE]
+    # test_activations = model_activations[TRAIN_SIZE:]
+    test_activations = model_activations
 
     omp_l0 = 8
 
@@ -261,11 +332,13 @@ if MAIN:
 # %%
 
 if MAIN:
-    sae = saes[-1]
+    sae = saes[5]
 
     try:
+        raise FileNotFoundError()
         omp_losses = pickle.load(open(f"data/omp_losses.pkl", "rb"))
         sae_losses = pickle.load(open(f"data/sae_losses.pkl", "rb"))
+        # TODO: get these in a separate loop during evaluation
         omp_activations = torch.load(f"data/omp_activations.pt")
         omp_indices = torch.load(f"data/omp_indices.pt")
     except (pickle.UnpicklingError, FileNotFoundError) as e:
@@ -315,66 +388,433 @@ if MAIN:
     print(f"OMP Loss: {omp_loss}")
     print(f"SAE Loss: {sae_loss}")
 
+
 # %%
 
 
-def highlight_token_to_string(tokens, indices, activations):
-    if activations[0] == 0.:
+def highlight_token_to_string(tokens, index, activation, verbose=True):
+    if activation <= 0.01:
         return
     highlighted_text = Text()
 
     for i, token in enumerate(tokens):
-        token_str = model.to_string([token])
-        if i in indices:
-            activation_index = indices.index(i)
-            activation_value = activations[activation_index]
+        token_str = model.to_string([token]).replace("\n", "")
+        if i == index:
             if token_str.isspace():
                 token_str = "_"
             highlighted_text.append(
-                f"<<<{token_str}>>>[{activation_value:.2f}]", style="bold bright_yellow"
+                f"<<<{token_str}>>>[{activation:.2f}]", style="bold bright_yellow"
             )
         else:
             highlighted_text.append(f"{token_str}")
 
-    print(highlighted_text)
+    if verbose:
+        rprint(highlighted_text)
 
     return highlighted_text.plain
 
 
+def get_strings(acts):
+    input_strings = []
+    for i in range(acts.shape[-1]):
+        active_inputs = (acts.sum(axis=1)[:, i] > 0).nonzero()[0]
+        feature_input_strings = []
+        for active_input in active_inputs:
+            token_idx = np.where(acts[active_input] > 0)[0][0]
+            str = highlight_token_to_string(
+                tokens[int(TRAIN_SIZE) + active_input],
+                token_idx,
+                acts[active_input, token_idx, i],
+                verbose=False,
+            )
+            if str is None:
+                continue
+            feature_input_strings.append((str, acts[active_input, token_idx, i]))
+        # Sort feature_input_strings by activation in descending order
+        feature_input_strings = [
+            x[0]
+            for x in sorted(feature_input_strings, key=lambda x: x[1], reverse=True)
+        ]
+        input_strings.append(feature_input_strings)
+    return input_strings
+
+
+def get_strings_activations(acts, tokens, n=20):
+    non_zero_indices = np.argwhere(acts != 0)
+    zero_indices = np.argwhere(acts == 0)
+
+    num_non_zero = int(n * 0.8)
+    num_zero = n - num_non_zero
+
+    try:
+        non_zero_idxs = non_zero_indices[
+            np.random.choice(
+                non_zero_indices.shape[0], size=num_non_zero, replace=False
+            )
+        ]
+        zero_idxs = zero_indices[
+            np.random.choice(zero_indices.shape[0], size=num_zero, replace=False)
+        ]
+
+        idxs = np.concatenate((non_zero_idxs, zero_idxs))
+        np.random.shuffle(idxs)
+    except ValueError:
+        raise ValueError(
+            f"Not enough activations found to sample {n} values. Found {non_zero_indices.shape[0]} activations."
+        )
+
+    def highlight_string(tokens, idx):
+        str = ""
+        for i, token in enumerate(tokens):
+            token_str = model.to_string([token]).replace("\n", "")
+            if i == idx:
+                str += f"<<<{token_str}>>>"
+            else:
+                str += f"{token_str}"
+        return str
+
+    sample_strs, sample_acts = [], []
+    for inp, tok in idxs[:-1]:
+        act = acts[inp, tok]
+
+        str = highlight_string(tokens[int(TRAIN_SIZE) + inp], tok)
+
+        sample_strs.append(str)
+        sample_acts.append(act)
+
+    test_idx = idxs[-1]
+    test_str = highlight_string(tokens[int(TRAIN_SIZE) + test_idx[0]], test_idx[1])
+    test_act = acts[test_idx[0], test_idx[1]]
+
+    sample_strs, sample_acts = zip(
+        *sorted(zip(sample_strs, sample_acts), key=lambda x: x[1], reverse=True)
+    )
+
+    return sample_strs, sample_acts, test_str, test_act
+
+
+def generate_test_samples(activations, feature_sample_count, tokens, verbose=False):
+    tests = []
+    for i in range(feature_sample_count):
+        try:
+            sample_strs, sample_acts, test_str, test_act = get_strings_activations(
+                activations[:, :, i], tokens, n=20
+            )
+
+            if verbose:
+                for a, s in zip(sample_acts, sample_strs):
+                    print(f"({a:.2f}) {s}")
+                print(f"Test: ({test_act:.2f}) {test_str}")
+                print("\n\n\n")
+
+            tests.append((sample_strs, sample_acts, test_str, test_act))
+        except ValueError as e:
+            if verbose:
+                print(e)
+            continue
+    return tests
+
+
+# XXX: MAJOR CONCERN: We only use the features where at least 20 activations are
+# found. This ignores infrequently activating latents, which could be
+# uninterpretable.
 if __name__ == "__main__":
-    sae = saes[0]
+    random.seed(42)
+    np.random.seed(42)
 
-    # uncomment to use the SAE instead
-    # omp_indices = []
-    # omp_activations = []
-    # for batch in torch.split(test_activations, BATCH_SIZE):
-    #     a = sae.encode(batch)
-    #     omp_activations.append(a.topk(omp_l0).values)
-    #     omp_indices.append(a.topk(omp_l0).indices)
-    # omp_activations = torch.cat(omp_activations).cpu().numpy()
-    # omp_indices = torch.cat(omp_indices).cpu().numpy()
+    feature_sample_count = 100
+    sae_features = random.sample(range(sae.W_dec.size(0)), feature_sample_count)
 
-    reshaped_indices = omp_indices.reshape(
+    feature, count = np.unique(omp_indices, return_counts=True)
+    omp_features = random.sample(range(atoms.size(0)), feature_sample_count)
+
+    sae_activations = []
+    for batch in torch.split(test_activations, BATCH_SIZE):
+        sae_activations.append(sae.encode(batch)[:, :, sae_features].cpu())
+    sae_activations = torch.cat(sae_activations, dim=0).cpu().numpy()
+    sae_activations = sae_activations / sae_activations.max()
+
+    omp_indices = omp_indices.reshape(
         test_activations.size(0), test_activations.size(1), omp_l0
     )
-    reshaped_activations = omp_activations.reshape(
+    omp_activations = omp_activations.reshape(
         test_activations.size(0), test_activations.size(1), omp_l0
     )
-    result = np.where(reshaped_indices[:, :, :] == 0)
-    activations = reshaped_activations[result[0], result[1], result[2]]
+    omp_activations = np.clip(omp_activations, -1, 1)
+    omp_features_array = np.array(omp_features)
+    dense_omp_activations = np.zeros((6957, 16, len(omp_features_array)))
+    for i, feature in enumerate(omp_features_array):
+        mask = omp_indices == feature
+        feature_activations = omp_activations * mask
+        dense_omp_activations[:, :, i] = np.sum(feature_activations, axis=-1)
 
-    # Sort by activation values in descending order
-    sorted_indices = np.argsort(-activations)
-    sorted_input_indices = result[0][sorted_indices]
-    sorted_token_indices = result[1][sorted_indices]
-    sorted_activations = activations[sorted_indices]
+    dense_omp_activations = dense_omp_activations / dense_omp_activations.max()
+    dense_omp_activations[dense_omp_activations < 0.0] = 0.0
 
-    limit = 0
-    for input_idx, token_idx, activation in zip(
-        sorted_input_indices, sorted_token_indices, sorted_activations
-    ):
-        highlight_token_to_string(tokens[10_000 + input_idx], [token_idx], [activation])
+    verbose = True
+    omp_tests = generate_test_samples(
+        dense_omp_activations, feature_sample_count, tokens, verbose=verbose
+    )
+    omp_actual = np.array([test[3] for test in omp_tests])
+    sae_tests = generate_test_samples(
+        sae_activations, feature_sample_count, tokens, verbose=verbose
+    )
+    sae_actual = np.array([test[3] for test in sae_tests])
 
-        limit += 1
-        if limit > 10:
-            break
+    plt.figure(figsize=(10, 5))
+    plt.hist(omp_actual, bins=20, alpha=0.5, label="OMP actual")
+    plt.hist(sae_actual, bins=20, alpha=0.5, label="SAE actual")
+    plt.title("Distribution of predictions doesn't match")
+    fig.show()
+
+# %%
+
+OMP_SOURCE = 0
+SAE_SOURCE = 1
+
+UNINTERPRETABLE = 0
+SOMEWHAT_INTERPRETABLE = 1
+INTERPRETABLE = 2
+
+if MAIN:
+    try:
+        with open("data/all_tests.pkl", "rb") as f:
+            all_tests = pickle.load(f)
+        with open("data/source.pkl", "rb") as f:
+            source = pickle.load(f)
+    except FileNotFoundError:
+        source = [0] * len(omp_tests) + [1] * len(sae_tests)
+        all_tests = omp_tests + sae_tests
+
+        shuffled_tests = list(zip(all_tests, source))
+        random.shuffle(shuffled_tests)
+        all_tests, source = zip(*shuffled_tests)
+
+        with open("data/all_tests.pkl", "wb") as f:
+            pickle.dump(all_tests, f)
+        with open("data/source.pkl", "wb") as f:
+            pickle.dump(source, f)
+
+    for i, t in enumerate(all_tests):
+        string = "Sample " + str(i) + "\n"
+        for a, s in zip(t[1], t[0]):
+            string += f"{a:.2f} {s}\n"
+        string += f"\n\n"
+        print(string)
+
+    rating = {
+        0: 2,
+        1: 2,
+        2: 2,
+        3: 0,
+        4: 2,
+        5: 2,
+        6: 0,
+        7: 1,
+        8: 2,
+        9: 0,
+        10: 0,
+        11: 2,
+        12: 2,
+        13: 2,
+        14: 2,
+        15: 2,
+        16: 0,
+        17: 2,
+        18: 2,
+        19: 2,
+        20: 1,
+        21: 2,
+        22: 2,
+        23: 1,
+        24: 2,
+        25: 2,
+        26: 0,
+        27: 1,
+        28: 1,
+        29: 2,
+        30: 2,
+        31: 2,
+        32: 2,
+        33: 2,
+        34: 1,
+        35: 0,
+        36: 2,
+        37: 0,
+        38: 2,
+        39: 1,
+        40: 0,
+        41: 0,
+        42: 2,
+        43: 2,
+        44: 2,
+        45: 1,
+        46: 1,
+        47: 1,
+        48: 1,
+        49: 2,
+        50: 2,
+        51: 0,
+        52: 2,
+        53: 2,
+        54: 2,
+        55: 2,
+        56: 1,
+        57: 2,
+        58: 2,
+        59: 1,
+        60: 0,
+        61: 2,
+        62: 1,
+        63: 1,
+        64: 2,
+        65: 0,
+        66: 1,
+        67: 2,
+        68: 0,
+        69: 2,
+        70: 2,
+        71: 2,
+        72: 2,
+        73: 2,
+        74: 2,
+        75: 2,
+        76: 0,
+        77: 2,
+        78: 0,
+        79: 2,
+        80: 2,
+        81: 2,
+        82: 2,
+        83: 1,
+        84: 0,
+        85: 0,
+        86: 1,
+        87: 2,
+        88: 2,
+        89: 1,
+        90: 0,
+        91: 0,
+        92: 0,
+        93: 2,
+        94: 2,
+        95: 1,
+        96: 0,
+        97: 0,
+        98: 2,
+        99: 1,
+        100: 2,
+        101: 1,
+        102: 0,
+        103: 1,
+        104: 2,
+        105: 2,
+        106: 0,
+        107: 2,
+        108: 2,
+        109: 2,
+        110: 2,
+        111: 2,
+        112: 0,
+        113: 2,
+        114: 2,
+        115: 2,
+        116: 2,
+        117: 2,
+        117: 2,
+    }
+
+    interpretability_counts = {
+        OMP_SOURCE: {UNINTERPRETABLE: 0, SOMEWHAT_INTERPRETABLE: 0, INTERPRETABLE: 0},
+        SAE_SOURCE: {UNINTERPRETABLE: 0, SOMEWHAT_INTERPRETABLE: 0, INTERPRETABLE: 0},
+    }
+
+    # group ratings by source
+    ratings_by_source = {OMP_SOURCE: [], SAE_SOURCE: []}
+    for i, r in rating.items():
+        ratings_by_source[source[i]].append(r)
+
+    for source, values in ratings_by_source.items():
+        for value in values:
+            interpretability_counts[source][value] += 1
+
+    # Calculate ratios for each source
+    ratios = {}
+    for source, counts in interpretability_counts.items():
+        total = sum(counts.values())
+        ratios[source] = {key: counts[key] / total for key in counts}
+
+    # Create a rich table
+    console = Console()
+    table = Table(title="Interpretability Ratios by Source")
+
+    table.add_column("Source", justify="center", style="cyan", no_wrap=True)
+    table.add_column("Uninterpretable Ratio", justify="center", style="magenta")
+    table.add_column("Somewhat Interpretable Ratio", justify="center", style="yellow")
+    table.add_column("Interpretable Ratio", justify="center", style="green")
+
+    # Add rows to the table
+    for source, ratio in ratios.items():
+        source_name = "OMP_SOURCE" if source == OMP_SOURCE else "SAE_SOURCE"
+        table.add_row(
+            source_name,
+            f"{ratio[UNINTERPRETABLE]:.2f}",
+            f"{ratio[SOMEWHAT_INTERPRETABLE]:.2f}",
+            f"{ratio[INTERPRETABLE]:.2f}",
+        )
+
+    # Print the table
+    console.print(table)
+
+# %%
+# TODO: Move this into a config file and recycle the key
+openai.api_key = "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"
+
+
+# # TODO: This is slow - convert to a batch job?
+# def predict_activation(test_cases):
+#     predictions = []
+#     for test in tqdm(test_cases):
+#         question = ""
+#         for a, s in zip(test[1], test[0]):
+#             question += f"{a:.2f} {s}\n"
+#         question += f"\n\n{test[2]}"
+#         response = openai.chat.completions.create(
+#             model="gpt-4o-mini",
+#             messages=[
+#                 {
+#                     "role": "system",
+#                     "content": "You are doing auto-interp on SAE features. You will be presented with 20 activation and string pairs, in the string, a single token will be highlighted with <<<>>> brakcets. You will then be provided with another string with a highlighted token. Please predict the activation of that token using 2 decimal places. Respond only with the activation value.",
+#                 },
+#                 {"role": "user", "content": question},
+#             ],
+#             max_tokens=10,
+#             temperature=0.0,
+#         )
+#         answer = response.choices[0].message.content.strip()
+#         predictions.append(float(answer))
+#     return predictions
+
+
+# if __name__ == "__main__":
+#     # save the tests for later
+#     with open("data/omp_tests.pkl", "wb") as f:
+#         pickle.dump(omp_tests, f)
+#     with open("data/sae_tests.pkl", "wb") as f:
+#         pickle.dump(sae_tests, f)
+
+#     try:
+#         omp_predictions = pickle.load(open("data/omp_predictions.pkl", "rb"))
+#         sae_predictions = pickle.load(open("data/sae_predictions.pkl", "rb"))
+#     except FileNotFoundError:
+#         omp_predictions = predict_activation(omp_tests)
+#         sae_predictions = predict_activation(sae_tests)
+
+#         # save the predictions
+#         with open("data/omp_predictions.pkl", "wb") as f:
+#             pickle.dump(omp_predictions, f)
+#         with open("data/sae_predictions.pkl", "wb") as f:
+#             pickle.dump(sae_predictions, f)
+
+#     omp_predictions = np.array(omp_predictions)
+#     sae_predictions = np.array(sae_predictions)
