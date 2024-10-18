@@ -62,8 +62,8 @@ if MAIN:
 # test the hypothesis that SAE features relate to text patterns requiring a
 # certain number of tokens.
 
-BATCH_SIZE = 64
-SEQ_LEN = 16
+SEQ_LEN = 128
+BATCH_SIZE = 1024 // SEQ_LEN
 
 
 def sort_rows_by_weighted_mean(arr):
@@ -107,7 +107,7 @@ if __name__ == "__main__":
             for model_acts in tqdm(
                 torch.split(model_activations, BATCH_SIZE), desc=f"SAE {i+1}"
             ):
-                sae_acts = (sae.encode(model_acts) > 0).float().sum(dim=0).cpu()
+                sae_acts = (sae.encode(model_acts.to(device)) > 0).float().sum(dim=0).cpu()
                 mean_acts += sae_acts
             mean_acts /= len(tokens)
             torch.save(mean_acts, f"data/{model_name}/mean_acts_{sae.W_dec.size(0)}.pt")
@@ -128,26 +128,31 @@ if __name__ == "__main__":
 # %%
 
 if MAIN:
-    cs = []
-    for sae in tqdm(saes):
-        W_dec = F.normalize(sae.W_dec, p=2, dim=-1)
-        acts_norm = F.normalize(model_activations, p=2, dim=-1)
+    try:
+        with open(f"data/{model_name}/cosine_similarities.pkl", "rb") as f:
+            cs = pickle.load(f)
+    except FileNotFoundError:
+        cs = []
+        for sae in tqdm(saes):
+            W_dec = F.normalize(sae.W_dec, p=2, dim=-1)
+            acts_norm = F.normalize(model_activations, p=2, dim=-1).to(device)
 
-        n = W_dec.size(0)
-        m = acts_norm.size(0)
+            n = W_dec.size(0)
+            m = acts_norm.size(0)
 
-        batch_size = 256
-        maxes = []
-        for i in range(0, n, batch_size):
-            W_dec_batch = W_dec[i : i + batch_size]
-            m = (
-                torch.mm(W_dec_batch, acts_norm.flatten(end_dim=1).t())
-                .max(dim=-1)
-                .values
-            )
-            maxes.append(m)
-        maxes = torch.cat(maxes)
-        cs.append(maxes.cpu().numpy())
+            maxes = []
+            for i in range(0, n, BATCH_SIZE):
+                W_dec_batch = W_dec[i : i + BATCH_SIZE]
+                m = (
+                    torch.mm(W_dec_batch, acts_norm.flatten(end_dim=1).t().to(device))
+                    .max(dim=-1)
+                    .values
+                )
+                maxes.append(m)
+            maxes = torch.cat(maxes)
+            cs.append(maxes.cpu().numpy())
+        with open(f"data/{model_name}/cosine_similarities.pkl", "wb") as f:
+            pickle.dump(cs, f)
 
     plt.figure(figsize=(10, 6))
     for i, c in enumerate(cs):
@@ -162,12 +167,70 @@ if MAIN:
 
 # %%
 
+def gp_pytorch(D, x, n_nonzero_coefs, lr=1e-2, n_iterations=100):
+    """
+    Gradient Pursuit implementation in PyTorch.
+
+    Args:
+        D (torch.Tensor): Dictionary matrix (n_atoms, n_features).
+        x (torch.Tensor): Input signal matrix (batch_size, n_features).
+        n_nonzero_coefs (int): Number of non-zero coefficients to select.
+        lr (float): Learning rate for gradient descent.
+        n_iterations (int): Number of iterations for gradient descent.
+
+    Returns:
+        coef (torch.Tensor): Coefficients for the selected atoms (batch_size, n_nonzero_coefs).
+        indices (torch.Tensor): Indices of the selected atoms (batch_size, n_nonzero_coefs).
+    """
+    batch_size, n_features = x.shape
+    n_atoms = D.shape[0]
+    
+    # Initialize variables
+    indices = torch.zeros((batch_size, n_nonzero_coefs), device=D.device, dtype=torch.long)
+    residual = x.clone()
+    selected_atoms = torch.zeros((batch_size, n_nonzero_coefs, n_features), device=D.device)
+    available_atoms = torch.ones((batch_size, n_atoms), dtype=torch.bool, device=D.device)
+    batch_indices = torch.arange(batch_size, device=D.device)
+    
+    coef = torch.zeros((batch_size, n_nonzero_coefs), device=D.device)
+    
+    # Iteratively select atoms and update coefficients using gradient descent
+    for k in range(n_nonzero_coefs):
+        # Step 1: Select the atom most correlated with the residual
+        correlations = torch.matmul(residual, D.T)
+        abs_correlations = torch.abs(correlations)
+        abs_correlations[~available_atoms] = 0
+        idx = torch.argmax(abs_correlations, dim=1)
+        indices[:, k] = idx
+        available_atoms[batch_indices, idx] = False
+        selected_atoms[:, k, :] = D[idx]
+        
+        # Step 2: Perform gradient descent to refine the coefficients
+        for _ in range(n_iterations):
+            # Compute the current reconstruction
+            A = selected_atoms[:, :k + 1, :].transpose(1, 2)
+            recon = torch.bmm(A, coef[:, :k + 1].unsqueeze(2)).squeeze(2)
+            
+            # Calculate residual
+            residual = x - recon
+            
+            # Gradient update: ∇ = -2 * (x - A * coef) * A
+            gradient = -2 * torch.bmm(A.transpose(1, 2), residual.unsqueeze(2)).squeeze(2)
+            
+            # Update coefficients using gradient descent
+            coef[:, :k + 1] -= lr * gradient
+        
+        # Update residual after the gradient updates
+        residual = x - torch.bmm(A, coef[:, :k + 1].unsqueeze(2)).squeeze(2)
+
+    return coef, indices
+
 
 def omp_pytorch(D, x, n_nonzero_coefs):
     batch_size, n_features = x.shape
     n_atoms = D.shape[0]
     indices = torch.zeros(
-        (batch_size, n_nonzero_coefs), dtype=torch.long, device=D.device
+        (batch_size, n_nonzero_coefs), device=D.device, dtype=torch.long
     )
     residual = x.clone()
     selected_atoms = torch.zeros(
@@ -200,6 +263,8 @@ def omp_pytorch(D, x, n_nonzero_coefs):
         recon = torch.bmm(A, coef.unsqueeze(2)).squeeze(2)
         residual = x - recon
     return coef, indices
+
+ito = gp_pytorch
 
 
 def update_plot(
@@ -235,12 +300,14 @@ def update_plot(
 
 
 TRAIN_SIZE = 10_000
-OMP_L0 = 8
+OMP_L0 = 40
+OMP_BATCH_SIZE = 512 
+
 
 if MAIN:
     warnings.filterwarnings("ignore")
 
-    train_activations = model_activations[:TRAIN_SIZE]
+    train_activations = model_activations[:TRAIN_SIZE].to(device)
     test_activations = model_activations[TRAIN_SIZE:]
     normed_activations = train_activations / train_activations.norm(dim=2).unsqueeze(2)
 
@@ -270,16 +337,15 @@ if MAIN:
         ratio_history = []
 
         pbar = tqdm(total=remaining_activations.size(0))
-        batch_size = 1024
         plot_update_interval = 1
         batch_counter = 0
         while remaining_activations.size(0) > 0:
-            batch_activations = remaining_activations[:batch_size]
-            remaining_activations = remaining_activations[batch_size:]
+            batch_activations = remaining_activations[:OMP_BATCH_SIZE]
+            remaining_activations = remaining_activations[OMP_BATCH_SIZE:]
 
-            coefs, indices = omp_pytorch(atoms, batch_activations, OMP_L0)
+            coefs, indices = ito(atoms.float(), batch_activations.float(), OMP_L0)
             selected_atoms = atoms[indices]
-            recon = torch.bmm(coefs.unsqueeze(1), selected_atoms).squeeze(1)
+            recon = torch.bmm(coefs.unsqueeze(1), selected_atoms.float()).squeeze(1)
             loss = ((batch_activations - recon) ** 2).sum(dim=1)
             loss = torch.clamp(loss, 0, 1)
             losses.extend(loss.cpu().tolist())
@@ -296,7 +362,7 @@ if MAIN:
             pbar.update(len(batch_activations))
             batch_counter += 1
 
-            ratio = new_atoms.size(0) / batch_size
+            ratio = new_atoms.size(0) / OMP_BATCH_SIZE
             ratio_history.append(ratio)
 
             if batch_counter % plot_update_interval == 0:
@@ -334,10 +400,9 @@ if MAIN:
     sae = saes[3]
 
     try:
-        raise FileNotFoundError()
         omp_losses = pickle.load(open(f"data/{model_name}/omp_losses.pkl", "rb"))
         sae_losses = pickle.load(open(f"data/{model_name}/sae_losses.pkl", "rb"))
-        sae_losses = pickle.load(open(f"data/{model_name}/omp_sae_losses.pkl", "rb"))
+        omp_sae_losses = pickle.load(open(f"data/{model_name}/omp_sae_losses.pkl", "rb"))
         # TODO: get these in a separate loop during evaluation
         omp_activations = torch.load(f"data/{model_name}/omp_activations.pt")
         omp_indices = torch.load(f"data/{model_name}/omp_indices.pt")
@@ -352,7 +417,7 @@ if MAIN:
             flattened_batch = batch.flatten(end_dim=1)
             omp_batch = flattened_batch / flattened_batch.norm(dim=1).unsqueeze(1)
 
-            coefs, indices = omp_pytorch(atoms, omp_batch, OMP_L0)
+            coefs, indices = ito(atoms, omp_batch, OMP_L0)
             omp_activations.extend(coefs.cpu().tolist())
             omp_indices.extend(indices.cpu().tolist())
             selected_atoms = atoms[indices]
@@ -362,7 +427,7 @@ if MAIN:
             loss = loss[loss < 1]
             omp_losses.extend(loss.cpu().tolist())
 
-            coefs, indices = omp_pytorch(sae.W_dec, omp_batch, OMP_L0)
+            coefs, indices = ito(sae.W_dec, omp_batch, OMP_L0)
             selected_atoms = sae.W_dec[indices]
             omp_recon = torch.bmm(coefs.unsqueeze(1), selected_atoms).squeeze(1)
             loss = ((omp_batch - omp_recon) ** 2).mean(dim=1)
@@ -931,7 +996,7 @@ class OMPSAE:
         shape = x.size()
 
         x = x.view(-1, shape[-1])
-        coefs, indices = omp_pytorch(self.atoms, x, self.l0)
+        coefs, indices = ito(self.atoms, x, self.l0)
         expanded = torch.zeros((x.size(0), self.atoms.size(0)), device=x.device)
         expanded.scatter_(1, indices, coefs)
         expanded = expanded.view(*shape[:-1], -1)
