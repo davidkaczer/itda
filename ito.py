@@ -360,3 +360,26 @@ if __name__ == "__main__":
         torch.save(losses, f"data/{args.model}/{args.ito_fn}_losses.pt")
         torch.save(activations, f"data/{args.model}/{args.ito_fn}_activations.pt")
         torch.save(indices, f"data/{args.model}/{args.ito_fn}_indices.pt")
+
+
+class ITO_SAE:
+    def __init__(self, atoms, l0=8, ito_fn='omp'):
+        self.atoms = atoms
+        self.l0 = l0
+        self.ito = omp_pytorch if ito_fn == OMP else gp_pytorch
+
+    def encode(self, x):
+        norm = x.norm(dim=1).unsqueeze(1)
+
+        x = x / norm
+        shape = x.size()
+
+        x = x.view(-1, shape[-1])
+        coefs, indices = self.ito(self.atoms, x, self.l0)
+        expanded = torch.zeros((x.size(0), self.atoms.size(0)), device=x.device)
+        expanded.scatter_(1, indices, coefs)
+        expanded = expanded.view(*shape[:-1], -1)
+        return expanded
+
+    def decode(self, x, acts):
+        return torch.mm(acts, self.atoms) * x.norm(dim=1).unsqueeze(1)

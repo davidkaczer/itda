@@ -4,6 +4,7 @@ import random
 import os
 import warnings
 
+from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import numpy as np
 import openai
@@ -22,28 +23,33 @@ from tqdm import tqdm
 
 from meta_saes.sae import load_feature_splitting_saes, load_gemma_sae
 
+load_dotenv()
+
 # %%
 
 MAIN = __name__ == "__main__"
 
-# model_name = "gemma2"
-model_name = "gpt2"
+GEMMA2 = "gemma2"
+GPT2 = "gpt2"
+MODEL_NAME = GEMMA2
+# model_name = GPT2
 
 if MAIN:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if model_name == "gpt2":
+    if MODEL_NAME == GPT2:
         model, saes, token_dataset = load_feature_splitting_saes(
             device=device,
             saes_idxs=list(range(1, 9)),
         )
-    elif model_name == "gemma2":
+    elif MODEL_NAME == GEMMA2:
         model, saes, token_dataset = load_gemma_sae(
             release="gemma-scope-2b-pt-res",
             sae_id="layer_12/width_16k/average_l0_41",
             device=device,
+            dataset="NeelNanda/pile-10k",
         )
     else:
         raise ValueError("Invalid model")
@@ -56,14 +62,14 @@ if MAIN:
 if MAIN:
 
     os.makedirs("data", exist_ok=True)
-    os.makedirs(f"data/{model_name}", exist_ok=True)
+    os.makedirs(f"data/{MODEL_NAME}", exist_ok=True)
 
 # %%
 # test the hypothesis that SAE features relate to text patterns requiring a
 # certain number of tokens.
 
 SEQ_LEN = 128
-BATCH_SIZE = 1024 // SEQ_LEN
+BATCH_SIZE = 1024 // SEQ_LEN 
 
 
 def sort_rows_by_weighted_mean(arr):
@@ -77,12 +83,12 @@ if __name__ == "__main__":
     tokens = torch.stack([s["tokens"] for s in token_dataset])[:, :SEQ_LEN].to(device)
 
     try:
-        model_activations = torch.load(f"data/{model_name}/model_activations.pt")
+        model_activations = torch.load(f"data/{MODEL_NAME}/model_activations.pt")
     except FileNotFoundError:
         model_activations = []
 
         def add_activations(acts, hook=None):
-            model_activations.append(acts)
+            model_activations.append(acts.cpu())
 
         model.remove_all_hook_fns()
         model.add_hook(saes[0].cfg.hook_name, add_activations)
@@ -93,14 +99,14 @@ if __name__ == "__main__":
         model.remove_all_hook_fns()
 
         model_activations = torch.cat(model_activations)
-        torch.save(model_activations, f"data/{model_name}/model_activations.pt")
+        torch.save(model_activations, f"data/{MODEL_NAME}/model_activations.pt")
 
     fig, axs = plt.subplots(2, 4, figsize=(20, 10))
 
     for i, sae in enumerate(saes):
         try:
             mean_acts = torch.load(
-                f"data/{model_name}/mean_acts_{sae.W_dec.size(0)}.pt", weights_only=True
+                f"data/{MODEL_NAME}/mean_acts_{sae.W_dec.size(0)}.pt", weights_only=True
             )
         except FileNotFoundError:
             mean_acts = torch.zeros(SEQ_LEN, sae.W_dec.size(0))
@@ -110,7 +116,7 @@ if __name__ == "__main__":
                 sae_acts = (sae.encode(model_acts.to(device)) > 0).float().sum(dim=0).cpu()
                 mean_acts += sae_acts
             mean_acts /= len(tokens)
-            torch.save(mean_acts, f"data/{model_name}/mean_acts_{sae.W_dec.size(0)}.pt")
+            torch.save(mean_acts, f"data/{MODEL_NAME}/mean_acts_{sae.W_dec.size(0)}.pt")
 
         normed = mean_acts / mean_acts.sum(dim=0)
         ordered_rows = sort_rows_by_weighted_mean(normed.T)
@@ -127,9 +133,10 @@ if __name__ == "__main__":
 
 # %%
 
-if MAIN:
+if False:
+# if MAIN:
     try:
-        with open(f"data/{model_name}/cosine_similarities.pkl", "rb") as f:
+        with open(f"data/{MODEL_NAME}/cosine_similarities.pkl", "rb") as f:
             cs = pickle.load(f)
     except FileNotFoundError:
         cs = []
@@ -151,7 +158,7 @@ if MAIN:
                 maxes.append(m)
             maxes = torch.cat(maxes)
             cs.append(maxes.cpu().numpy())
-        with open(f"data/{model_name}/cosine_similarities.pkl", "wb") as f:
+        with open(f"data/{MODEL_NAME}/cosine_similarities.pkl", "wb") as f:
             pickle.dump(cs, f)
 
     plt.figure(figsize=(10, 6))
@@ -165,247 +172,19 @@ if MAIN:
     plt.show()
 
 
-# %%
-
-def gp_pytorch(D, x, n_nonzero_coefs, lr=1e-2, n_iterations=100):
-    """
-    Gradient Pursuit implementation in PyTorch.
-
-    Args:
-        D (torch.Tensor): Dictionary matrix (n_atoms, n_features).
-        x (torch.Tensor): Input signal matrix (batch_size, n_features).
-        n_nonzero_coefs (int): Number of non-zero coefficients to select.
-        lr (float): Learning rate for gradient descent.
-        n_iterations (int): Number of iterations for gradient descent.
-
-    Returns:
-        coef (torch.Tensor): Coefficients for the selected atoms (batch_size, n_nonzero_coefs).
-        indices (torch.Tensor): Indices of the selected atoms (batch_size, n_nonzero_coefs).
-    """
-    batch_size, n_features = x.shape
-    n_atoms = D.shape[0]
-    
-    # Initialize variables
-    indices = torch.zeros((batch_size, n_nonzero_coefs), device=D.device, dtype=torch.long)
-    residual = x.clone()
-    selected_atoms = torch.zeros((batch_size, n_nonzero_coefs, n_features), device=D.device)
-    available_atoms = torch.ones((batch_size, n_atoms), dtype=torch.bool, device=D.device)
-    batch_indices = torch.arange(batch_size, device=D.device)
-    
-    coef = torch.zeros((batch_size, n_nonzero_coefs), device=D.device)
-    
-    # Iteratively select atoms and update coefficients using gradient descent
-    for k in range(n_nonzero_coefs):
-        # Step 1: Select the atom most correlated with the residual
-        correlations = torch.matmul(residual, D.T)
-        abs_correlations = torch.abs(correlations)
-        abs_correlations[~available_atoms] = 0
-        idx = torch.argmax(abs_correlations, dim=1)
-        indices[:, k] = idx
-        available_atoms[batch_indices, idx] = False
-        selected_atoms[:, k, :] = D[idx]
-        
-        # Step 2: Perform gradient descent to refine the coefficients
-        for _ in range(n_iterations):
-            # Compute the current reconstruction
-            A = selected_atoms[:, :k + 1, :].transpose(1, 2)
-            recon = torch.bmm(A, coef[:, :k + 1].unsqueeze(2)).squeeze(2)
-            
-            # Calculate residual
-            residual = x - recon
-            
-            # Gradient update: ∇ = -2 * (x - A * coef) * A
-            gradient = -2 * torch.bmm(A.transpose(1, 2), residual.unsqueeze(2)).squeeze(2)
-            
-            # Update coefficients using gradient descent
-            coef[:, :k + 1] -= lr * gradient
-        
-        # Update residual after the gradient updates
-        residual = x - torch.bmm(A, coef[:, :k + 1].unsqueeze(2)).squeeze(2)
-
-    return coef, indices
-
-
-def omp_pytorch(D, x, n_nonzero_coefs):
-    batch_size, n_features = x.shape
-    n_atoms = D.shape[0]
-    indices = torch.zeros(
-        (batch_size, n_nonzero_coefs), device=D.device, dtype=torch.long
-    )
-    residual = x.clone()
-    selected_atoms = torch.zeros(
-        (batch_size, n_nonzero_coefs, n_features), device=D.device
-    )
-    available_atoms = torch.ones(
-        (batch_size, n_atoms), dtype=torch.bool, device=D.device
-    )
-    batch_indices = torch.arange(batch_size, device=D.device)
-
-    for k in range(n_nonzero_coefs):
-        correlations = torch.matmul(residual, D.T)
-        abs_correlations = torch.abs(correlations)
-        abs_correlations[~available_atoms] = 0
-        idx = torch.argmax(abs_correlations, dim=1)
-        indices[:, k] = idx
-        available_atoms[batch_indices, idx] = False
-        selected_atoms[:, k, :] = D[idx]
-        A = selected_atoms[:, : k + 1, :].transpose(1, 2)
-        B = x.unsqueeze(2)
-        try:
-            coef = torch.linalg.lstsq(A, B).solution
-        except RuntimeError as e:
-            print(f"Least squares solver failed at iteration {k}: {e}")
-            coef = torch.zeros(batch_size, k + 1, 1, device=D.device)
-        coef = coef.squeeze(2)
-        invalid_coefs = torch.isnan(coef) | torch.isinf(coef)
-        if invalid_coefs.any():
-            coef[invalid_coefs] = 0.0
-        recon = torch.bmm(A, coef.unsqueeze(2)).squeeze(2)
-        residual = x - recon
-    return coef, indices
-
-ito = gp_pytorch
-
-
-def update_plot(
-    atoms,
-    losses,
-    atom_start_size,
-    ratio_history,
-    plot_update_interval=10,
-    batch_counter=0,
-):
-    """
-    Update the loss plot and the ratio plot.
-    """
-    window = 100
-    np_losses = np.array(losses)
-    smoothed_losses = np.convolve(np_losses, np.ones(window) / window, mode="valid")
-
-    plt.clf()
-    fig, axes = plt.subplots(2, 1, figsize=(10, 10))
-
-    axes[0].set_title(f"Added {len(atoms)} of {len(losses) + atom_start_size} atoms")
-    axes[0].plot(smoothed_losses)
-    axes[0].set_ylabel("Smoothed Losses")
-    axes[0].set_xlabel("Iterations")
-
-    axes[1].set_title("Ratio of len(atoms) / (len(losses) + atom_start_size)")
-    axes[1].plot(ratio_history)
-    axes[1].set_ylabel("Ratio")
-    axes[1].set_xlabel("Plot Update Interval")
-
-    plt.tight_layout()
-    plt.savefig(f"data/{model_name}/losses_and_ratio.png")
-
-
-TRAIN_SIZE = 10_000
-OMP_L0 = 40
-OMP_BATCH_SIZE = 512 
-
-
-if MAIN:
-    warnings.filterwarnings("ignore")
-
-    train_activations = model_activations[:TRAIN_SIZE].to(device)
-    test_activations = model_activations[TRAIN_SIZE:]
-    normed_activations = train_activations / train_activations.norm(dim=2).unsqueeze(2)
-
-    try:
-        atoms = torch.load(f"data/{model_name}/atoms.pt")
-        atom_indices = torch.load(f"data/{model_name}/atom_indices.pt")
-    except FileNotFoundError:
-        atoms = torch.cat(
-            [
-                normed_activations[:, 0].unique(dim=0),
-                normed_activations[:, 1].unique(dim=0),
-            ],
-            dim=0,
-        )
-        atom_start_size = len(atoms)
-
-        # Initialize atom_indices to track which activations are added
-        atom_indices = torch.arange(atom_start_size).tolist()
-
-        remaining_activations = (
-            normed_activations[:, 2:]
-            .permute(1, 0, 2)
-            .reshape(-1, saes[0].W_dec.size(1))
-        )
-
-        losses = []
-        ratio_history = []
-
-        pbar = tqdm(total=remaining_activations.size(0))
-        plot_update_interval = 1
-        batch_counter = 0
-        while remaining_activations.size(0) > 0:
-            batch_activations = remaining_activations[:OMP_BATCH_SIZE]
-            remaining_activations = remaining_activations[OMP_BATCH_SIZE:]
-
-            coefs, indices = ito(atoms.float(), batch_activations.float(), OMP_L0)
-            selected_atoms = atoms[indices]
-            recon = torch.bmm(coefs.unsqueeze(1), selected_atoms.float()).squeeze(1)
-            loss = ((batch_activations - recon) ** 2).sum(dim=1)
-            loss = torch.clamp(loss, 0, 1)
-            losses.extend(loss.cpu().tolist())
-
-            mask = loss > 0.4
-            new_atoms = batch_activations[mask]
-            if new_atoms.size(0) > 0:
-                atoms = torch.cat([atoms, new_atoms], dim=0)
-                new_indices = torch.arange(
-                    len(atom_indices), len(atom_indices) + new_atoms.size(0)
-                ).tolist()
-                atom_indices.extend(new_indices)
-
-            pbar.update(len(batch_activations))
-            batch_counter += 1
-
-            ratio = new_atoms.size(0) / OMP_BATCH_SIZE
-            ratio_history.append(ratio)
-
-            if batch_counter % plot_update_interval == 0:
-                update_plot(
-                    atoms,
-                    losses,
-                    atom_start_size,
-                    ratio_history,
-                    plot_update_interval,
-                    batch_counter,
-                )
-
-        update_plot(
-            atoms,
-            losses,
-            atom_start_size,
-            ratio_history,
-            plot_update_interval,
-            batch_counter,
-        )
-
-        pbar.close()
-
-        print(f'Trained a model with {len(atoms)} atoms')
-
-        torch.save(atoms, f"data/{model_name}/atoms.pt")
-        torch.save(atom_indices, f"data/{model_name}/atom_indices.pt")
-        with open(f"data/{model_name}/losses.pkl", "wb") as f:
-            pickle.dump(losses, f)
-
 
 # %%
 
 if MAIN:
-    sae = saes[3]
+    sae = saes[3] if MODEL_NAME == GPT2 else saes[0]
 
     try:
-        omp_losses = pickle.load(open(f"data/{model_name}/omp_losses.pkl", "rb"))
-        sae_losses = pickle.load(open(f"data/{model_name}/sae_losses.pkl", "rb"))
-        omp_sae_losses = pickle.load(open(f"data/{model_name}/omp_sae_losses.pkl", "rb"))
+        omp_losses = pickle.load(open(f"data/{MODEL_NAME}/omp_losses.pkl", "rb"))
+        sae_losses = pickle.load(open(f"data/{MODEL_NAME}/sae_losses.pkl", "rb"))
+        omp_sae_losses = pickle.load(open(f"data/{MODEL_NAME}/omp_sae_losses.pkl", "rb"))
         # TODO: get these in a separate loop during evaluation
-        omp_activations = torch.load(f"data/{model_name}/omp_activations.pt")
-        omp_indices = torch.load(f"data/{model_name}/omp_indices.pt")
+        omp_activations = torch.load(f"data/{MODEL_NAME}/omp_activations.pt")
+        omp_indices = torch.load(f"data/{MODEL_NAME}/omp_indices.pt")
     except (pickle.UnpicklingError, FileNotFoundError) as e:
         BATCH_SIZE = 32
         omp_losses = []
@@ -413,49 +192,52 @@ if MAIN:
         omp_activations = []
         sae_losses = []
         omp_sae_losses = []
+
+        W_dec = sae.W_dec.cpu()
         for batch in tqdm(torch.split(test_activations, BATCH_SIZE)):
             flattened_batch = batch.flatten(end_dim=1)
             omp_batch = flattened_batch / flattened_batch.norm(dim=1).unsqueeze(1)
 
             coefs, indices = ito(atoms, omp_batch, OMP_L0)
-            omp_activations.extend(coefs.cpu().tolist())
-            omp_indices.extend(indices.cpu().tolist())
+            omp_activations.extend(coefs.tolist())
+            omp_indices.extend(indices.tolist())
             selected_atoms = atoms[indices]
             omp_recon = torch.bmm(coefs.unsqueeze(1), selected_atoms).squeeze(1)
             loss = ((omp_batch - omp_recon) ** 2).mean(dim=1)
             # can't reconstruct some? removing for now to investigate later
             loss = loss[loss < 1]
-            omp_losses.extend(loss.cpu().tolist())
+            omp_losses.extend(loss.tolist())
 
-            coefs, indices = ito(sae.W_dec, omp_batch, OMP_L0)
-            selected_atoms = sae.W_dec[indices]
+            coefs, indices = ito(W_dec, omp_batch, OMP_L0)
+            selected_atoms = W_dec[indices]
             omp_recon = torch.bmm(coefs.unsqueeze(1), selected_atoms).squeeze(1)
             loss = ((omp_batch - omp_recon) ** 2).mean(dim=1)
             # can't reconstruct some? removing for now to investigate later
             loss = loss[loss < 1]
-            omp_sae_losses.extend(loss.cpu().tolist())
+            omp_sae_losses.extend(loss.tolist())
 
-            sae_recon = sae(flattened_batch)
+            gpu_batch = flattened_batch.to(sae.W_dec.device)
+            sae_recon = sae(gpu_batch)
             loss = (
                 (
-                    flattened_batch / flattened_batch.norm(dim=1).unsqueeze(1)
+                    gpu_batch / gpu_batch.norm(dim=1).unsqueeze(1)
                     - sae_recon / sae_recon.norm(dim=1).unsqueeze(1)
                 )
                 ** 2
             ).mean(dim=1)
-            sae_losses.extend(loss.cpu().tolist())
+            sae_losses.extend(loss.tolist())
 
         omp_activations = np.array(omp_activations)
         omp_indices = np.array(omp_indices)
 
-        with open(f"data/{model_name}/omp_losses.pkl", "wb") as f:
+        with open(f"data/{MODEL_NAME}/omp_losses.pkl", "wb") as f:
             pickle.dump(omp_losses, f)
-        with open(f"data/{model_name}/sae_losses.pkl", "wb") as f:
+        with open(f"data/{MODEL_NAME}/sae_losses.pkl", "wb") as f:
             pickle.dump(sae_losses, f)
-        with open(f"data/{model_name}/omp_sae_losses.pkl", "wb") as f:
+        with open(f"data/{MODEL_NAME}/omp_sae_losses.pkl", "wb") as f:
             pickle.dump(omp_sae_losses, f)
-        torch.save(omp_activations, f"data/{model_name}/omp_activations.pt")
-        torch.save(omp_indices, f"data/{model_name}/omp_indices.pt")
+        torch.save(omp_activations, f"data/{MODEL_NAME}/omp_activations.pt")
+        torch.save(omp_indices, f"data/{MODEL_NAME}/omp_indices.pt")
 
     omp_loss = np.mean(omp_losses)
     sae_loss = np.mean(sae_losses)
@@ -607,7 +389,7 @@ if __name__ == "__main__":
 
     sae_activations = []
     for batch in torch.split(test_activations, BATCH_SIZE):
-        sae_activations.append(sae.encode(batch)[:, :, sae_features].cpu())
+        sae_activations.append(sae.encode(batch.to(sae.W_dec.device))[:, :, sae_features].cpu())
     sae_activations = torch.cat(sae_activations, dim=0).cpu().numpy()
     sae_activations = sae_activations / sae_activations.max()
 
@@ -619,7 +401,7 @@ if __name__ == "__main__":
     )
     omp_activations = np.clip(omp_activations, -1, 1)
     omp_features_array = np.array(omp_features)
-    dense_omp_activations = np.zeros((6957, 16, len(omp_features_array)))
+    dense_omp_activations = np.zeros((omp_activations.shape[0], SEQ_LEN, len(omp_features_array)))
     for i, feature in enumerate(omp_features_array):
         mask = omp_indices == feature
         feature_activations = omp_activations * mask
@@ -658,9 +440,9 @@ INTERPRETABLE = 2
 
 if MAIN:
     try:
-        with open(f"data/{model_name}/all_tests.pkl", "rb") as f:
+        with open(f"data/{MODEL_NAME}/all_tests.pkl", "rb") as f:
             all_tests = pickle.load(f)
-        with open(f"data/{model_name}/source.pkl", "rb") as f:
+        with open(f"data/{MODEL_NAME}/source.pkl", "rb") as f:
             source = pickle.load(f)
     except FileNotFoundError:
         source = [0] * len(omp_tests) + [1] * len(sae_tests)
@@ -670,9 +452,9 @@ if MAIN:
         random.shuffle(shuffled_tests)
         all_tests, source = zip(*shuffled_tests)
 
-        with open(f"data/{model_name}/all_tests.pkl", "wb") as f:
+        with open(f"data/{MODEL_NAME}/all_tests.pkl", "wb") as f:
             pickle.dump(all_tests, f)
-        with open(f"data/{model_name}/source.pkl", "wb") as f:
+        with open(f"data/{MODEL_NAME}/source.pkl", "wb") as f:
             pickle.dump(source, f)
 
     for i, t in enumerate(all_tests):
@@ -848,7 +630,6 @@ if MAIN:
 
 # %%
 
-
 import ipywidgets as widgets
 from IPython.display import display, clear_output
 from rich.console import Console
@@ -981,950 +762,950 @@ openai.api_key = "..."
 
 # %%
 
-from datasets import load_dataset
-
-
-class OMPSAE:
-    def __init__(self, atoms, l0=8):
-        self.atoms = atoms
-        self.l0 = l0
-
-    def encode(self, x):
-        norm = x.norm(dim=1).unsqueeze(1)
-
-        x = x / norm
-        shape = x.size()
-
-        x = x.view(-1, shape[-1])
-        coefs, indices = ito(self.atoms, x, self.l0)
-        expanded = torch.zeros((x.size(0), self.atoms.size(0)), device=x.device)
-        expanded.scatter_(1, indices, coefs)
-        expanded = expanded.view(*shape[:-1], -1)
-        return expanded
-
-    def decode(self, x, acts):
-        return torch.mm(acts, self.atoms) * x.norm(dim=1).unsqueeze(1)
-
-
-def load_huggingface_dataset(dataset_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if dataset_name == "bias_in_bios":
-        dataset = load_dataset("LabHC/bias_in_bios")
-        train_df = pd.DataFrame(dataset["train"])
-        test_df = pd.DataFrame(dataset["test"])
-    elif dataset_name == "amazon_reviews_all_ratings":
-        dataset = load_dataset(
-            "canrager/amazon_reviews_mcauley",
-            config_name="dataset_all_categories_and_ratings_train1000_test250",
-        )
-    elif dataset_name == "amazon_reviews_1and5":
-        dataset = load_dataset(
-            "canrager/amazon_reviews_mcauley_1and5",
-        )
-        train_df = pd.DataFrame(dataset["train"])
-        test_df = pd.DataFrame(dataset["test"])
-    else:
-        raise ValueError(f"Unknown dataset name: {dataset_name}")
-    return train_df, test_df
-
-
-def ensure_shared_keys(train_data: dict, test_data: dict) -> tuple[dict, dict]:
-    # Find keys that are in test but not in train
-    test_only_keys = set(test_data.keys()) - set(train_data.keys())
-
-    # Find keys that are in train but not in test
-    train_only_keys = set(train_data.keys()) - set(test_data.keys())
-
-    # Remove keys from test that are not in train
-    for key in test_only_keys:
-        print(f"Removing {key} from test set")
-        del test_data[key]
-
-    # Remove keys from train that are not in test
-    for key in train_only_keys:
-        print(f"Removing {key} from train set")
-        del train_data[key]
-
-    return train_data, test_data
-
-
-POSITIVE_CLASS_LABEL = 1
-NEGATIVE_CLASS_LABEL = 0
-
-# NOTE: These are going to be hardcoded, and won't change even if the underlying dataset or data labels change.
-# This is a bit confusing, but IMO male_professor / female_nurse is a bit easier to understand than e.g. class1_pos_class2_pos / class1_neg_class2_neg
-PAIRED_CLASS_KEYS = {
-    "male / female": "female_data_only",
-    "professor / nurse": "nurse_data_only",
-    "male_professor / female_nurse": "female_nurse_data_only",
-}
-
-profession_dict = {
-    "accountant": 0,
-    "architect": 1,
-    "attorney": 2,
-    "chiropractor": 3,
-    "comedian": 4,
-    "composer": 5,
-    "dentist": 6,
-    "dietitian": 7,
-    "dj": 8,
-    "filmmaker": 9,
-    "interior_designer": 10,
-    "journalist": 11,
-    "model": 12,
-    "nurse": 13,
-    "painter": 14,
-    "paralegal": 15,
-    "pastor": 16,
-    "personal_trainer": 17,
-    "photographer": 18,
-    "physician": 19,
-    "poet": 20,
-    "professor": 21,
-    "psychologist": 22,
-    "rapper": 23,
-    "software_engineer": 24,
-    "surgeon": 25,
-    "teacher": 26,
-    "yoga_teacher": 27,
-}
-profession_int_to_str = {v: k for k, v in profession_dict.items()}
-
-gender_dict = {
-    "male": 0,
-    "female": 1,
-}
-
-# From the original dataset
-amazon_category_dict = {
-    "All_Beauty": 0,
-    "Toys_and_Games": 1,
-    "Cell_Phones_and_Accessories": 2,
-    "Industrial_and_Scientific": 3,
-    "Gift_Cards": 4,
-    "Musical_Instruments": 5,
-    "Electronics": 6,
-    "Handmade_Products": 7,
-    "Arts_Crafts_and_Sewing": 8,
-    "Baby_Products": 9,
-    "Health_and_Household": 10,
-    "Office_Products": 11,
-    "Digital_Music": 12,
-    "Grocery_and_Gourmet_Food": 13,
-    "Sports_and_Outdoors": 14,
-    "Home_and_Kitchen": 15,
-    "Subscription_Boxes": 16,
-    "Tools_and_Home_Improvement": 17,
-    "Pet_Supplies": 18,
-    "Video_Games": 19,
-    "Kindle_Store": 20,
-    "Clothing_Shoes_and_Jewelry": 21,
-    "Patio_Lawn_and_Garden": 22,
-    "Unknown": 23,
-    "Books": 24,
-    "Automotive": 25,
-    "CDs_and_Vinyl": 26,
-    "Beauty_and_Personal_Care": 27,
-    "Amazon_Fashion": 28,
-    "Magazine_Subscriptions": 29,
-    "Software": 30,
-    "Health_and_Personal_Care": 31,
-    "Appliances": 32,
-    "Movies_and_TV": 33,
-}
-amazon_int_to_str = {v: k for k, v in amazon_category_dict.items()}
-
-
-amazon_rating_dict = {
-    1.0: 1.0,
-    5.0: 5.0,
-}
-
-dataset_metadata = {
-    "bias_in_bios": {
-        "text_column_name": "hard_text",
-        "column1_name": "profession",
-        "column2_name": "gender",
-        "column2_autointerp_name": "gender",
-        "column1_mapping": profession_dict,
-        "column2_mapping": gender_dict,
-    },
-    "amazon_reviews_1and5": {
-        "text_column_name": "text",
-        "column1_name": "category",
-        "column2_name": "rating",
-        "column2_autointerp_name": "Amazon Review Sentiment",
-        "column1_mapping": amazon_category_dict,
-        "column2_mapping": amazon_rating_dict,
-    },
-}
-
-chosen_classes_per_dataset = {
-    "bias_in_bios": ["0", "1", "2", "6", "9"],
-    "amazon_reviews_1and5": ["1", "2", "3", "5", "6"],
-}
-
-def get_balanced_dataset(
-    df: pd.DataFrame,
-    dataset_name: str,
-    min_samples_per_quadrant: int,
-    random_seed: int,
-) -> dict[str, list[str]]:
-    """Returns a dataset of, in the case of bias_in_bios, a key of profession idx,
-    and a value of a list of bios (strs) of len min_samples_per_quadrant * 2."""
-
-    text_column_name = dataset_metadata[dataset_name]["text_column_name"]
-    column1_name = dataset_metadata[dataset_name]["column1_name"]
-    column2_name = dataset_metadata[dataset_name]["column2_name"]
-
-    balanced_df_list = []
-
-    for profession in tqdm(df[column1_name].unique()):
-        prof_df = df[df[column1_name] == profession]
-        min_count = prof_df[column2_name].value_counts().min()
-
-        unique_groups = prof_df[column2_name].unique()
-        if len(unique_groups) < 2:
-            continue  # Skip professions with less than two groups
-
-        if min_count < min_samples_per_quadrant:
-            continue
-
-        balanced_prof_df = pd.concat(
-            [
-                group.sample(n=min_samples_per_quadrant, random_state=random_seed)
-                for _, group in prof_df.groupby(column2_name)
-            ]
-        ).reset_index(drop=True)
-        balanced_df_list.append(balanced_prof_df)
-
-    balanced_df = pd.concat(balanced_df_list).reset_index(drop=True)
-    grouped = balanced_df.groupby(column1_name)[text_column_name].apply(list)
-
-    str_data = {str(key): texts for key, texts in grouped.items()}
-
-    balanced_data = {label: texts for label, texts in str_data.items()}
-
-    for key in balanced_data.keys():
-        balanced_data[key] = balanced_data[key][: min_samples_per_quadrant * 2]
-        assert len(balanced_data[key]) == min_samples_per_quadrant * 2
-
-    return balanced_data
-
-def get_multi_label_train_test_data(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    dataset_name: str,
-    train_set_size: int,
-    test_set_size: int,
-    random_seed: int,
-) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """Returns a dict of [class_name, list[str]]"""
-    # 4 is because male / gender for each profession
-    minimum_train_samples_per_quadrant = train_set_size // 4
-    minimum_test_samples_per_quadrant = test_set_size // 4
-
-    train_data = get_balanced_dataset(
-        train_df,
-        dataset_name,
-        minimum_train_samples_per_quadrant,
-        random_seed=random_seed,
-    )
-    test_data = get_balanced_dataset(
-        test_df,
-        dataset_name,
-        minimum_test_samples_per_quadrant,
-        random_seed=random_seed,
-    )
-
-    train_data, test_data = ensure_shared_keys(train_data, test_data)
-
-    return train_data, test_data
-
-
-def filter_dataset(
-    data: dict[str, list[str]], chosen_class_indices: list[str]
-) -> dict[str, list[str]]:
-    filtered_data = {}
-    for class_name in chosen_class_indices:
-        filtered_data[class_name] = data[class_name]
-    return filtered_data
-
-
-from transformers import AutoTokenizer
-
-
-def tokenize_data(
-    data: dict[str, list[str]], tokenizer: AutoTokenizer, max_length: int, device: str
-) -> dict[str, dict]:
-    tokenized_data = {}
-    for key, texts in tqdm(data.items(), desc="Tokenizing data"):
-        # .data so we have a dict, not a BatchEncoding
-        tokenized_data[key] = (
-            tokenizer(
-                texts,
-                padding="max_length",
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            .to(device)
-            .data
-        )
-    return tokenized_data
-
-import torch
-import torch.nn as nn
-from tqdm import tqdm
-from typing import Callable, Optional
-from jaxtyping import Int, Float, jaxtyped, BFloat16
-from beartype import beartype
-import einops
-from transformer_lens import HookedTransformer
-from sae_lens import SAE
-
-LLM_NAME_TO_BATCH_SIZE = {
-    "gpt2-small": 64,
-    "pythia-70m-deduped": 500,
-    "gemma-2-2b": 32,
-}
-
-LLM_NAME_TO_DTYPE = {
-    "gpt2-small": torch.float32,
-    "pythia-70m-deduped": torch.float32,
-    "gemma-2-2b": torch.bfloat16,
-}
-
-
-@torch.no_grad
-def get_all_llm_activations(
-    tokenized_inputs_dict: dict[str, dict[str, Int[torch.Tensor, "dataset_size seq_len"]]],
-    model: HookedTransformer,
-    batch_size: int,
-    hook_name: str,
-) -> dict[str, Float[torch.Tensor, "dataset_size seq_len d_model"]]:
-    """VERY IMPORTANT NOTE: We zero out masked token activations in this function. Later, we ignore zeroed activations."""
-    all_classes_acts_BLD = {}
-
-    for class_name in tokenized_inputs_dict:
-        all_acts_BLD = []
-        tokenized_inputs = tokenized_inputs_dict[class_name]
-
-        for i in tqdm(
-            range(0, len(tokenized_inputs["input_ids"]), batch_size),
-            desc=f"Collecting activations for class {class_name}",
-        ):
-            tokens_BL = tokenized_inputs["input_ids"][i : i + batch_size]
-            attention_mask_BL = tokenized_inputs["attention_mask"][i : i + batch_size]
-
-            acts_BLD = None
-
-            def activation_hook(resid_BLD: torch.Tensor, hook):
-                nonlocal acts_BLD
-                acts_BLD = resid_BLD
-
-            model.run_with_hooks(
-                tokens_BL, return_type=None, fwd_hooks=[(hook_name, activation_hook)]
-            )
-
-            acts_BLD = acts_BLD * attention_mask_BL[:, :, None]
-            all_acts_BLD.append(acts_BLD)
-
-        all_acts_BLD = torch.cat(all_acts_BLD, dim=0)
-
-        all_classes_acts_BLD[class_name] = all_acts_BLD
-
-    return all_classes_acts_BLD
-
-
-@torch.no_grad
-def create_meaned_model_activations(
-    all_llm_activations_BLD: dict[str, Float[torch.Tensor, "batch_size seq_len d_model"]],
-) -> dict[str, Float[torch.Tensor, "batch_size d_model"]]:
-    """VERY IMPORTANT NOTE: We assume that the activations have been zeroed out for masked tokens."""
-
-    all_llm_activations_BD = {}
-    for class_name in all_llm_activations_BLD:
-        acts_BLD = all_llm_activations_BLD[class_name]
-        dtype = acts_BLD.dtype
-
-        activations_BL = einops.reduce(acts_BLD, "B L D -> B L", "sum")
-        nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
-        nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum")
-
-        meaned_acts_BD = einops.reduce(acts_BLD, "B L D -> B D", "sum") / nonzero_acts_B[:, None]
-        all_llm_activations_BD[class_name] = meaned_acts_BD
-
-    return all_llm_activations_BD
-
-
-@torch.no_grad
-def get_sae_meaned_activations(
-    all_llm_activations_BLD: dict[str, Float[torch.Tensor, "batch_size seq_len d_model"]],
-    sae,
-    sae_batch_size: int,
-    dtype: torch.dtype,
-) -> dict[str, Float[torch.Tensor, "batch_size d_sae"]]:
-    """VERY IMPORTANT NOTE: We assume that the activations have been zeroed out for masked tokens."""
-    all_sae_activations_BF = {}
-    for class_name in all_llm_activations_BLD:
-        all_acts_BLD = all_llm_activations_BLD[class_name]
-
-        all_acts_BF = []
-
-        for i in range(0, len(all_acts_BLD), sae_batch_size):
-            acts_BLD = all_acts_BLD[i : i + sae_batch_size]
-            acts_BLF = sae.encode(acts_BLD)
-
-            activations_BL = einops.reduce(acts_BLD, "B L D -> B L", "sum")
-            nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
-            nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum")
-
-            acts_BLF = acts_BLF * nonzero_acts_BL[:, :, None]
-            acts_BF = einops.reduce(acts_BLF, "B L F -> B F", "sum") / nonzero_acts_B[:, None]
-            acts_BF = acts_BF.to(dtype=dtype)
-
-            all_acts_BF.append(acts_BF)
-
-        all_acts_BF = torch.cat(all_acts_BF, dim=0)
-        all_sae_activations_BF[class_name] = all_acts_BF
-
-    return all_sae_activations_BF
-
-from dataclasses import dataclass, field
-from typing import Optional
-import torch
-
-import copy
-from typing import Optional
-
-import torch
-import torch.nn as nn
-from beartype import beartype
-from jaxtyping import Bool, Float, Int, jaxtyped
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-
-
-class Probe(nn.Module):
-    def __init__(self, activation_dim: int, dtype: torch.dtype):
-        super().__init__()
-        self.net = nn.Linear(activation_dim, 1, bias=True, dtype=dtype)
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
-def prepare_probe_data(
-    all_activations: dict[str, Float[torch.Tensor, "num_datapoints_per_class ... d_model"]],
-    class_name: str,
-    spurious_corr: bool = False,
-) -> tuple[
-    Float[torch.Tensor, "num_datapoints_per_class_x_2 ... d_model"],
-    Int[torch.Tensor, "num_datapoints_per_class_x_2"],
-]:
-    """spurious_corr is for the SHIFT metric. In this case, all_activations has 3 pairs of keys, or 6 total.
-    It's a bit unfortunate to introduce coupling between the metrics, but most of the code is reused between them.
-    The ... means we can have an optional seq_len dimension between num_datapoints_per_class and d_model.
-    """
-    positive_acts_BD = all_activations[class_name]
-    device = positive_acts_BD.device
-
-    num_positive = len(positive_acts_BD)
-
-    if spurious_corr:
-        if class_name in PAIRED_CLASS_KEYS.keys():
-            negative_acts = all_activations[PAIRED_CLASS_KEYS[class_name]]
-        elif class_name in PAIRED_CLASS_KEYS.values():
-            reversed_dict = {v: k for k, v in PAIRED_CLASS_KEYS.items()}
-            negative_acts = all_activations[reversed_dict[class_name]]
-        else:
-            raise ValueError(f"Class {class_name} not found in paired class keys.")
-    else:
-        # Collect all negative class activations and labels
-        negative_acts = []
-        for idx, acts in all_activations.items():
-            if idx != class_name:
-                negative_acts.append(acts)
-
-        negative_acts = torch.cat(negative_acts)
-
-    # Randomly select num_positive samples from negative class
-    indices = torch.randperm(len(negative_acts))[:num_positive]
-    selected_negative_acts_BD = negative_acts[indices]
-
-    assert selected_negative_acts_BD.shape == positive_acts_BD.shape
-
-    # Combine positive and negative samples
-    combined_acts = torch.cat([positive_acts_BD, selected_negative_acts_BD])
-
-    combined_labels = torch.empty(len(combined_acts), dtype=torch.int, device=device)
-    combined_labels[:num_positive] = POSITIVE_CLASS_LABEL
-    combined_labels[num_positive:] = NEGATIVE_CLASS_LABEL
-
-    # Shuffle the combined data
-    shuffle_indices = torch.randperm(len(combined_acts))
-    shuffled_acts = combined_acts[shuffle_indices]
-    shuffled_labels = combined_labels[shuffle_indices]
-
-    return shuffled_acts, shuffled_labels
-
-
-def get_top_k_mean_diff_mask(
-    acts_BD: Float[torch.Tensor, "batch_size d_model"],
-    labels_B: Int[torch.Tensor, "batch_size"],
-    k: int,
-) -> Bool[torch.Tensor, "k"]:
-    positive_mask_B = labels_B == POSITIVE_CLASS_LABEL
-    negative_mask_B = labels_B == NEGATIVE_CLASS_LABEL
-
-    positive_distribution_D = acts_BD[positive_mask_B].mean(dim=0)
-    negative_distribution_D = acts_BD[negative_mask_B].mean(dim=0)
-    distribution_diff_D = (positive_distribution_D - negative_distribution_D).abs()
-    top_k_indices_D = torch.argsort(distribution_diff_D, descending=True)[:k]
-
-    mask_D = torch.ones(acts_BD.shape[1], dtype=torch.bool, device=acts_BD.device)
-    mask_D[top_k_indices_D] = False
-
-    return mask_D
-
-
-def apply_topk_mask_zero_dims(
-    acts_BD: Float[torch.Tensor, "batch_size d_model"],
-    mask_D: Bool[torch.Tensor, "d_model"],
-) -> Float[torch.Tensor, "batch_size k"]:
-    masked_acts_BD = acts_BD.clone()
-    masked_acts_BD[:, mask_D] = 0.0
-
-    return masked_acts_BD
-
-
-def apply_topk_mask_reduce_dim(
-    acts_BD: Float[torch.Tensor, "batch_size d_model"],
-    mask_D: Bool[torch.Tensor, "d_model"],
-) -> Float[torch.Tensor, "batch_size k"]:
-    masked_acts_BD = acts_BD.clone()
-
-    masked_acts_BD = masked_acts_BD[:, ~mask_D]
-
-    return masked_acts_BD
-
-
-@beartype
-def train_sklearn_probe(
-    train_inputs: Float[torch.Tensor, "train_dataset_size d_model"],
-    train_labels: Int[torch.Tensor, "train_dataset_size"],
-    test_inputs: Float[torch.Tensor, "test_dataset_size d_model"],
-    test_labels: Int[torch.Tensor, "test_dataset_size"],
-    max_iter: int = 1000,  # non-default sklearn value, increased due to convergence warnings
-    C: float = 1.0,  # default sklearn value
-    verbose: bool = False,
-    l1_ratio: Optional[float] = None,
-) -> tuple[LogisticRegression, float]:
-    train_inputs = train_inputs.to(dtype=torch.float32)
-    test_inputs = test_inputs.to(dtype=torch.float32)
-
-    # Convert torch tensors to numpy arrays
-    train_inputs_np = train_inputs.cpu().numpy()
-    train_labels_np = train_labels.cpu().numpy()
-    test_inputs_np = test_inputs.cpu().numpy()
-    test_labels_np = test_labels.cpu().numpy()
-
-    # Initialize the LogisticRegression model
-    if l1_ratio is not None:
-        # Use Elastic Net regularization
-        probe = LogisticRegression(
-            penalty="elasticnet",
-            solver="saga",
-            C=C,
-            l1_ratio=l1_ratio,
-            max_iter=max_iter,
-            verbose=int(verbose),
-        )
-    else:
-        # Use L2 regularization
-        probe = LogisticRegression(penalty="l2", C=C, max_iter=max_iter, verbose=int(verbose))
-
-    # Train the model
-    probe.fit(train_inputs_np, train_labels_np)
-
-    # Compute accuracies
-    train_accuracy = accuracy_score(train_labels_np, probe.predict(train_inputs_np))
-    test_accuracy = accuracy_score(test_labels_np, probe.predict(test_inputs_np))
-
-    if verbose:
-        print(f"\nTraining completed.")
-        print(f"Train accuracy: {train_accuracy}, Test accuracy: {test_accuracy}\n")
-
-    return probe, test_accuracy
-
-
-# Helper function to test the probe
-@beartype
-def test_sklearn_probe(
-    inputs: Float[torch.Tensor, "dataset_size d_model"],
-    labels: Int[torch.Tensor, "dataset_size"],
-    probe: LogisticRegression,
-) -> float:
-    inputs = inputs.to(dtype=torch.float32)
-    inputs_np = inputs.cpu().numpy()
-    labels_np = labels.cpu().numpy()
-    predictions = probe.predict(inputs_np)
-    return accuracy_score(labels_np, predictions)
-
-
-@torch.no_grad
-def test_probe_gpu(
-    inputs: Float[torch.Tensor, "test_dataset_size d_model"],
-    labels: Int[torch.Tensor, "test_dataset_size"],
-    batch_size: int,
-    probe: Probe,
-) -> float:
-    criterion = nn.BCEWithLogitsLoss()
-
-    with torch.no_grad():
-        corrects_0 = []
-        corrects_1 = []
-        all_corrects = []
-        losses = []
-
-        for i in range(0, len(labels), batch_size):
-            acts_BD = inputs[i : i + batch_size]
-            labels_B = labels[i : i + batch_size]
-            logits_B = probe(acts_BD)
-            preds_B = (logits_B > 0.0).long()
-            correct_B = (preds_B == labels_B).float()
-
-            all_corrects.append(correct_B)
-            corrects_0.append(correct_B[labels_B == 0])
-            corrects_1.append(correct_B[labels_B == 1])
-
-            loss = criterion(logits_B, labels_B.to(dtype=probe.net.weight.dtype))
-            losses.append(loss)
-
-        accuracy_all = torch.cat(all_corrects).mean().item()
-        accuracy_0 = torch.cat(corrects_0).mean().item() if corrects_0 else 0.0
-        accuracy_1 = torch.cat(corrects_1).mean().item() if corrects_1 else 0.0
-        all_loss = torch.stack(losses).mean().item()
-
-    return accuracy_all
-
-
-def train_probe_gpu(
-    train_inputs: Float[torch.Tensor, "train_dataset_size d_model"],
-    train_labels: Int[torch.Tensor, "train_dataset_size"],
-    test_inputs: Float[torch.Tensor, "test_dataset_size d_model"],
-    test_labels: Int[torch.Tensor, "test_dataset_size"],
-    dim: int,
-    batch_size: int,
-    epochs: int,
-    lr: float,
-    verbose: bool = False,
-    l1_penalty: Optional[float] = None,
-    early_stopping_patience: int = 10,
-) -> tuple[Probe, float]:
-    """We have a GPU training function for training on all SAE features, which was very slow (1 minute+) on CPU."""
-    device = train_inputs.device
-    model_dtype = train_inputs.dtype
-
-    print(f"Training probe with dim: {dim}, device: {device}, dtype: {model_dtype}")
-
-    probe = Probe(dim, model_dtype).to(device)
-    optimizer = torch.optim.AdamW(probe.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
-
-    best_test_accuracy = 0.0
-    best_probe = None
-    patience_counter = 0
-    for epoch in range(epochs):
-        indices = torch.randperm(len(train_inputs))
-
-        for i in range(0, len(train_inputs), batch_size):
-            batch_indices = indices[i : i + batch_size]
-            acts_BD = train_inputs[batch_indices]
-            labels_B = train_labels[batch_indices]
-            logits_B = probe(acts_BD)
-            loss = criterion(
-                logits_B, labels_B.clone().detach().to(device=device, dtype=model_dtype)
-            )
-
-            if l1_penalty is not None:
-                l1_loss = l1_penalty * torch.sum(torch.abs(probe.net.weight))
-                loss += l1_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        train_accuracy = test_probe_gpu(train_inputs, train_labels, batch_size, probe)
-        test_accuracy = test_probe_gpu(test_inputs, test_labels, batch_size, probe)
-
-        if test_accuracy > best_test_accuracy:
-            best_test_accuracy = test_accuracy
-            best_probe = copy.deepcopy(probe)
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if verbose:
-            print(
-                f"Epoch {epoch + 1}/{epochs} Loss: {loss.item()}, train accuracy: {train_accuracy}, test accuracy: {test_accuracy}"
-            )
-
-        if patience_counter >= early_stopping_patience:
-            print(f"GPU probe training early stopping triggered after {epoch + 1} epochs")
-            break
-
-    return best_probe, best_test_accuracy
-
-
-def train_probe_on_activations(
-    train_activations: dict[str, Float[torch.Tensor, "train_dataset_size d_model"]],
-    test_activations: dict[str, Float[torch.Tensor, "test_dataset_size d_model"]],
-    select_top_k: Optional[int] = None,
-    use_sklearn: bool = True,
-    batch_size: int = 16,
-    epochs: int = 5,
-    lr: float = 1e-3,
-    verbose: bool = False,
-    early_stopping_patience: int = 10,
-    spurious_corr: bool = False,
-) -> tuple[dict[str, LogisticRegression | Probe], dict[str, float]]:
-    """Train a probe on the given activations and return the probe and test accuracies for each profession.
-    use_sklearn is a flag to use sklearn's LogisticRegression model instead of a custom PyTorch model.
-    We use sklearn by default. probe training on GPU is only for training a probe on all SAE features.
-    """
-    torch.set_grad_enabled(True)
-
-    probes, test_accuracies = {}, {}
-
-    for profession in train_activations.keys():
-        train_acts, train_labels = prepare_probe_data(
-            train_activations, profession, spurious_corr
-        )
-        test_acts, test_labels = prepare_probe_data(
-            test_activations, profession, spurious_corr
-        )
-
-        if select_top_k is not None:
-            activation_mask_D = get_top_k_mean_diff_mask(
-                train_acts, train_labels, select_top_k
-            )
-            train_acts = apply_topk_mask_reduce_dim(train_acts, activation_mask_D)
-            test_acts = apply_topk_mask_reduce_dim(test_acts, activation_mask_D)
-
-        activation_dim = train_acts.shape[1]
-
-        print(f"Num non-zero elements: {activation_dim}")
-
-        if use_sklearn:
-            probe, test_accuracy = train_sklearn_probe(
-                train_acts,
-                train_labels,
-                test_acts,
-                test_labels,
-                verbose=False,
-            )
-        else:
-            probe, test_accuracy = train_probe_gpu(
-                train_acts,
-                train_labels,
-                test_acts,
-                test_labels,
-                dim=activation_dim,
-                batch_size=batch_size,
-                epochs=epochs,
-                lr=lr,
-                verbose=verbose,
-                early_stopping_patience=early_stopping_patience,
-            )
-
-        print(f"Test accuracy for {profession}: {test_accuracy}")
-
-        probes[profession] = probe
-        test_accuracies[profession] = test_accuracy
-
-    return probes, test_accuracies
-
-
-
-
-def average_test_accuracy(test_accuracies: dict[str, float]) -> float:
-    return sum(test_accuracies.values()) / len(test_accuracies)
-
-
-
-@dataclass
-class EvalConfig:
-    random_seed: int = 42
-
-    dataset_names: list[str] = field(
-        default_factory=lambda: ["bias_in_bios", "amazon_reviews_1and5"]
-    )
-
-    probe_train_set_size: int = 4000
-    probe_test_set_size: int = 1000
-    context_length: int = 128
-
-    sae_batch_size: int = 16
-
-    ## Uncomment to run Pythia SAEs
-
-    # sae_releases: list[str] = field(
-    #     default_factory=lambda: [
-    #         "sae_bench_pythia70m_sweep_standard_ctx128_0712",
-    #         "sae_bench_pythia70m_sweep_topk_ctx128_0730",
-    #     ]
-    # )
-    model_name: str = "gpt2-small"
-    layer: int = 8
-    trainer_ids: Optional[list[int]] = field(default_factory=lambda: list(range(20)))
-    trainer_ids: Optional[list[int]] = field(default_factory=lambda: [10])
-    include_checkpoints: bool = False
-
-    ## Uncomment to run Gemma SAEs
-
-    # sae_releases: list[str] = field(
-    #     default_factory=lambda: [
-    #         "gemma-scope-2b-pt-res",
-    #         "sae_bench_gemma-2-2b_sweep_topk_ctx128_ef8_0824",
-    #         "sae_bench_gemma-2-2b_sweep_standard_ctx128_ef8_0824",
-    #     ]
-    # )
-    # model_name: str = "gemma-2-2b"
-    # layer: int = 19
-    # trainer_ids: Optional[list[int]] = None
-    # include_checkpoints: bool = False
-
-    k_values: list[int] = field(default_factory=lambda: [1]) #, 2, 5, 10, 20, 50, 100])
-
-    selected_saes_dict: dict = field(default_factory=lambda: {})
-
-if MAIN:
-
-    dataset_name = "bias_in_bios"
-    config = EvalConfig()
-
-
-    train_df, test_df = load_huggingface_dataset(dataset_name)
-    train_data, test_data = get_multi_label_train_test_data(
-        train_df,
-        test_df,
-        dataset_name,
-        config.probe_train_set_size,
-        config.probe_test_set_size,
-        config.random_seed,
-    )
-
-    chosen_classes = chosen_classes_per_dataset[dataset_name]
-
-    train_data = filter_dataset(train_data, chosen_classes)
-    test_data = filter_dataset(test_data, chosen_classes)
-
-    train_data = tokenize_data(
-        train_data, model.tokenizer, config.context_length, device
-    )
-    test_data = tokenize_data(
-        test_data, model.tokenizer, config.context_length, device
-    )
-
-    print(f"Running evaluation for layer {config.layer}")
-    hook_name = f"blocks.{config.layer}.hook_resid_post"
-
-    llm_batch_size = LLM_NAME_TO_BATCH_SIZE[config.model_name]
-    llm_dtype = LLM_NAME_TO_DTYPE[config.model_name]
-
-    all_train_acts_BLD = get_all_llm_activations(
-        train_data, model, llm_batch_size, hook_name
-    )
-    all_test_acts_BLD = get_all_llm_activations(
-        test_data, model, llm_batch_size, hook_name
-    )
-
-    all_train_acts_BD = create_meaned_model_activations(
-        all_train_acts_BLD
-    )
-    all_test_acts_BD = create_meaned_model_activations(
-        all_test_acts_BLD
-    )
-
-    results_dict = {}
-
-
-    llm_probes, llm_test_accuracies = train_probe_on_activations(
-        all_train_acts_BD,
-        all_test_acts_BD,
-        select_top_k=None,
-    )
-
-    llm_results = {"llm_test_accuracy": average_test_accuracy(llm_test_accuracies)}
-
-    for k in config.k_values:
-        llm_top_k_probes, llm_top_k_test_accuracies = (
-            train_probe_on_activations(
-                all_train_acts_BD,
-                all_test_acts_BD,
-                select_top_k=k,
-            )
-        )
-        llm_results[f"llm_top_{k}_test_accuracy"] = average_test_accuracy(
-            llm_top_k_test_accuracies
-        )
-
-    import gc
-
-    for i, sae in enumerate(tqdm(
-        [
-            sae,
-            OMPSAE(atoms, OMP_L0),
-            OMPSAE(sae.W_dec, OMP_L0),
-        ],
-        desc="Running SAE evaluation on all selected SAEs",
-    )):
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        sae_name = sae.__class__.__name__
-
-        # if "topk" in sae_name:
-        #     assert isinstance(sae.activation_fn, TopK)
-
-        all_sae_train_acts_BF = get_sae_meaned_activations(
-            all_train_acts_BLD, sae, config.sae_batch_size, llm_dtype
-        )
-        all_sae_test_acts_BF = get_sae_meaned_activations(
-            all_test_acts_BLD, sae, config.sae_batch_size, llm_dtype
-        )
-
-        _, sae_test_accuracies = train_probe_on_activations(
-            all_sae_train_acts_BF,
-            all_sae_test_acts_BF,
-            select_top_k=None,
-            use_sklearn=False,
-            batch_size=250,
-            epochs=100,
-            lr=1e-2,
-        )
-
-        results_dict[sae_name] = {}
-
-        for llm_result_key, llm_result_value in llm_results.items():
-            results_dict[sae_name][llm_result_key] = llm_result_value
-
-        results_dict[sae_name]["sae_test_accuracy"] = average_test_accuracy(
-            sae_test_accuracies
-        )
-
-        for k in config.k_values:
-            sae_top_k_probes, sae_top_k_test_accuracies = (
-                train_probe_on_activations(
-                    all_sae_train_acts_BF,
-                    all_sae_test_acts_BF,
-                    select_top_k=k,
-                )
-            )
-            results_dict[sae_name][f"sae_top_{k}_test_accuracy"] = (
-                average_test_accuracy(sae_top_k_test_accuracies)
-            )
-
-        print(results_dict)
+# from datasets import load_dataset
+
+
+# class OMPSAE:
+#     def __init__(self, atoms, l0=8):
+#         self.atoms = atoms
+#         self.l0 = l0
+
+#     def encode(self, x):
+#         norm = x.norm(dim=1).unsqueeze(1)
+
+#         x = x / norm
+#         shape = x.size()
+
+#         x = x.view(-1, shape[-1])
+#         coefs, indices = ito(self.atoms, x, self.l0)
+#         expanded = torch.zeros((x.size(0), self.atoms.size(0)), device=x.device)
+#         expanded.scatter_(1, indices, coefs)
+#         expanded = expanded.view(*shape[:-1], -1)
+#         return expanded
+
+#     def decode(self, x, acts):
+#         return torch.mm(acts, self.atoms) * x.norm(dim=1).unsqueeze(1)
+
+
+# def load_huggingface_dataset(dataset_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+#     if dataset_name == "bias_in_bios":
+#         dataset = load_dataset("LabHC/bias_in_bios")
+#         train_df = pd.DataFrame(dataset["train"])
+#         test_df = pd.DataFrame(dataset["test"])
+#     elif dataset_name == "amazon_reviews_all_ratings":
+#         dataset = load_dataset(
+#             "canrager/amazon_reviews_mcauley",
+#             config_name="dataset_all_categories_and_ratings_train1000_test250",
+#         )
+#     elif dataset_name == "amazon_reviews_1and5":
+#         dataset = load_dataset(
+#             "canrager/amazon_reviews_mcauley_1and5",
+#         )
+#         train_df = pd.DataFrame(dataset["train"])
+#         test_df = pd.DataFrame(dataset["test"])
+#     else:
+#         raise ValueError(f"Unknown dataset name: {dataset_name}")
+#     return train_df, test_df
+
+
+# def ensure_shared_keys(train_data: dict, test_data: dict) -> tuple[dict, dict]:
+#     # Find keys that are in test but not in train
+#     test_only_keys = set(test_data.keys()) - set(train_data.keys())
+
+#     # Find keys that are in train but not in test
+#     train_only_keys = set(train_data.keys()) - set(test_data.keys())
+
+#     # Remove keys from test that are not in train
+#     for key in test_only_keys:
+#         print(f"Removing {key} from test set")
+#         del test_data[key]
+
+#     # Remove keys from train that are not in test
+#     for key in train_only_keys:
+#         print(f"Removing {key} from train set")
+#         del train_data[key]
+
+#     return train_data, test_data
+
+
+# POSITIVE_CLASS_LABEL = 1
+# NEGATIVE_CLASS_LABEL = 0
+
+# # NOTE: These are going to be hardcoded, and won't change even if the underlying dataset or data labels change.
+# # This is a bit confusing, but IMO male_professor / female_nurse is a bit easier to understand than e.g. class1_pos_class2_pos / class1_neg_class2_neg
+# PAIRED_CLASS_KEYS = {
+#     "male / female": "female_data_only",
+#     "professor / nurse": "nurse_data_only",
+#     "male_professor / female_nurse": "female_nurse_data_only",
+# }
+
+# profession_dict = {
+#     "accountant": 0,
+#     "architect": 1,
+#     "attorney": 2,
+#     "chiropractor": 3,
+#     "comedian": 4,
+#     "composer": 5,
+#     "dentist": 6,
+#     "dietitian": 7,
+#     "dj": 8,
+#     "filmmaker": 9,
+#     "interior_designer": 10,
+#     "journalist": 11,
+#     "model": 12,
+#     "nurse": 13,
+#     "painter": 14,
+#     "paralegal": 15,
+#     "pastor": 16,
+#     "personal_trainer": 17,
+#     "photographer": 18,
+#     "physician": 19,
+#     "poet": 20,
+#     "professor": 21,
+#     "psychologist": 22,
+#     "rapper": 23,
+#     "software_engineer": 24,
+#     "surgeon": 25,
+#     "teacher": 26,
+#     "yoga_teacher": 27,
+# }
+# profession_int_to_str = {v: k for k, v in profession_dict.items()}
+
+# gender_dict = {
+#     "male": 0,
+#     "female": 1,
+# }
+
+# # From the original dataset
+# amazon_category_dict = {
+#     "All_Beauty": 0,
+#     "Toys_and_Games": 1,
+#     "Cell_Phones_and_Accessories": 2,
+#     "Industrial_and_Scientific": 3,
+#     "Gift_Cards": 4,
+#     "Musical_Instruments": 5,
+#     "Electronics": 6,
+#     "Handmade_Products": 7,
+#     "Arts_Crafts_and_Sewing": 8,
+#     "Baby_Products": 9,
+#     "Health_and_Household": 10,
+#     "Office_Products": 11,
+#     "Digital_Music": 12,
+#     "Grocery_and_Gourmet_Food": 13,
+#     "Sports_and_Outdoors": 14,
+#     "Home_and_Kitchen": 15,
+#     "Subscription_Boxes": 16,
+#     "Tools_and_Home_Improvement": 17,
+#     "Pet_Supplies": 18,
+#     "Video_Games": 19,
+#     "Kindle_Store": 20,
+#     "Clothing_Shoes_and_Jewelry": 21,
+#     "Patio_Lawn_and_Garden": 22,
+#     "Unknown": 23,
+#     "Books": 24,
+#     "Automotive": 25,
+#     "CDs_and_Vinyl": 26,
+#     "Beauty_and_Personal_Care": 27,
+#     "Amazon_Fashion": 28,
+#     "Magazine_Subscriptions": 29,
+#     "Software": 30,
+#     "Health_and_Personal_Care": 31,
+#     "Appliances": 32,
+#     "Movies_and_TV": 33,
+# }
+# amazon_int_to_str = {v: k for k, v in amazon_category_dict.items()}
+
+
+# amazon_rating_dict = {
+#     1.0: 1.0,
+#     5.0: 5.0,
+# }
+
+# dataset_metadata = {
+#     "bias_in_bios": {
+#         "text_column_name": "hard_text",
+#         "column1_name": "profession",
+#         "column2_name": "gender",
+#         "column2_autointerp_name": "gender",
+#         "column1_mapping": profession_dict,
+#         "column2_mapping": gender_dict,
+#     },
+#     "amazon_reviews_1and5": {
+#         "text_column_name": "text",
+#         "column1_name": "category",
+#         "column2_name": "rating",
+#         "column2_autointerp_name": "Amazon Review Sentiment",
+#         "column1_mapping": amazon_category_dict,
+#         "column2_mapping": amazon_rating_dict,
+#     },
+# }
+
+# chosen_classes_per_dataset = {
+#     "bias_in_bios": ["0", "1", "2", "6", "9"],
+#     "amazon_reviews_1and5": ["1", "2", "3", "5", "6"],
+# }
+
+# def get_balanced_dataset(
+#     df: pd.DataFrame,
+#     dataset_name: str,
+#     min_samples_per_quadrant: int,
+#     random_seed: int,
+# ) -> dict[str, list[str]]:
+#     """Returns a dataset of, in the case of bias_in_bios, a key of profession idx,
+#     and a value of a list of bios (strs) of len min_samples_per_quadrant * 2."""
+
+#     text_column_name = dataset_metadata[dataset_name]["text_column_name"]
+#     column1_name = dataset_metadata[dataset_name]["column1_name"]
+#     column2_name = dataset_metadata[dataset_name]["column2_name"]
+
+#     balanced_df_list = []
+
+#     for profession in tqdm(df[column1_name].unique()):
+#         prof_df = df[df[column1_name] == profession]
+#         min_count = prof_df[column2_name].value_counts().min()
+
+#         unique_groups = prof_df[column2_name].unique()
+#         if len(unique_groups) < 2:
+#             continue  # Skip professions with less than two groups
+
+#         if min_count < min_samples_per_quadrant:
+#             continue
+
+#         balanced_prof_df = pd.concat(
+#             [
+#                 group.sample(n=min_samples_per_quadrant, random_state=random_seed)
+#                 for _, group in prof_df.groupby(column2_name)
+#             ]
+#         ).reset_index(drop=True)
+#         balanced_df_list.append(balanced_prof_df)
+
+#     balanced_df = pd.concat(balanced_df_list).reset_index(drop=True)
+#     grouped = balanced_df.groupby(column1_name)[text_column_name].apply(list)
+
+#     str_data = {str(key): texts for key, texts in grouped.items()}
+
+#     balanced_data = {label: texts for label, texts in str_data.items()}
+
+#     for key in balanced_data.keys():
+#         balanced_data[key] = balanced_data[key][: min_samples_per_quadrant * 2]
+#         assert len(balanced_data[key]) == min_samples_per_quadrant * 2
+
+#     return balanced_data
+
+# def get_multi_label_train_test_data(
+#     train_df: pd.DataFrame,
+#     test_df: pd.DataFrame,
+#     dataset_name: str,
+#     train_set_size: int,
+#     test_set_size: int,
+#     random_seed: int,
+# ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+#     """Returns a dict of [class_name, list[str]]"""
+#     # 4 is because male / gender for each profession
+#     minimum_train_samples_per_quadrant = train_set_size // 4
+#     minimum_test_samples_per_quadrant = test_set_size // 4
+
+#     train_data = get_balanced_dataset(
+#         train_df,
+#         dataset_name,
+#         minimum_train_samples_per_quadrant,
+#         random_seed=random_seed,
+#     )
+#     test_data = get_balanced_dataset(
+#         test_df,
+#         dataset_name,
+#         minimum_test_samples_per_quadrant,
+#         random_seed=random_seed,
+#     )
+
+#     train_data, test_data = ensure_shared_keys(train_data, test_data)
+
+#     return train_data, test_data
+
+
+# def filter_dataset(
+#     data: dict[str, list[str]], chosen_class_indices: list[str]
+# ) -> dict[str, list[str]]:
+#     filtered_data = {}
+#     for class_name in chosen_class_indices:
+#         filtered_data[class_name] = data[class_name]
+#     return filtered_data
+
+
+# from transformers import AutoTokenizer
+
+
+# def tokenize_data(
+#     data: dict[str, list[str]], tokenizer: AutoTokenizer, max_length: int, device: str
+# ) -> dict[str, dict]:
+#     tokenized_data = {}
+#     for key, texts in tqdm(data.items(), desc="Tokenizing data"):
+#         # .data so we have a dict, not a BatchEncoding
+#         tokenized_data[key] = (
+#             tokenizer(
+#                 texts,
+#                 padding="max_length",
+#                 truncation=True,
+#                 max_length=max_length,
+#                 return_tensors="pt",
+#             )
+#             .to(device)
+#             .data
+#         )
+#     return tokenized_data
+
+# import torch
+# import torch.nn as nn
+# from tqdm import tqdm
+# from typing import Callable, Optional
+# from jaxtyping import Int, Float, jaxtyped, BFloat16
+# from beartype import beartype
+# import einops
+# from transformer_lens import HookedTransformer
+# from sae_lens import SAE
+
+# LLM_NAME_TO_BATCH_SIZE = {
+#     "gpt2-small": 64,
+#     "pythia-70m-deduped": 500,
+#     "gemma-2-2b": 32,
+# }
+
+# LLM_NAME_TO_DTYPE = {
+#     "gpt2-small": torch.float32,
+#     "pythia-70m-deduped": torch.float32,
+#     "gemma-2-2b": torch.bfloat16,
+# }
+
+
+# @torch.no_grad
+# def get_all_llm_activations(
+#     tokenized_inputs_dict: dict[str, dict[str, Int[torch.Tensor, "dataset_size seq_len"]]],
+#     model: HookedTransformer,
+#     batch_size: int,
+#     hook_name: str,
+# ) -> dict[str, Float[torch.Tensor, "dataset_size seq_len d_model"]]:
+#     """VERY IMPORTANT NOTE: We zero out masked token activations in this function. Later, we ignore zeroed activations."""
+#     all_classes_acts_BLD = {}
+
+#     for class_name in tokenized_inputs_dict:
+#         all_acts_BLD = []
+#         tokenized_inputs = tokenized_inputs_dict[class_name]
+
+#         for i in tqdm(
+#             range(0, len(tokenized_inputs["input_ids"]), batch_size),
+#             desc=f"Collecting activations for class {class_name}",
+#         ):
+#             tokens_BL = tokenized_inputs["input_ids"][i : i + batch_size]
+#             attention_mask_BL = tokenized_inputs["attention_mask"][i : i + batch_size]
+
+#             acts_BLD = None
+
+#             def activation_hook(resid_BLD: torch.Tensor, hook):
+#                 nonlocal acts_BLD
+#                 acts_BLD = resid_BLD
+
+#             model.run_with_hooks(
+#                 tokens_BL, return_type=None, fwd_hooks=[(hook_name, activation_hook)]
+#             )
+
+#             acts_BLD = acts_BLD * attention_mask_BL[:, :, None]
+#             all_acts_BLD.append(acts_BLD)
+
+#         all_acts_BLD = torch.cat(all_acts_BLD, dim=0)
+
+#         all_classes_acts_BLD[class_name] = all_acts_BLD
+
+#     return all_classes_acts_BLD
+
+
+# @torch.no_grad
+# def create_meaned_model_activations(
+#     all_llm_activations_BLD: dict[str, Float[torch.Tensor, "batch_size seq_len d_model"]],
+# ) -> dict[str, Float[torch.Tensor, "batch_size d_model"]]:
+#     """VERY IMPORTANT NOTE: We assume that the activations have been zeroed out for masked tokens."""
+
+#     all_llm_activations_BD = {}
+#     for class_name in all_llm_activations_BLD:
+#         acts_BLD = all_llm_activations_BLD[class_name]
+#         dtype = acts_BLD.dtype
+
+#         activations_BL = einops.reduce(acts_BLD, "B L D -> B L", "sum")
+#         nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
+#         nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum")
+
+#         meaned_acts_BD = einops.reduce(acts_BLD, "B L D -> B D", "sum") / nonzero_acts_B[:, None]
+#         all_llm_activations_BD[class_name] = meaned_acts_BD
+
+#     return all_llm_activations_BD
+
+
+# @torch.no_grad
+# def get_sae_meaned_activations(
+#     all_llm_activations_BLD: dict[str, Float[torch.Tensor, "batch_size seq_len d_model"]],
+#     sae,
+#     sae_batch_size: int,
+#     dtype: torch.dtype,
+# ) -> dict[str, Float[torch.Tensor, "batch_size d_sae"]]:
+#     """VERY IMPORTANT NOTE: We assume that the activations have been zeroed out for masked tokens."""
+#     all_sae_activations_BF = {}
+#     for class_name in all_llm_activations_BLD:
+#         all_acts_BLD = all_llm_activations_BLD[class_name]
+
+#         all_acts_BF = []
+
+#         for i in range(0, len(all_acts_BLD), sae_batch_size):
+#             acts_BLD = all_acts_BLD[i : i + sae_batch_size]
+#             acts_BLF = sae.encode(acts_BLD)
+
+#             activations_BL = einops.reduce(acts_BLD, "B L D -> B L", "sum")
+#             nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
+#             nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum")
+
+#             acts_BLF = acts_BLF * nonzero_acts_BL[:, :, None]
+#             acts_BF = einops.reduce(acts_BLF, "B L F -> B F", "sum") / nonzero_acts_B[:, None]
+#             acts_BF = acts_BF.to(dtype=dtype)
+
+#             all_acts_BF.append(acts_BF)
+
+#         all_acts_BF = torch.cat(all_acts_BF, dim=0)
+#         all_sae_activations_BF[class_name] = all_acts_BF
+
+#     return all_sae_activations_BF
+
+# from dataclasses import dataclass, field
+# from typing import Optional
+# import torch
+
+# import copy
+# from typing import Optional
+
+# import torch
+# import torch.nn as nn
+# from beartype import beartype
+# from jaxtyping import Bool, Float, Int, jaxtyped
+# from sklearn.linear_model import LogisticRegression
+# from sklearn.metrics import accuracy_score
+
+
+# class Probe(nn.Module):
+#     def __init__(self, activation_dim: int, dtype: torch.dtype):
+#         super().__init__()
+#         self.net = nn.Linear(activation_dim, 1, bias=True, dtype=dtype)
+
+#     def forward(self, x):
+#         return self.net(x).squeeze(-1)
+
+
+# def prepare_probe_data(
+#     all_activations: dict[str, Float[torch.Tensor, "num_datapoints_per_class ... d_model"]],
+#     class_name: str,
+#     spurious_corr: bool = False,
+# ) -> tuple[
+#     Float[torch.Tensor, "num_datapoints_per_class_x_2 ... d_model"],
+#     Int[torch.Tensor, "num_datapoints_per_class_x_2"],
+# ]:
+#     """spurious_corr is for the SHIFT metric. In this case, all_activations has 3 pairs of keys, or 6 total.
+#     It's a bit unfortunate to introduce coupling between the metrics, but most of the code is reused between them.
+#     The ... means we can have an optional seq_len dimension between num_datapoints_per_class and d_model.
+#     """
+#     positive_acts_BD = all_activations[class_name]
+#     device = positive_acts_BD.device
+
+#     num_positive = len(positive_acts_BD)
+
+#     if spurious_corr:
+#         if class_name in PAIRED_CLASS_KEYS.keys():
+#             negative_acts = all_activations[PAIRED_CLASS_KEYS[class_name]]
+#         elif class_name in PAIRED_CLASS_KEYS.values():
+#             reversed_dict = {v: k for k, v in PAIRED_CLASS_KEYS.items()}
+#             negative_acts = all_activations[reversed_dict[class_name]]
+#         else:
+#             raise ValueError(f"Class {class_name} not found in paired class keys.")
+#     else:
+#         # Collect all negative class activations and labels
+#         negative_acts = []
+#         for idx, acts in all_activations.items():
+#             if idx != class_name:
+#                 negative_acts.append(acts)
+
+#         negative_acts = torch.cat(negative_acts)
+
+#     # Randomly select num_positive samples from negative class
+#     indices = torch.randperm(len(negative_acts))[:num_positive]
+#     selected_negative_acts_BD = negative_acts[indices]
+
+#     assert selected_negative_acts_BD.shape == positive_acts_BD.shape
+
+#     # Combine positive and negative samples
+#     combined_acts = torch.cat([positive_acts_BD, selected_negative_acts_BD])
+
+#     combined_labels = torch.empty(len(combined_acts), dtype=torch.int, device=device)
+#     combined_labels[:num_positive] = POSITIVE_CLASS_LABEL
+#     combined_labels[num_positive:] = NEGATIVE_CLASS_LABEL
+
+#     # Shuffle the combined data
+#     shuffle_indices = torch.randperm(len(combined_acts))
+#     shuffled_acts = combined_acts[shuffle_indices]
+#     shuffled_labels = combined_labels[shuffle_indices]
+
+#     return shuffled_acts, shuffled_labels
+
+
+# def get_top_k_mean_diff_mask(
+#     acts_BD: Float[torch.Tensor, "batch_size d_model"],
+#     labels_B: Int[torch.Tensor, "batch_size"],
+#     k: int,
+# ) -> Bool[torch.Tensor, "k"]:
+#     positive_mask_B = labels_B == POSITIVE_CLASS_LABEL
+#     negative_mask_B = labels_B == NEGATIVE_CLASS_LABEL
+
+#     positive_distribution_D = acts_BD[positive_mask_B].mean(dim=0)
+#     negative_distribution_D = acts_BD[negative_mask_B].mean(dim=0)
+#     distribution_diff_D = (positive_distribution_D - negative_distribution_D).abs()
+#     top_k_indices_D = torch.argsort(distribution_diff_D, descending=True)[:k]
+
+#     mask_D = torch.ones(acts_BD.shape[1], dtype=torch.bool, device=acts_BD.device)
+#     mask_D[top_k_indices_D] = False
+
+#     return mask_D
+
+
+# def apply_topk_mask_zero_dims(
+#     acts_BD: Float[torch.Tensor, "batch_size d_model"],
+#     mask_D: Bool[torch.Tensor, "d_model"],
+# ) -> Float[torch.Tensor, "batch_size k"]:
+#     masked_acts_BD = acts_BD.clone()
+#     masked_acts_BD[:, mask_D] = 0.0
+
+#     return masked_acts_BD
+
+
+# def apply_topk_mask_reduce_dim(
+#     acts_BD: Float[torch.Tensor, "batch_size d_model"],
+#     mask_D: Bool[torch.Tensor, "d_model"],
+# ) -> Float[torch.Tensor, "batch_size k"]:
+#     masked_acts_BD = acts_BD.clone()
+
+#     masked_acts_BD = masked_acts_BD[:, ~mask_D]
+
+#     return masked_acts_BD
+
+
+# @beartype
+# def train_sklearn_probe(
+#     train_inputs: Float[torch.Tensor, "train_dataset_size d_model"],
+#     train_labels: Int[torch.Tensor, "train_dataset_size"],
+#     test_inputs: Float[torch.Tensor, "test_dataset_size d_model"],
+#     test_labels: Int[torch.Tensor, "test_dataset_size"],
+#     max_iter: int = 1000,  # non-default sklearn value, increased due to convergence warnings
+#     C: float = 1.0,  # default sklearn value
+#     verbose: bool = False,
+#     l1_ratio: Optional[float] = None,
+# ) -> tuple[LogisticRegression, float]:
+#     train_inputs = train_inputs.to(dtype=torch.float32)
+#     test_inputs = test_inputs.to(dtype=torch.float32)
+
+#     # Convert torch tensors to numpy arrays
+#     train_inputs_np = train_inputs.cpu().numpy()
+#     train_labels_np = train_labels.cpu().numpy()
+#     test_inputs_np = test_inputs.cpu().numpy()
+#     test_labels_np = test_labels.cpu().numpy()
+
+#     # Initialize the LogisticRegression model
+#     if l1_ratio is not None:
+#         # Use Elastic Net regularization
+#         probe = LogisticRegression(
+#             penalty="elasticnet",
+#             solver="saga",
+#             C=C,
+#             l1_ratio=l1_ratio,
+#             max_iter=max_iter,
+#             verbose=int(verbose),
+#         )
+#     else:
+#         # Use L2 regularization
+#         probe = LogisticRegression(penalty="l2", C=C, max_iter=max_iter, verbose=int(verbose))
+
+#     # Train the model
+#     probe.fit(train_inputs_np, train_labels_np)
+
+#     # Compute accuracies
+#     train_accuracy = accuracy_score(train_labels_np, probe.predict(train_inputs_np))
+#     test_accuracy = accuracy_score(test_labels_np, probe.predict(test_inputs_np))
+
+#     if verbose:
+#         print(f"\nTraining completed.")
+#         print(f"Train accuracy: {train_accuracy}, Test accuracy: {test_accuracy}\n")
+
+#     return probe, test_accuracy
+
+
+# # Helper function to test the probe
+# @beartype
+# def test_sklearn_probe(
+#     inputs: Float[torch.Tensor, "dataset_size d_model"],
+#     labels: Int[torch.Tensor, "dataset_size"],
+#     probe: LogisticRegression,
+# ) -> float:
+#     inputs = inputs.to(dtype=torch.float32)
+#     inputs_np = inputs.cpu().numpy()
+#     labels_np = labels.cpu().numpy()
+#     predictions = probe.predict(inputs_np)
+#     return accuracy_score(labels_np, predictions)
+
+
+# @torch.no_grad
+# def test_probe_gpu(
+#     inputs: Float[torch.Tensor, "test_dataset_size d_model"],
+#     labels: Int[torch.Tensor, "test_dataset_size"],
+#     batch_size: int,
+#     probe: Probe,
+# ) -> float:
+#     criterion = nn.BCEWithLogitsLoss()
+
+#     with torch.no_grad():
+#         corrects_0 = []
+#         corrects_1 = []
+#         all_corrects = []
+#         losses = []
+
+#         for i in range(0, len(labels), batch_size):
+#             acts_BD = inputs[i : i + batch_size]
+#             labels_B = labels[i : i + batch_size]
+#             logits_B = probe(acts_BD)
+#             preds_B = (logits_B > 0.0).long()
+#             correct_B = (preds_B == labels_B).float()
+
+#             all_corrects.append(correct_B)
+#             corrects_0.append(correct_B[labels_B == 0])
+#             corrects_1.append(correct_B[labels_B == 1])
+
+#             loss = criterion(logits_B, labels_B.to(dtype=probe.net.weight.dtype))
+#             losses.append(loss)
+
+#         accuracy_all = torch.cat(all_corrects).mean().item()
+#         accuracy_0 = torch.cat(corrects_0).mean().item() if corrects_0 else 0.0
+#         accuracy_1 = torch.cat(corrects_1).mean().item() if corrects_1 else 0.0
+#         all_loss = torch.stack(losses).mean().item()
+
+#     return accuracy_all
+
+
+# def train_probe_gpu(
+#     train_inputs: Float[torch.Tensor, "train_dataset_size d_model"],
+#     train_labels: Int[torch.Tensor, "train_dataset_size"],
+#     test_inputs: Float[torch.Tensor, "test_dataset_size d_model"],
+#     test_labels: Int[torch.Tensor, "test_dataset_size"],
+#     dim: int,
+#     batch_size: int,
+#     epochs: int,
+#     lr: float,
+#     verbose: bool = False,
+#     l1_penalty: Optional[float] = None,
+#     early_stopping_patience: int = 10,
+# ) -> tuple[Probe, float]:
+#     """We have a GPU training function for training on all SAE features, which was very slow (1 minute+) on CPU."""
+#     device = train_inputs.device
+#     model_dtype = train_inputs.dtype
+
+#     print(f"Training probe with dim: {dim}, device: {device}, dtype: {model_dtype}")
+
+#     probe = Probe(dim, model_dtype).to(device)
+#     optimizer = torch.optim.AdamW(probe.parameters(), lr=lr)
+#     criterion = nn.BCEWithLogitsLoss()
+
+#     best_test_accuracy = 0.0
+#     best_probe = None
+#     patience_counter = 0
+#     for epoch in range(epochs):
+#         indices = torch.randperm(len(train_inputs))
+
+#         for i in range(0, len(train_inputs), batch_size):
+#             batch_indices = indices[i : i + batch_size]
+#             acts_BD = train_inputs[batch_indices]
+#             labels_B = train_labels[batch_indices]
+#             logits_B = probe(acts_BD)
+#             loss = criterion(
+#                 logits_B, labels_B.clone().detach().to(device=device, dtype=model_dtype)
+#             )
+
+#             if l1_penalty is not None:
+#                 l1_loss = l1_penalty * torch.sum(torch.abs(probe.net.weight))
+#                 loss += l1_loss
+
+#             optimizer.zero_grad()
+#             loss.backward()
+#             optimizer.step()
+
+#         train_accuracy = test_probe_gpu(train_inputs, train_labels, batch_size, probe)
+#         test_accuracy = test_probe_gpu(test_inputs, test_labels, batch_size, probe)
+
+#         if test_accuracy > best_test_accuracy:
+#             best_test_accuracy = test_accuracy
+#             best_probe = copy.deepcopy(probe)
+#             patience_counter = 0
+#         else:
+#             patience_counter += 1
+
+#         if verbose:
+#             print(
+#                 f"Epoch {epoch + 1}/{epochs} Loss: {loss.item()}, train accuracy: {train_accuracy}, test accuracy: {test_accuracy}"
+#             )
+
+#         if patience_counter >= early_stopping_patience:
+#             print(f"GPU probe training early stopping triggered after {epoch + 1} epochs")
+#             break
+
+#     return best_probe, best_test_accuracy
+
+
+# def train_probe_on_activations(
+#     train_activations: dict[str, Float[torch.Tensor, "train_dataset_size d_model"]],
+#     test_activations: dict[str, Float[torch.Tensor, "test_dataset_size d_model"]],
+#     select_top_k: Optional[int] = None,
+#     use_sklearn: bool = True,
+#     batch_size: int = 16,
+#     epochs: int = 5,
+#     lr: float = 1e-3,
+#     verbose: bool = False,
+#     early_stopping_patience: int = 10,
+#     spurious_corr: bool = False,
+# ) -> tuple[dict[str, LogisticRegression | Probe], dict[str, float]]:
+#     """Train a probe on the given activations and return the probe and test accuracies for each profession.
+#     use_sklearn is a flag to use sklearn's LogisticRegression model instead of a custom PyTorch model.
+#     We use sklearn by default. probe training on GPU is only for training a probe on all SAE features.
+#     """
+#     torch.set_grad_enabled(True)
+
+#     probes, test_accuracies = {}, {}
+
+#     for profession in train_activations.keys():
+#         train_acts, train_labels = prepare_probe_data(
+#             train_activations, profession, spurious_corr
+#         )
+#         test_acts, test_labels = prepare_probe_data(
+#             test_activations, profession, spurious_corr
+#         )
+
+#         if select_top_k is not None:
+#             activation_mask_D = get_top_k_mean_diff_mask(
+#                 train_acts, train_labels, select_top_k
+#             )
+#             train_acts = apply_topk_mask_reduce_dim(train_acts, activation_mask_D)
+#             test_acts = apply_topk_mask_reduce_dim(test_acts, activation_mask_D)
+
+#         activation_dim = train_acts.shape[1]
+
+#         print(f"Num non-zero elements: {activation_dim}")
+
+#         if use_sklearn:
+#             probe, test_accuracy = train_sklearn_probe(
+#                 train_acts,
+#                 train_labels,
+#                 test_acts,
+#                 test_labels,
+#                 verbose=False,
+#             )
+#         else:
+#             probe, test_accuracy = train_probe_gpu(
+#                 train_acts,
+#                 train_labels,
+#                 test_acts,
+#                 test_labels,
+#                 dim=activation_dim,
+#                 batch_size=batch_size,
+#                 epochs=epochs,
+#                 lr=lr,
+#                 verbose=verbose,
+#                 early_stopping_patience=early_stopping_patience,
+#             )
+
+#         print(f"Test accuracy for {profession}: {test_accuracy}")
+
+#         probes[profession] = probe
+#         test_accuracies[profession] = test_accuracy
+
+#     return probes, test_accuracies
+
+
+
+
+# def average_test_accuracy(test_accuracies: dict[str, float]) -> float:
+#     return sum(test_accuracies.values()) / len(test_accuracies)
+
+
+
+# @dataclass
+# class EvalConfig:
+#     random_seed: int = 42
+
+#     dataset_names: list[str] = field(
+#         default_factory=lambda: ["bias_in_bios", "amazon_reviews_1and5"]
+#     )
+
+#     probe_train_set_size: int = 4000
+#     probe_test_set_size: int = 1000
+#     context_length: int = 128
+
+#     sae_batch_size: int = 16
+
+#     ## Uncomment to run Pythia SAEs
+
+#     # sae_releases: list[str] = field(
+#     #     default_factory=lambda: [
+#     #         "sae_bench_pythia70m_sweep_standard_ctx128_0712",
+#     #         "sae_bench_pythia70m_sweep_topk_ctx128_0730",
+#     #     ]
+#     # )
+#     model_name: str = "gpt2-small"
+#     layer: int = 8
+#     trainer_ids: Optional[list[int]] = field(default_factory=lambda: list(range(20)))
+#     trainer_ids: Optional[list[int]] = field(default_factory=lambda: [10])
+#     include_checkpoints: bool = False
+
+#     ## Uncomment to run Gemma SAEs
+
+#     # sae_releases: list[str] = field(
+#     #     default_factory=lambda: [
+#     #         "gemma-scope-2b-pt-res",
+#     #         "sae_bench_gemma-2-2b_sweep_topk_ctx128_ef8_0824",
+#     #         "sae_bench_gemma-2-2b_sweep_standard_ctx128_ef8_0824",
+#     #     ]
+#     # )
+#     # model_name: str = "gemma-2-2b"
+#     # layer: int = 19
+#     # trainer_ids: Optional[list[int]] = None
+#     # include_checkpoints: bool = False
+
+#     k_values: list[int] = field(default_factory=lambda: [1]) #, 2, 5, 10, 20, 50, 100])
+
+#     selected_saes_dict: dict = field(default_factory=lambda: {})
+
+# if MAIN:
+
+#     dataset_name = "bias_in_bios"
+#     config = EvalConfig()
+
+
+#     train_df, test_df = load_huggingface_dataset(dataset_name)
+#     train_data, test_data = get_multi_label_train_test_data(
+#         train_df,
+#         test_df,
+#         dataset_name,
+#         config.probe_train_set_size,
+#         config.probe_test_set_size,
+#         config.random_seed,
+#     )
+
+#     chosen_classes = chosen_classes_per_dataset[dataset_name]
+
+#     train_data = filter_dataset(train_data, chosen_classes)
+#     test_data = filter_dataset(test_data, chosen_classes)
+
+#     train_data = tokenize_data(
+#         train_data, model.tokenizer, config.context_length, device
+#     )
+#     test_data = tokenize_data(
+#         test_data, model.tokenizer, config.context_length, device
+#     )
+
+#     print(f"Running evaluation for layer {config.layer}")
+#     hook_name = f"blocks.{config.layer}.hook_resid_post"
+
+#     llm_batch_size = LLM_NAME_TO_BATCH_SIZE[config.model_name]
+#     llm_dtype = LLM_NAME_TO_DTYPE[config.model_name]
+
+#     all_train_acts_BLD = get_all_llm_activations(
+#         train_data, model, llm_batch_size, hook_name
+#     )
+#     all_test_acts_BLD = get_all_llm_activations(
+#         test_data, model, llm_batch_size, hook_name
+#     )
+
+#     all_train_acts_BD = create_meaned_model_activations(
+#         all_train_acts_BLD
+#     )
+#     all_test_acts_BD = create_meaned_model_activations(
+#         all_test_acts_BLD
+#     )
+
+#     results_dict = {}
+
+
+#     llm_probes, llm_test_accuracies = train_probe_on_activations(
+#         all_train_acts_BD,
+#         all_test_acts_BD,
+#         select_top_k=None,
+#     )
+
+#     llm_results = {"llm_test_accuracy": average_test_accuracy(llm_test_accuracies)}
+
+#     for k in config.k_values:
+#         llm_top_k_probes, llm_top_k_test_accuracies = (
+#             train_probe_on_activations(
+#                 all_train_acts_BD,
+#                 all_test_acts_BD,
+#                 select_top_k=k,
+#             )
+#         )
+#         llm_results[f"llm_top_{k}_test_accuracy"] = average_test_accuracy(
+#             llm_top_k_test_accuracies
+#         )
+
+#     import gc
+
+#     for i, sae in enumerate(tqdm(
+#         [
+#             sae,
+#             OMPSAE(atoms, OMP_L0),
+#             OMPSAE(sae.W_dec, OMP_L0),
+#         ],
+#         desc="Running SAE evaluation on all selected SAEs",
+#     )):
+#         gc.collect()
+#         torch.cuda.empty_cache()
+
+#         sae_name = sae.__class__.__name__
+
+#         # if "topk" in sae_name:
+#         #     assert isinstance(sae.activation_fn, TopK)
+
+#         all_sae_train_acts_BF = get_sae_meaned_activations(
+#             all_train_acts_BLD, sae, config.sae_batch_size, llm_dtype
+#         )
+#         all_sae_test_acts_BF = get_sae_meaned_activations(
+#             all_test_acts_BLD, sae, config.sae_batch_size, llm_dtype
+#         )
+
+#         _, sae_test_accuracies = train_probe_on_activations(
+#             all_sae_train_acts_BF,
+#             all_sae_test_acts_BF,
+#             select_top_k=None,
+#             use_sklearn=False,
+#             batch_size=250,
+#             epochs=100,
+#             lr=1e-2,
+#         )
+
+#         results_dict[sae_name] = {}
+
+#         for llm_result_key, llm_result_value in llm_results.items():
+#             results_dict[sae_name][llm_result_key] = llm_result_value
+
+#         results_dict[sae_name]["sae_test_accuracy"] = average_test_accuracy(
+#             sae_test_accuracies
+#         )
+
+#         for k in config.k_values:
+#             sae_top_k_probes, sae_top_k_test_accuracies = (
+#                 train_probe_on_activations(
+#                     all_sae_train_acts_BF,
+#                     all_sae_test_acts_BF,
+#                     select_top_k=k,
+#                 )
+#             )
+#             results_dict[sae_name][f"sae_top_{k}_test_accuracy"] = (
+#                 average_test_accuracy(sae_top_k_test_accuracies)
+#             )
+
+#         print(results_dict)

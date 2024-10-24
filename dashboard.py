@@ -7,16 +7,17 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
-from main import OMP_L0, SEQ_LEN, TRAIN_SIZE
-from transformers import GPT2Tokenizer
+from main import OMP_L0, SEQ_LEN, TRAIN_SIZE, GPT2, GEMMA2
+from transformers import GPT2Tokenizer, AutoTokenizer
+from transformer_lens import HookedTransformer
 
-from meta_saes.sae import load_feature_splitting_saes
+from meta_saes.sae import load_feature_splitting_saes, load_gemma_sae
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 st.set_page_config(layout="wide")
 
-# Include necessary functions
-
+MODEL_NAME = GEMMA2
+SEQ_LEN = 128
 
 def match_activation(search_activation, all_activations):
     if all_activations.shape[-1] != search_activation.shape[0]:
@@ -127,16 +128,32 @@ def generate_test_samples(activations, feature_sample_count, tokens):
 # Load data
 @st.cache_resource
 def load_data():
-    model, saes, token_dataset = load_feature_splitting_saes(
-        device=device,
-        saes_idxs=list(range(1, 2)),
-    )
-    atoms = torch.load("data/gpt2/atoms.pt")
-    omp_activations = torch.load("data/gpt2/omp_activations.pt").reshape(
+    torch.set_grad_enabled(False)
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if MODEL_NAME == GPT2:
+        model, saes, token_dataset = load_feature_splitting_saes(
+            device=device,
+            saes_idxs=list(range(1, 9)),
+        )
+    elif MODEL_NAME == GEMMA2:
+        model, saes, token_dataset = load_gemma_sae(
+            release="gemma-scope-2b-pt-res",
+            sae_id="layer_12/width_16k/average_l0_41",
+            device=device,
+            dataset="NeelNanda/pile-10k",
+        )
+    else:
+        raise ValueError("Invalid model")
+
+    atoms = torch.load(f"data/{MODEL_NAME}/atoms.pt")
+    omp_activations = torch.load(f"data/{MODEL_NAME}/omp_activations.pt").reshape(
         -1, SEQ_LEN, OMP_L0
     )
-    omp_indices = torch.load("data/gpt2/omp_indices.pt").reshape(-1, SEQ_LEN, OMP_L0)
-    model_activations = torch.load(f"data/gpt2/model_activations.pt")
+    omp_indices = torch.load(f"data/{MODEL_NAME}/omp_indices.pt").reshape(-1, SEQ_LEN, OMP_L0)
+    model_activations = torch.load(f"data/{MODEL_NAME}/model_activations.pt")
     train_activations = model_activations[:TRAIN_SIZE]
     normed_activations = train_activations / train_activations.norm(dim=2).unsqueeze(2)
     tokens = torch.stack([s["tokens"] for s in token_dataset])[:, :SEQ_LEN].to(device)
@@ -146,11 +163,10 @@ def load_data():
 model, saes, atoms, omp_activations, omp_indices, normed_activations, tokens = (
     load_data()
 )
+tokenizer = model.tokenizer
 
 TRAIN_SIZE = 10000
 
-# Load tokenizer
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
 # Read query parameters
 params = st.query_params
@@ -193,11 +209,8 @@ if page == "activation_interface":
         zip(activations, indices), key=lambda x: x[0], reverse=True
     )
 
-    # Get the title
     title = highlight_string(tokens[TRAIN_SIZE + input_idx], token_idx, tokenizer)
     st.subheader(title)
-
-    # Build rows
     rows = []
 
     for a, i in sorted_activations_indices:
@@ -212,7 +225,7 @@ if page == "activation_interface":
             activation_text = f"{a:.2f}"
             rows.append(
                 {
-                    "Index": atom_input_idx,
+                    "Atom": i,
                     "Activation": activation_text,
                     "String": highlighted_string,
                     "Color": color,
@@ -225,7 +238,7 @@ if page == "activation_interface":
     header_col1, header_col2, header_col3 = st.columns([1, 1, 10])
 
     with header_col1:
-        st.markdown("**Index**")
+        st.markdown("**Atom**")
     with header_col2:
         st.markdown("**Activation**")
     with header_col3:
@@ -233,7 +246,7 @@ if page == "activation_interface":
 
     # Create rows for each entry in the data
     for row in rows:
-        atom_index = row["Index"]
+        atom_index = row["Atom"]
         activation = row["Activation"]
         string = row["String"]
         color = row["Color"]
@@ -257,10 +270,9 @@ if page == "activation_interface":
 
 elif page == "test_samples":
     # Test Samples Page
-    atom_index = int(params.get("atom_index", [0])[0])
+    atom_index = int(params.get("atom_index", [0]))
     st.title(f"Test Samples for Atom {atom_index}")
 
-    # Provide UI control to select the atom index
     atom_index = st.number_input(
         "Atom index",
         min_value=0,
@@ -269,16 +281,14 @@ elif page == "test_samples":
         step=1,
     )
 
-    # Update the query parameters based on user input
     st.query_params.atom_index = atom_index
 
-    # Compute activations for this atom
     mask = omp_indices == atom_index
     feature_activations = omp_activations * mask
     dense_omp_activations = np.sum(feature_activations, axis=-1)
     dense_omp_activations = np.expand_dims(
         dense_omp_activations, axis=-1
-    )  # Shape (samples, seq_len, 1)
+    )
     if np.max(dense_omp_activations) != 0:
         dense_omp_activations = dense_omp_activations / dense_omp_activations.max()
     dense_omp_activations[dense_omp_activations < 0.0] = 0.0
