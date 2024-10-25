@@ -363,8 +363,8 @@ if __name__ == "__main__":
 
 
 class ITO_SAE:
-    def __init__(self, atoms, l0=8, ito_fn='omp'):
-        self.atoms = atoms
+    def __init__(self, atoms, l0=8, ito_fn='omp', device='cpu'):
+        self.atoms = atoms.to(device)
         self.l0 = l0
         self.ito = omp_pytorch if ito_fn == OMP else gp_pytorch
 
@@ -383,3 +383,7 @@ class ITO_SAE:
 
     def decode(self, x, acts):
         return torch.mm(acts, self.atoms) * x.norm(dim=1).unsqueeze(1)
+
+    @property
+    def W_dec(self):
+        return self.atoms

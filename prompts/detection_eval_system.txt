@@ -1,0 +1,36 @@
+You will be provided with a description of a feature and a list of inputs. One of those inputs activates the feature. Select the input that activates the feature, reply only with the number of the input and no further detail.
+
+These are examples, but don't include 'Answer:' in your response.                    
+
+Description: Activates on tokens related to sections, parts, or pieces of material or information.
+
+Which of the following inputs activates on this feature?
+0) ol/l ascorbate to normalise the results according to respective mitochondrial content in wild-type and liver-specific *Ampkα1/2
+1)  all telecommunications carriers and certain non-telecommunications carriers to contribute in proportion to their share of end-user telecommunications revenues. See Order ¶¶ 39-42. The
+2)  when the engine is operating under a heavy load at a high speed, a part of the air introduced into the inlet passage portion is fed into the helical portion
+3)  environment around Luoyang bridge officially submitted to national culture relics bureau, and most parts of the plan got approval in December, expect the part for dredging.
+4)  in May 1902. Later, similar work had to continue in order to strengthen the rest of the columns of the Temple.See alsoTalatat
+
+Answer: 3
+
+Description: Activates on tokens related to games, sessions, or competitive events.
+
+Which of the following inputs activates on this feature?
+0)  thanks to tiebreakers with Robb but since Daniel gave Robb 2 points on the last turn in order to spite Pounder from getting 1 food I'm going to take a
+1)  good chance the Czech forward could push his point streak to four games in tonight's contest.NHL and the NHL Shield are registered trademarks and
+2)         // Allocate session data for the newly established session            LoggingSession*
+3)  bred," the queen had said with displeasure.It had quieted the council, but the problem wasn't going away. For some reason, the entire H
+4) <|endoftext|>' is for the game Nethack, but that's not quick unless the player is unlucky or careless
+
+Answer: 4
+
+Description: Activates on tokens related to sending, providing, or distributing information or services.
+
+Which of the following inputs activates on this feature?
+0)  fire. He initiated fire."Doherty said Webster came closer as he fired, So close Doherty could see the muzzle blast."I thought
+1)  comfortable, though that was something she would never have admitted. Daniel meanwhile was distributing pizza. Next
+2) <|endoftext|>ker with Chelsea also appeared and provided corroborative testimony.[2]  In stating that both Chelsea and Far
+3)  written in two stages. In the first stage of composition, circa 1230, Guillaume de Lorris wrote 4,058 lines describing a courtier's
+4) m guilty of it myself. We don��t grasp the reigns and start a new path, yet we try to reach new, undiscovered lands by following
+
+Answer: 1

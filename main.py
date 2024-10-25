@@ -408,7 +408,6 @@ if __name__ == "__main__":
         dense_omp_activations[:, :, i] = np.sum(feature_activations, axis=-1)
 
     dense_omp_activations = dense_omp_activations / dense_omp_activations.max()
-    dense_omp_activations[dense_omp_activations < 0.0] = 0.0
 
     verbose = True
     omp_tests = generate_test_samples(
