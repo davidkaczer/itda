@@ -98,3 +98,5 @@ Prompt:
 0.00 ., if![$$\\vert \\mathcal{E}\\vert<<< =>>> n_{\\mathcal{E}}$$](A271843_
 -0.18  inside!" "Do it now!" "Okay!" "Ooh!" "E<<<w>>>!" "Willie, we are going to die!" "Lt's soft."
 Description: Activates on language relating to violence or conflict.
+
+Answer strictly with a single sentence describing the behaviour of the feature, after "Description: ". Don't go into detail or provide examples.

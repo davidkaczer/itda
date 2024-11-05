@@ -1,0 +1,49 @@
+You will be provided a description of a feature, and a list of activation-input pairs with the token corresponding to the activation highlight with <<>>. One of these activations is incorrect. Based on the description of the feature, your task is to respond with which answer is incorrect. Answer only with the number of the incorrect activation, and no further detail.
+
+These are examples, but don't include 'Answer:' in your response.                    
+
+Description: Activates on the term "long," which often indicates a duration of time, ongoing expectations or desires, and themes of memory or longing. This activation can be seen through several contexts that reflect on emotional states, personal reflections, or even specific narratives connecting to duration or unfulfilled desires.
+
+Which of the following activations is incorrect?
+0) 2.34  to goats. KCR is one such person. A criminal by constitution he had<<< long>>> forgone his human nature and turned a pig, BIG. His Telangana
+1) 1.56 <|endoftext|>A memory long fogoton, fading into the past. How the heart<<< long>>>s, but the memories never last.A broken heart,shatted dreams,
+2) 1.51 IYO ISHIDA"_________________Shattered MemoriesA memory<<< long>>> fogoton, fading into the past. How the heart longs, but
+3) 0.00  set of 30 Graves's disease patients being independent of the training set, regarded as<<< test>>> set for thyroid volume measurements were used for comparisons and performance analyses. In this study
+4) 1.41  temp = [now, _data.disk];    disk.<<<push>>>(temp);    dataset = [     
+
+Answer: 4
+
+Description: Activates on tokens related to the second-person pronoun "you" and expressions of personal engagement or address. 
+
+Which of the following activations is incorrect?
+0) 0.58 <|endoftext|> of it.You<<<'re>>> waiting, then, for something just like thatto wander into view so that
+1) 0.00  feel so unstable fucking hate my label��. (��I wasn�<<<�>>>t going through hate with them
+2) 0.00 , he'll know right where is it." "You'll see." "If<<< we>>> could get to the Cauldron first and destroy it..." " Oh
+3) 0.00 �e jsem to dal jako kus d��eva a<<<>>>plot m��j otec mi zlomil nohu, t
+4) 0.71 ally, women make up 24.7 per cent of Parliament, compared to the<<< U>>>.S. Congress where women account for just 17.8 per cent of representatives
+
+Answer: 4
+
+Description: Activates on terms related to measurement, assessment, or evaluation, particularly those indicating relationships of quantity, duration, or efficacy.
+
+Which of the following activations is incorrect?
+0) 1.61 )Intellectual decline after stroke: the Framingham Study.The causes and<<< characteristics>>> of cognitive decline after stroke are poorly defined, because most studies have relied on the
+1) 0.44  Grillot talks with geographer Kathleen O��Reilly about the gender and social<<< issues>>> of sanitation projects in India.In light of this week��s
+2) 1.09 1){ref-type="supplementary-material"}). The metabolite<<< patterns>>> suggested that S84 glycosylation imparted a specific metabolic effect
+3) 0.00 ." Merriam-Webster's Collegiate Dictionary 313 (10th ed<<<.>>> 1994). GTE claims that by using the word "designate," Congress instructed
+4) 0.00  forego any legal action in courts.The company that is still negotiating<<< is>>> Farmaca, which Bartlett Díaz expects to fall into line ��
+
+Answer: 2
+
+Description: Activates on language related to invitations and summons, indicating a context of being asked or requested to participate in an event or legal matter.
+
+Which of the following activations is incorrect?
+0) 1.36  competition, with a US$5,000 reward,  in which participants were<<< invited>>> to find five "suspects" in a simulated law enforcement search in five
+1) 0.00  Hebrew prayer book, which I discovered among my father's books in the course of<<< reading>>> my way through his library. In this prayer book there was a newspaper clipping about
+2) 0.49  anybody?""No, but you spent endless hours talking in an irritating<<< tone>>> about
+3) 0.00 <|endoftext|> Baby Wolf wrapped<<< in>>> their only blanket, huddled in front of the embers of the fire made
+4) 0.00  15.50 10 30.90 13 76 15 73 15 14.90 15<<< 75>>> 14 73 14 14.80 14 81 8 76 11 15.70 10 22
+
+Answer: 2
+
+When you respond, don't say "Answer: " just provide the number of the answer directly with no further information.
