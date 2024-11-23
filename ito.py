@@ -59,11 +59,8 @@ class ITO_SAE:
         x = x.to(self.atoms.device)
         shape = x.size()
         x = x.view(-1, shape[-1])
-        coefs, indices = omp_pytorch(self.atoms, x, self.l0)
-        expanded = torch.zeros((x.size(0), self.atoms.size(0)), device=x.device)
-        expanded.scatter_(1, indices, coefs)
-        expanded = expanded.view(*shape[:-1], -1)
-        return expanded.to(original_device)
+        activations = omp_pytorch(self.atoms, x, self.l0)
+        return activations
 
     def decode(self, acts):
         original_device = acts.device
@@ -87,7 +84,7 @@ class ITO_SAE:
         return self.atoms.dtype
 
 
-def omp_pytorch_naive(D, x, n_nonzero_coefs):
+def omp_pytorch(D, x, n_nonzero_coefs):
     """
     Naive implementation of Orthogonal Matching Pursuit (OMP) in PyTorch.
 
@@ -130,7 +127,10 @@ def omp_pytorch_naive(D, x, n_nonzero_coefs):
             coef[invalid_coefs] = 0.0
         recon = torch.bmm(A, coef.unsqueeze(2)).squeeze(2)
         residual = x - recon
-    return coef, indices
+    activations = torch.zeros((x.size(0), n_atoms), device=x.device)
+    activations.scatter_(1, indices, coef)
+    activations = activations.view(*x.shape[:-1], -1)
+    return activations
 
 
 def update_plot(
