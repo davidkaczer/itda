@@ -19,6 +19,7 @@ st.set_page_config(layout="wide")
 MODEL_NAME = GEMMA2
 SEQ_LEN = 128
 
+
 def match_activation(search_activation, all_activations):
     if all_activations.shape[-1] != search_activation.shape[0]:
         raise ValueError(
@@ -152,7 +153,9 @@ def load_data():
     omp_activations = torch.load(f"data/{MODEL_NAME}/omp_activations.pt").reshape(
         -1, SEQ_LEN, OMP_L0
     )
-    omp_indices = torch.load(f"data/{MODEL_NAME}/omp_indices.pt").reshape(-1, SEQ_LEN, OMP_L0)
+    omp_indices = torch.load(f"data/{MODEL_NAME}/omp_indices.pt").reshape(
+        -1, SEQ_LEN, OMP_L0
+    )
     model_activations = torch.load(f"data/{MODEL_NAME}/model_activations.pt")
     train_activations = model_activations[:TRAIN_SIZE]
     normed_activations = train_activations / train_activations.norm(dim=2).unsqueeze(2)
@@ -256,9 +259,7 @@ if page == "activation_interface":
 
         # Render the values in their respective columns
         with col1:
-            link = (
-                f'<a href="?page=test_samples&atom_index={atom_index}" target="_self">{atom_index}</a>'
-            )
+            link = f'<a href="?page=test_samples&atom_index={atom_index}" target="_self">{atom_index}</a>'
             st.markdown(link, unsafe_allow_html=True)
         with col2:
             st.markdown(
@@ -286,9 +287,7 @@ elif page == "test_samples":
     mask = omp_indices == atom_index
     feature_activations = omp_activations * mask
     dense_omp_activations = np.sum(feature_activations, axis=-1)
-    dense_omp_activations = np.expand_dims(
-        dense_omp_activations, axis=-1
-    )
+    dense_omp_activations = np.expand_dims(dense_omp_activations, axis=-1)
     if np.max(dense_omp_activations) != 0:
         dense_omp_activations = dense_omp_activations / dense_omp_activations.max()
     dense_omp_activations[dense_omp_activations < 0.0] = 0.0

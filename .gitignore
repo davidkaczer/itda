@@ -1,4 +1,8 @@
 artifacts/
 data/
 nohup.out
+eval_results/
+cuda/
 __pycache__/
+scratch.py
+

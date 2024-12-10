@@ -43,7 +43,6 @@ if __name__ == "__main__":
     model_activations = torch.load(f"data/{model_name}/model_activations.pt")
 
     model, saes, token_dataset = load_model(
-        # args.model, device=device, gpt2_saes=range(8, 9)
         args.model,
         device=device,
         gpt2_saes=range(1, 2),
@@ -53,7 +52,7 @@ if __name__ == "__main__":
     atoms = torch.load(f"data/{model_name}/atoms.pt")
     ito_cfg = copy(sae.cfg)
     ito_cfg.device = "cpu"
-    ito_sae = ITO_SAE(atoms, l0=40, cfg=ito_cfg)
+    ito_sae = ITO_SAE(atoms, l0=args.l0, cfg=ito_cfg)
 
     print(
         f"Evaluating an ITO SAE with {ito_sae.W_dec.size(0)} atoms against an SAE with {sae.W_dec.size(0)} atoms"
@@ -80,14 +79,10 @@ if __name__ == "__main__":
     print("---- SPARSE PROBING -----")
     eval_config = SparseProbingEvalConfig(
         sae_batch_size=512,
-        probe_train_set_size=10,
-        probe_test_set_size=10,
+        probe_train_set_size=100,
+        probe_test_set_size=100,
         model_name=args.model,
         llm_dtype="float32",
-        dataset_names=[
-            "LabHC/bias_in_bios_class_set1",
-        ],
-        k_values=[1],
     )
     activation_store = ActivationsStore.from_sae(model, sae, context_size=context_size)
     ito_sae_sparse_probe = run_sparse_probing(
