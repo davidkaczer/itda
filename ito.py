@@ -451,7 +451,7 @@ def construct_atoms(
     losses = []
     ratio_history = []
 
-    pbar = tqdm(total=remaining_activations.size(0))
+    pbar = tqdm(total=remaining_activations.size(0), desc="Constructing Atoms")
     batch_counter = 0
     while remaining_activations.size(0) > 0:
         batch_activations = remaining_activations[:batch_size]
@@ -501,19 +501,19 @@ def construct_atoms(
 
 def evaluate(sae, model_activations, batch_size=32):
     losses = []
-    for batch in tqdm(torch.split(model_activations, batch_size)):
-        batch = batch.flatten(end_dim=1).to(sae.device)
+    for batch in tqdm(torch.split(model_activations.flatten(end_dim=1), batch_size), desc="Evaluating"):
         recon = sae(batch)
         loss = (batch - recon) ** 2
         losses.extend(loss.detach().cpu())
     return torch.stack(losses)
 
 
+# TODO: Commonise this into training
 def get_atom_indices(atoms, activations, batch_size: int = 256):
     flattened_activations = activations.view(-1, activations.size(-1))
     num_atoms = atoms.size(0)
     flattened_idxs = torch.empty(num_atoms, dtype=torch.long, device=atoms.device)
-    for start_idx in tqdm(range(0, flattened_activations.size(0), batch_size)):
+    for start_idx in tqdm(range(0, flattened_activations.size(0), batch_size), desc="Getting atom indices"):
         end_idx = min(start_idx + batch_size, flattened_activations.size(0))
         activations_batch = flattened_activations[start_idx:end_idx].to(atoms.device)
         matches = torch.all(atoms[:, None, :] == activations_batch[None, :, :], dim=2)
@@ -654,6 +654,8 @@ if __name__ == "__main__":
         target_loss=args.target_loss,
     )
 
+    model_activations = load_model_activations(args, device)
+
     if len(matching_runs) > 0:
         # Use the first matching run directory
         run_dir = matching_runs[0]
@@ -662,34 +664,12 @@ if __name__ == "__main__":
         with open(os.path.join(run_dir, "metadata.yaml"), "r") as f:
             metadata = yaml.safe_load(f)
 
-        # Load previously computed atoms
         atoms_path = os.path.join(run_dir, "atoms.pt")
         if not os.path.exists(atoms_path):
             raise FileNotFoundError(
                 f"Matched run at {run_dir} does not have atoms.pt, something is wrong."
             )
         atoms = torch.load(atoms_path, weights_only=True)
-
-        # Load model activations (for validation)
-        model_activations = load_model_activations(args, device)
-        test_activations = model_activations[-1000:].to(device)
-        ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
-        eval_losses = evaluate(
-            ito_sae, test_activations.to(device), batch_size=args.batch_size
-        )
-
-        plt.hist(torch.log(eval_losses.mean(-1)).cpu().numpy(), bins=100)
-        plt.savefig(os.path.join(run_dir, "loss_hist.png"))
-        plt.close()
-
-        print(
-            "Mean ITO loss:",
-            eval_losses.mean().item(),
-            "on",
-            len(eval_losses),
-            "samples",
-        )
-
     else:
         # Create a new run if no existing run matches
         run_id = str(uuid.uuid4())
@@ -709,9 +689,7 @@ if __name__ == "__main__":
         with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
             yaml.safe_dump(metadata, f)
 
-        model_activations = load_model_activations(args, device)
-
-        train_size = int(model_activations.size(0) * 0.7) // 4
+        train_size = int(model_activations.size(0) * 0.7)
         train_activations = model_activations[:train_size].to(device)
 
         # Construct atoms
@@ -719,53 +697,39 @@ if __name__ == "__main__":
         losses_path = os.path.join(run_dir, "losses.pkl")
         indices_path = os.path.join(run_dir, "atom_indices.pt")
 
-        if not os.path.exists(atoms_path):
-            atoms, atom_indices, losses = construct_atoms(
-                train_activations,
-                batch_size=args.batch_size,
-                l0=args.l0,
-                target_loss=args.target_loss,
-                run_dir=run_dir,
-            )
-            torch.save(atoms, atoms_path)
-            with open(losses_path, "wb") as f:
-                pickle.dump(losses, f)
-
-            atom_indices = get_atom_indices(
-                atoms.to(device), model_activations, batch_size=1024
-            ).cpu()
-            torch.save(atom_indices, indices_path)
-
-            # Update metadata with the number of atoms
-            metadata["num_atoms"] = atoms.size(0)
-            with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
-                yaml.safe_dump(metadata, f)
-        else:
-            # If already present, just load them
-            atoms = torch.load(atoms_path, weights_only=True)
-            metadata["num_atoms"] = atoms.size(0)
-            with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
-                yaml.safe_dump(metadata, f)
-
-        # Evaluate
-        test_activations = model_activations[-1000:].to(device)
-        ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
-        eval_losses = evaluate(
-            ito_sae, test_activations.to(device), batch_size=args.batch_size
+        atoms, atom_indices, losses = construct_atoms(
+            train_activations,
+            batch_size=args.batch_size,
+            l0=args.l0,
+            target_loss=args.target_loss,
+            run_dir=run_dir,
         )
+        torch.save(atoms, atoms_path)
+        with open(losses_path, "wb") as f:
+            pickle.dump(losses, f)
 
-        plt.hist(torch.log(eval_losses.mean(-1)).cpu().numpy(), bins=100)
-        plt.savefig(os.path.join(run_dir, "loss_hist.png"))
-        plt.close()
+        atom_indices = get_atom_indices(
+            atoms.to(device), model_activations, batch_size=1024
+        ).cpu()
+        torch.save(atom_indices, indices_path)
 
-        print(
-            "Mean ITO loss:",
-            eval_losses.mean().item(),
-            "on",
-            len(eval_losses),
-            "samples",
-        )
+        # Update metadata with the number of atoms
+        metadata["num_atoms"] = atoms.size(0)
+        with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
+            yaml.safe_dump(metadata, f)
 
-        # Example usage of filter_runs
-        matched = filter_runs(base_dir="runs", model="gpt2", layer=8)
-        print("Matching runs with model=gpt2, layer=8:", matched)
+    # Evaluate
+    test_size = int(model_activations.size(0) * 0.3)
+    test_activations = model_activations[-test_size:].to(device)
+    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+    eval_losses = evaluate(
+        ito_sae, test_activations.to(device), batch_size=args.batch_size
+    )
+
+    print(
+        "Mean ITO loss:",
+        eval_losses.mean().item(),
+        "on",
+        len(eval_losses),
+        "samples",
+    )
