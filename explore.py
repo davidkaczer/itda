@@ -2,8 +2,15 @@
 from copy import copy
 
 import torch
+import matplotlib.pyplot as plt
 from IPython.display import HTML, display
-from ito import ITO_SAE, get_model_name, load_model, get_atom_indices
+from ito import (
+    ITO_SAE,
+    get_model_name,
+    load_model,
+    get_atom_indices,
+    to_unbounded_activations,
+)
 from tqdm import tqdm
 
 # %%
@@ -31,7 +38,8 @@ if MAIN:
     )
     tokens = token_dataset["tokens"][:, :SEQ_LEN]
 
-    sae = ITO_SAE(atoms, l0=L0, cfg=copy(saes[0].cfg))
+    sae = ITO_SAE(atoms, l0=8, cfg=copy(saes[0].cfg))
+    # sae = ITO_SAE(atoms, l0=L0, cfg=copy(saes[0].cfg))
 
 # %%
 
@@ -48,8 +56,10 @@ if MAIN:
 # %%
 
 
-def encode_string(string, model, sae, batch_size=32):
-    tokens = model.tokenizer(string, return_tensors="pt")["input_ids"].to(device)
+def get_model_activations(strings, model, batch_size=32):
+    tokens = model.tokenizer(
+        strings, return_tensors="pt", padding=True, truncation=True
+    )["input_ids"].to(device)
 
     model_activations = []
 
@@ -61,8 +71,12 @@ def encode_string(string, model, sae, batch_size=32):
     for batch in tqdm(torch.split(tokens, batch_size), desc="Model"):
         model(batch)
     model.remove_all_hook_fns()
+    acts = torch.stack(model_activations).squeeze(0)
+    return acts
 
-    acts = model_activations[0].flatten(end_dim=1).to(sae.device)
+
+def encode_string(string, model, sae, batch_size=32):
+    acts = get_model_activations([string], model, batch_size=batch_size)
     return sae.encode(acts)
 
 
@@ -101,22 +115,63 @@ def highlight_string(tokens, idx, tokenizer, crop=-1):
     return HTML(str_)
 
 
-if MAIN:
-    s = "Mark went to the shop to buy some milk."
-    encoding = encode_string(s, model, sae)
-    print_decomposition(encoding[8], atom_indices, tokens, model.tokenizer)
+# if MAIN:
+#     s = "Adolf Hitler"
+#     s = "Winston Churchill"
+#     encoding = encode_string(s, model, sae)
+#     encoding = to_unbounded_activations(encoding)
+#     print("Decomposition of:", s)
+#     print_decomposition(encoding[-1], atom_indices, tokens, model.tokenizer)
 
+# Interactive dictionary exploration
+
+dictionary = [
+    "happy",
+    # "joy",
+    "James",
+    # "sad",
+    "anger"
+]
+
+tokens = model.tokenizer(
+    dictionary, return_tensors="pt", padding=True, truncation=True
+)["input_ids"]
+model_activations = get_model_activations(dictionary, model)
+mask = tokens != 50256
+atoms = model_activations[torch.arange(mask.size(0)), mask.float().argmin(dim=-1) - 1]
+sae = ITO_SAE(atoms, l0=len(dictionary), cfg=copy(saes[0].cfg))
+
+s = "I love Mark."
+encoding = encode_string(s, model, sae)
+acts = get_model_activations([s], model)
+recon = sae.decode(encoding)
+loss = (acts - recon).pow(2).mean().item()
+print("Decomposition of:", s, "into", dictionary)
+print("Loss:", loss)
+
+encoding = to_unbounded_activations(encoding).squeeze(0)
+print_decomposition(
+    encoding[1],
+    torch.stack([torch.arange(mask.size(0)), mask.float().argmin(dim=-1) - 1], dim=-1),
+    tokens,
+    model.tokenizer,
+)
 
 # %%
 
-def get_all_activations():
+
+def get_all_activations(sae, model_activations, tokens):
     all_acts = []
     batch_size = 128
     for start_idx in tqdm(range(0, len(model_activations), batch_size)):
-        end_idx = min(len(tokens), start_idx + batch_size)
-        acts = sae.encode(model_activations[start_idx:end_idx])
-        sparse = acts.to_sparse().cpu()
-        all_acts.append(sparse)
+        try:
+            end_idx = min(len(tokens), start_idx + batch_size)
+            acts = sae.encode(model_activations[start_idx:end_idx].to(sae.device))
+            sparse = acts.to_sparse().cpu()
+            all_acts.append(sparse)
+        except torch.OutOfMemoryError:
+            print(f"Out of memory at {start_idx}")
+            break
     return torch.cat(all_acts, dim=0)
 
 
@@ -124,20 +179,22 @@ if MAIN:
     try:
         all_acts = torch.load(f"data/{model_name}/all_acts.pt")
     except FileNotFoundError:
-        all_acts = get_all_activations()
+        all_acts = get_all_activations(sae, model_activations, tokens)
         torch.save(all_acts.coalesce(), f"data/{model_name}/all_acts.pt")
 
     if not all_acts.is_coalesced():
         all_acts = all_acts.coalesce()
 
+
 # %%
 
+
 def print_max_activating_samples(all_acts, atom_idx, tokens, tokenizer, n=20):
-    sparse_active_idxs = (all_acts.indices()[2] == atom_idx) & (all_acts.values() > 0)
+    sparse_active_idxs = (all_acts.indices()[2] == atom_idx) & (all_acts.values() > 0.2)
     active_idxs = all_acts.indices()[:, sparse_active_idxs][:2]
     atom_acts = all_acts.values()[sparse_active_idxs]
 
-    # take a random sample of n activations
+    # take a random sample of n activations
     sample_idxs = torch.randperm(len(atom_acts))[:n]
     active_idxs = active_idxs[:, sample_idxs]
     atom_acts = atom_acts[sample_idxs]
@@ -155,4 +212,16 @@ def print_max_activating_samples(all_acts, atom_idx, tokens, tokenizer, n=20):
         display(HTML(combined_html))
 
 
-print_max_activating_samples(all_acts, 16009, tokens, model.tokenizer)
+atom_idx = 16009
+print_max_activating_samples(all_acts, atom_idx, tokens, model.tokenizer)
+
+# %%
+
+
+def plot_activations_histogram(all_acts, atom_idx):
+    sparse_active_idxs = all_acts.indices()[2] == atom_idx
+    atom_acts = all_acts.values()[sparse_active_idxs]
+    plt.hist(atom_acts.cpu().numpy(), bins=100)
+
+
+plot_activations_histogram(all_acts, atom_idx)

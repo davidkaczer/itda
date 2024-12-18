@@ -6,20 +6,26 @@ using these methods.
 
 import argparse
 import contextlib
-from dataclasses import dataclass, field
 import gc
 import os
 import pickle
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 import cupy as cp
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
+from datasets import load_dataset
+from sae_lens import SAE
+from sae_lens.load_model import load_model as sae_lens_load_model
 from sae_lens.toolkit.pretrained_saes_directory import get_pretrained_saes_directory
 from tqdm import tqdm
+from transformer_lens import HookedTransformer
+from transformer_lens.utils import tokenize_and_concatenate
 
-from meta_saes.sae import load_feature_splitting_saes, load_gemma_sae
+import wandb
 
 OMP_BATCH_SIZE = 512
 OMP_L0 = 40
@@ -32,6 +38,110 @@ GP = "gp"
 
 SEQ_LEN = 128
 DATASET = "NeelNanda/pile-10k"
+
+
+def load_feature_splitting_saes(device="cpu", saes_idxs=list(range(1, 9))):
+    saes = []
+    api = wandb.Api()
+
+    class BackwardsCompatibleUnpickler(pickle.Unpickler):
+        """
+        An Unpickler that can load files saved before the "sae_lens" package namechange
+        """
+
+        def find_class(self, module: str, name: str):
+            if name == "LanguageModelSAERunnerConfig":
+                return super().find_class("sae_lens.config", name)
+            return super().find_class(module, name)
+
+    class BackwardsCompatiblePickleClass:
+        Unpickler = BackwardsCompatibleUnpickler
+
+    for i in saes_idxs:
+        wandb_link = f"jbloom/mats_sae_training_gpt2_feature_splitting_experiment/sparse_autoencoder_gpt2-small_blocks.8.hook_resid_pre_{768 * 2**(i-1)}:v9"
+
+        artifact = api.artifact(
+            wandb_link,
+            type="model",
+        )
+        artifact_dir = artifact.download()
+        file = os.listdir(artifact_dir)[0]
+
+        state_dict = torch.load(
+            os.path.join(artifact_dir, file),
+            pickle_module=BackwardsCompatiblePickleClass,
+        )
+        state_dict["cfg"].activation_fn_kwargs = None
+        state_dict["cfg"].model_kwargs = None
+        state_dict["cfg"].model_from_pretrained_kwargs = None
+        state_dict["cfg"].sae_lens_version = None
+        state_dict["cfg"].sae_lens_training_version = None
+        state_dict["cfg"].activation_fn_str = "relu"
+        state_dict["cfg"].dtype = "torch.float32"
+        state_dict["cfg"].finetuning_scaling_factor = 1.0
+        state_dict["cfg"].hook_name = "blocks.8.hook_resid_pre"
+        state_dict["cfg"].hook_layer = 8
+        instance = SAE(cfg=state_dict["cfg"])
+        instance.finetuning_scaling_factor = nn.Parameter(torch.tensor(1.0))
+        state_dict["state_dict"]["finetuning_scaling_factor"] = nn.Parameter(
+            torch.tensor(1.0)
+        )
+        instance.load_state_dict(state_dict["state_dict"], strict=True)
+        instance.to(device)
+
+        saes.append(instance)
+
+    model = sae_lens_load_model("HookedTransformer", "gpt2-small", device=device)
+
+    dataset = load_dataset(
+        path="NeelNanda/pile-10k",
+        split="train",
+        streaming=False,
+    )
+    token_dataset = tokenize_and_concatenate(
+        dataset=dataset,  # type: ignore
+        tokenizer=model.tokenizer,  # type: ignore
+        streaming=False,
+        add_bos_token=saes[0].cfg.prepend_bos,
+    )
+
+    return model, saes, token_dataset
+
+
+def load_gemma_sae(
+    release="gemma-scope-2b-pt-res-canonical",
+    sae_id="layer_3/width_16k/canonical",
+    dataset="NeelNanda/c4-10k",
+    device="cuda",
+):
+
+    sae, cfg_dict, sparsity = SAE.from_pretrained(
+        release=release,
+        sae_id=sae_id,
+        device=device,
+    )
+    sae.eval()
+
+    model = HookedTransformer.from_pretrained_no_processing(
+        cfg_dict["model_name"], device=device
+    )
+    model.eval()
+
+    dataset = load_dataset(
+        path=dataset,
+        split="train",
+        streaming=False,
+    )
+
+    token_dataset = tokenize_and_concatenate(
+        dataset=dataset,
+        tokenizer=model.tokenizer,
+        streaming=False,
+        max_length=sae.cfg.context_size,
+        add_bos_token=sae.cfg.prepend_bos,
+    )
+
+    return model, [sae], token_dataset
 
 
 @dataclass
@@ -69,6 +179,22 @@ def get_gpu_tensors():
         print(f"Tensor: {tensor.shape}, Memory: {memory_mb:.2f} MB")
 
 
+def to_nonnegative_activations(activations):
+    # force non-negative activations at cost of doubling the apparent number of latents
+    positive_activations = activations.clamp(min=0.0)
+    negative_activations = activations.clamp(max=0.0)
+    activations = torch.cat([positive_activations, negative_activations], dim=-1)
+    return activations
+
+
+def to_unbounded_activations(activations):
+    half_dim = activations.size(-1) // 2
+    positive_activations = activations[..., :half_dim]
+    negative_activations = activations[..., half_dim:]
+    original_activations = positive_activations + negative_activations
+    return original_activations
+
+
 # TODO: Save the L0 and config alongside the the atoms.
 class ITO_SAE:
     def __init__(self, atoms, l0=8, cfg=None):
@@ -77,22 +203,24 @@ class ITO_SAE:
         self.cfg = cfg
 
     def encode(self, x):
-        # XXX: Janky af but required for sae bench I think?
-        x = x.to(self.atoms.device)
         shape = x.size()
+        # flatten batch*seq_len
         x = x.view(-1, shape[-1])
-        # activations = omp_pytorch(self.atoms, x, self.l0)
         activations = omp_incremental_cholesky_with_fallback(self.atoms, x, self.l0)
+        activations = to_nonnegative_activations(activations)
         return activations.view(*shape[:-1], -1)
 
-    def decode(self, acts):
-        original_device = acts.device
-        acts = acts.to(self.atoms.device)
-        return torch.matmul(acts, self.atoms).to(original_device)
+    def decode(self, activations):
+        original_activations = to_unbounded_activations(activations)
+        original_device = original_activations.device
+        original_activations = original_activations.to(self.atoms.device)
+        return torch.matmul(original_activations, self.atoms).to(original_device)
 
     @property
     def W_dec(self):
-        return self.atoms
+        # When acting as an SAE, our activations are non-negative, so our W_dec
+        # is also doubled up.
+        return torch.cat([self.atoms, -self.atoms], dim=0)
 
     def __call__(self, x):
         acts = self.encode(x)
@@ -199,7 +327,9 @@ def omp_incremental_cholesky(D, x, n_nonzero_coefs, device=None):
     )
     residual = x.clone()  # (batch_size, n_features)
     selected_atoms = torch.zeros(
-        (batch_size, n_nonzero_coefs, n_features), device=device, dtype=D.dtype,
+        (batch_size, n_nonzero_coefs, n_features),
+        device=device,
+        dtype=D.dtype,
     )
     available_atoms = torch.ones((batch_size, n_atoms), dtype=torch.bool, device=device)
 
@@ -559,9 +689,11 @@ if __name__ == "__main__":
     del model_activations
 
     model, saes, token_dataset = load_model(
-        args.model, layer=args.layer, device=device, gpt2_saes=list(range(1, 2))
+        args.model, layer=args.layer, device=device, gpt2_saes=list(range(1, 9))
     )
     del model, token_dataset
+
+    test_activations = test_activations[-1_000:].to(device)
 
     # saes_losses = []
     # for sae in saes:
@@ -579,38 +711,40 @@ if __name__ == "__main__":
     #         "samples",
     #     )
 
-    # ito_sae = ITO_SAE(saes[-3].W_dec.cpu(), l0=args.l0)
-    # print(f"Evaluating ITO W_dec SAE with {saes[-3].W_dec.size(0)} atoms")
-    # del saes
-    # losses = evaluate(
-    #     ito_sae,
-    #     test_activations.cpu(),
-    #     batch_size=args.batch_size,
-    # )
-    # print(
-    #     "Mean ITO W_dec loss:",
-    #     losses.mean().item(),
-    #     "on",
-    #     len(losses),
-    #     "samples",
-    # )
-
-    print(f"Evaluating ITO SAE with {atoms.size(0)} atoms")
-    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+    ito_sae = ITO_SAE(saes[-3].W_dec.cpu(), l0=args.l0)
+    print(f"Evaluating ITO W_dec SAE with {saes[-3].W_dec.size(0)} atoms")
+    del saes
     losses = evaluate(
         ito_sae,
-        # TODO: Improve decide handling for large datasets of activations
-        test_activations[-10_000:].to(device),
+        test_activations.cpu(),
         batch_size=args.batch_size,
     )
-
-    plt.hist(torch.log(losses.mean(-1)).cpu().numpy(), bins=100)
-    plt.savefig(f"data/{model_name}/loss_hist.png")
-
     print(
-        "Mean ITO loss:",
+        "Mean ITO W_dec loss:",
         losses.mean().item(),
         "on",
         len(losses),
         "samples",
     )
+
+    # for l0 in [8, 10, 12,16, 32]:
+    #     print(f"Evaluating ITO SAE with {atoms.size(0)} atoms with l0 {l0}")
+    #     ito_sae = ITO_SAE(atoms.to(device), l0=l0)
+    #     # ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+    #     losses = evaluate(
+    #         ito_sae,
+    #         # TODO: Improve decide handling for large datasets of activations
+    #         test_activations.to(device),
+    #         batch_size=args.batch_size,
+    #     )
+
+    #     plt.hist(torch.log(losses.mean(-1)).cpu().numpy(), bins=100)
+    #     plt.savefig(f"data/{model_name}/loss_hist.png")
+
+    #     print(
+    #         "Mean ITO loss:",
+    #         losses.mean().item(),
+    #         "on",
+    #         len(losses),
+    #         "samples",
+    #     )

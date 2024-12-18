@@ -129,12 +129,12 @@ def run_evals(
                 "eval_results/tpp",
                 force_rerun,
                 clean_up_activations=True,
-                save_activations=save_activations,
             )
         ),
         "sparse_probing": (
             lambda: sparse_probing.run_eval(
                 sparse_probing.SparseProbingEvalConfig(
+                    # dataset_names=["LabHC/bias_in_bios_class_set1"],
                     model_name=model_name,
                     random_seed=RANDOM_SEED,
                     llm_batch_size=llm_batch_size,
@@ -190,22 +190,13 @@ if __name__ == "__main__":
 
     device = general_utils.setup_environment()
 
-    # model_name = "pythia-70m-deduped"
-    model_name = "gemma-2-2b"
-    d_model = MODEL_CONFIGS[model_name]["d_model"]
-    llm_batch_size = MODEL_CONFIGS[model_name]["batch_size"]
-    if model_name == "gemma-2-2b":
-        llm_batch_size = 1
-
-    llm_dtype = MODEL_CONFIGS[model_name]["dtype"]
-
     eval_types = [
-        # "absorption", # not sure this applies to omp?
+        # "absorption", # not sure this applies to omp? or it might just be broken
         # "autointerp",
-        # "core",
+        "core",
         "scr",
         "tpp",
-        # "sparse_probing",
+        "sparse_probing",
         # "unlearning", # doesn't apply to gpt2
     ]
 
@@ -229,7 +220,7 @@ if __name__ == "__main__":
     _, saes, _ = load_model(
         "gpt2",
         device=device,
-        gpt2_saes=[1]#, 3, 5],
+        gpt2_saes=[2, 4, 6],
     )
     llm_batch_size = 128
     for sae in saes:
@@ -240,7 +231,8 @@ if __name__ == "__main__":
     selected_saes = [(f"gpt2_layer_8_sae_{sae.W_dec.size(0)}", sae) for sae in saes]
 
     atoms = torch.load(f"data/gpt2_layer_8_l0_40_target_loss_3.0/atoms.pt").to(device)
-    ito_sae = ITO_SAE(atoms, l0=40, cfg=ITO_SAEConfig(
+    # XXX: different target l0 to gpt2 as loss is the same but runs faster
+    ito_sae = ITO_SAE(atoms, l0=12, cfg=ITO_SAEConfig(
         model_name="gpt2",
         dtype=llm_dtype,
         d_in=d_model,
@@ -255,7 +247,7 @@ if __name__ == "__main__":
         seqpos_slice=saes[0].cfg.seqpos_slice,
         device=device,
     ))
-    selected_saes.append(("gpt2_layer_8_ito_sae", ito_sae))
+    selected_saes.append(("gpt2_layer_8_ito_sae_", ito_sae))
     run_evals(
         "gpt2",
         selected_saes,
