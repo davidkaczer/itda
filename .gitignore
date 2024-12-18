@@ -1,4 +1,5 @@
 artifacts/
+runs/
 data/
 nohup.out
 eval_results/

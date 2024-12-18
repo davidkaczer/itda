@@ -9,6 +9,7 @@ import contextlib
 import gc
 import os
 import pickle
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -17,6 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import yaml
 from datasets import load_dataset
 from sae_lens import SAE
 from sae_lens.load_model import load_model as sae_lens_load_model
@@ -38,6 +40,27 @@ GP = "gp"
 
 SEQ_LEN = 128
 DATASET = "NeelNanda/pile-10k"
+
+
+@dataclass
+class ITO_SAEConfig:
+    model_name: str
+    d_in: int
+    d_sae: int
+    hook_layer: int
+    hook_name: str
+    dtype: str
+
+    context_size: int = None
+    dtype: str = ""
+    device: str = ""
+
+    model_from_pretrained_kwargs: Dict = field(default_factory=dict)
+    hook_head_index: Optional[int] = None
+    prepend_bos: bool = True
+    normalize_activations: str = "none"
+    dataset_trust_remote_code: bool = True
+    seqpos_slice: tuple = (None,)
 
 
 def load_feature_splitting_saes(device="cpu", saes_idxs=list(range(1, 9))):
@@ -144,27 +167,6 @@ def load_gemma_sae(
     return model, [sae], token_dataset
 
 
-@dataclass
-class ITO_SAEConfig:
-    model_name: str
-    d_in: int
-    d_sae: int
-    hook_layer: int
-    hook_name: str
-    dtype: str
-
-    context_size: int = None  # Can be used for auto-interp
-    dtype: str = ""  # this must be set to e.g. "float32" in core/main.py
-    device: str = ""
-
-    model_from_pretrained_kwargs: Dict = field(default_factory=dict)
-    hook_head_index: Optional[int] = None
-    prepend_bos: bool = True
-    normalize_activations: str = "none"
-    dataset_trust_remote_code: bool = True
-    seqpos_slice: tuple = (None,)
-
-
 def get_gpu_tensors():
     gpu_tensors = [
         obj for obj in gc.get_objects() if isinstance(obj, torch.Tensor) and obj.is_cuda
@@ -180,7 +182,6 @@ def get_gpu_tensors():
 
 
 def to_nonnegative_activations(activations):
-    # force non-negative activations at cost of doubling the apparent number of latents
     positive_activations = activations.clamp(min=0.0)
     negative_activations = activations.clamp(max=0.0)
     activations = torch.cat([positive_activations, negative_activations], dim=-1)
@@ -195,7 +196,6 @@ def to_unbounded_activations(activations):
     return original_activations
 
 
-# TODO: Save the L0 and config alongside the the atoms.
 class ITO_SAE:
     def __init__(self, atoms, l0=8, cfg=None):
         self.atoms = atoms
@@ -204,7 +204,6 @@ class ITO_SAE:
 
     def encode(self, x):
         shape = x.size()
-        # flatten batch*seq_len
         x = x.view(-1, shape[-1])
         activations = omp_incremental_cholesky_with_fallback(self.atoms, x, self.l0)
         activations = to_nonnegative_activations(activations)
@@ -218,8 +217,6 @@ class ITO_SAE:
 
     @property
     def W_dec(self):
-        # When acting as an SAE, our activations are non-negative, so our W_dec
-        # is also doubled up.
         return torch.cat([self.atoms, -self.atoms], dim=0)
 
     def __call__(self, x):
@@ -243,9 +240,6 @@ class ITO_SAE:
 
 
 def svd_min_norm_solution(A, B, rcond=None):
-    """
-    Cuda accelerated least squares solver using SVD.
-    """
     m, n = A.shape[-2], A.shape[-1]
     U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver="gesvda")
     if rcond is None:
@@ -263,10 +257,6 @@ def svd_min_norm_solution(A, B, rcond=None):
 
 
 def omp_pytorch(D, x, n_nonzero_coefs):
-    """
-    The original OMP implementation using svd_min_norm_solution.
-    This is the fallback solver for problematic samples.
-    """
     batch_size, n_features = x.shape
     n_atoms = D.shape[0]
     indices = torch.zeros(
@@ -294,7 +284,6 @@ def omp_pytorch(D, x, n_nonzero_coefs):
         try:
             coef = svd_min_norm_solution(A, B)
         except RuntimeError as e:
-            print(f"Least squares solver failed at iteration {k}: {e}")
             coef = torch.zeros(batch_size, k + 1, 1, device=D.device)
         coef = coef.squeeze(2)
         invalid_coefs = torch.isnan(coef) | torch.isinf(coef)
@@ -304,32 +293,23 @@ def omp_pytorch(D, x, n_nonzero_coefs):
         residual = x - recon
     activations = torch.zeros((x.size(0), n_atoms), device=x.device)
     activations.scatter_(1, indices, coef)
-    activations = activations.view(*x.shape[:-1], -1)
     return activations
 
 
 def omp_incremental_cholesky(D, x, n_nonzero_coefs, device=None):
-    """
-    Fast OMP using incremental Cholesky updates.
-    (Assuming from previous steps, includes numerical stability improvements.)
-    """
     if device is None:
         device = D.device
-
     D = D.to(device)
     x = x.to(device)
-
     batch_size, n_features = x.shape
     n_atoms = D.shape[0]
 
     indices = torch.zeros(
         (batch_size, n_nonzero_coefs), device=device, dtype=torch.long
     )
-    residual = x.clone()  # (batch_size, n_features)
+    residual = x.clone()
     selected_atoms = torch.zeros(
-        (batch_size, n_nonzero_coefs, n_features),
-        device=device,
-        dtype=D.dtype,
+        (batch_size, n_nonzero_coefs, n_features), device=device, dtype=D.dtype
     )
     available_atoms = torch.ones((batch_size, n_atoms), dtype=torch.bool, device=device)
 
@@ -338,28 +318,25 @@ def omp_incremental_cholesky(D, x, n_nonzero_coefs, device=None):
     Beta = None
 
     for k in range(n_nonzero_coefs):
-        # Select next atom
-        correlations = torch.matmul(residual, D.T)  # (batch_size, n_atoms)
+        correlations = torch.matmul(residual, D.T)
         abs_correlations = torch.abs(correlations)
         abs_correlations[~available_atoms] = 0
         idx = torch.argmax(abs_correlations, dim=1)
         indices[:, k] = idx
         available_atoms[torch.arange(batch_size, device=device), idx] = False
 
-        a_k = D[idx, :]  # (batch_size, n_features)
+        a_k = D[idx, :]
         selected_atoms[:, k, :] = a_k
-        a_k_x = torch.sum(a_k * x, dim=-1, keepdim=True)  # (batch_size, 1)
+        a_k_x = torch.sum(a_k * x, dim=-1, keepdim=True)
 
         if k == 0:
-            # First atom
             norm_a_k2 = torch.sum(a_k * a_k, dim=-1, keepdim=True)
-            L = torch.sqrt(norm_a_k2)
-            L = L.unsqueeze(-1)
+            L = torch.sqrt(norm_a_k2).unsqueeze(-1)
             b = a_k_x.unsqueeze(-1)
             Beta = b / (L * L)
         else:
             prev_atoms = selected_atoms[:, :k, :]
-            c = torch.sum(prev_atoms * a_k.unsqueeze(1), dim=-1)  # (batch_size, k)
+            c = torch.sum(prev_atoms * a_k.unsqueeze(1), dim=-1)
             y = torch.linalg.solve_triangular(
                 L, c.unsqueeze(-1), upper=False, unitriangular=False
             )
@@ -380,7 +357,6 @@ def omp_incremental_cholesky(D, x, n_nonzero_coefs, device=None):
 
             b_new = torch.cat([b, a_k_x.unsqueeze(-1)], dim=1)
             b = b_new
-
             Beta = torch.cholesky_solve(b, L, upper=False)
 
         A_cur = selected_atoms[:, : k + 1, :]
@@ -394,69 +370,63 @@ def omp_incremental_cholesky(D, x, n_nonzero_coefs, device=None):
 
 
 def omp_incremental_cholesky_with_fallback(D, x, n_nonzero_coefs, device=None):
-    """
-    OMP with incremental Cholesky updates and fallback to omp_pytorch for problematic examples.
-    """
     if device is None:
         device = D.device
 
-    # Run incremental OMP
     activations, Beta_final, residual, indices, selected_atoms = (
         omp_incremental_cholesky(D, x, n_nonzero_coefs, device=device)
     )
 
-    # Check for problematic samples
     invalid_mask = torch.isnan(Beta_final) | torch.isinf(Beta_final)
     residual_norm = torch.norm(residual, dim=-1)
     high_error_mask = residual_norm > 1e8
     fallback_mask = invalid_mask.any(dim=-1) | high_error_mask
 
     if fallback_mask.any():
-        # Fallback to omp_pytorch for these samples
         fallback_indices = torch.where(fallback_mask)[0]
         D_fallback = D
         x_fallback = x[fallback_indices]
-
-        # Solve OMP for problematic samples using the stable original method
         fallback_acts = omp_pytorch(D_fallback, x_fallback, n_nonzero_coefs)
-
-        # Replace the problematic solutions with fallback solutions
         activations[fallback_indices] = fallback_acts
 
     return activations
 
 
-def update_plot(
-    atoms,
-    losses,
-    atom_start_size,
-    ratio_history,
-    model_name,
-):
-    """
-    Update the loss plot and the ratio plot.
-    """
-    # TODO: Probably need to do more smoothing and downsampling as pyplot is
-    # hella slow.
-    window = 100
+
+def update_plot(atoms, losses, atom_start_size, ratio_history, run_dir):
+    window = 1000
     np_losses = np.array(losses)
-    smoothed_losses = np.convolve(np_losses, np.ones(window) / window, mode="valid")
+    np_ratios = np.array(ratio_history)
+
+    # Smooth the losses if we have enough data points
+    if len(np_losses) >= window:
+        smoothed_losses = np.convolve(np_losses, np.ones(window) / window, mode="valid")
+    else:
+        smoothed_losses = np_losses
+
+    # Smooth the ratio history if we have enough data points
+    if len(np_ratios) >= window:
+        smoothed_ratios = np.convolve(np_ratios, np.ones(window) / window, mode="valid")
+    else:
+        smoothed_ratios = np_ratios
 
     plt.clf()
     fig, axes = plt.subplots(2, 1, figsize=(10, 10))
 
+    # Plot smoothed losses
     axes[0].set_title(f"Added {len(atoms)} of {len(losses) + atom_start_size} atoms")
     axes[0].plot(smoothed_losses)
     axes[0].set_ylabel("Smoothed Losses")
     axes[0].set_xlabel("Iterations")
 
+    # Plot smoothed ratio history
     axes[1].set_title("Ratio of len(atoms) / (len(losses) + atom_start_size)")
-    axes[1].plot(ratio_history)
-    axes[1].set_ylabel("Ratio")
+    axes[1].plot(smoothed_ratios)
+    axes[1].set_ylabel("Smoothed Ratio")
     axes[1].set_xlabel("Plot Update Interval")
 
     plt.tight_layout()
-    plt.savefig(f"data/{model_name}/losses_and_ratio.png")
+    plt.savefig(os.path.join(run_dir, "losses_and_ratio.png"))
     plt.close()
 
 
@@ -464,26 +434,20 @@ def construct_atoms(
     activations,
     batch_size=OMP_BATCH_SIZE,
     l0=OMP_L0,
-    model_name=GPT2,
     target_loss=2.0,
     plot_update_interval=10,
+    run_dir=".",
 ):
     atoms = torch.cat(
-        [
-            activations[:, 0].unique(dim=0),
-            activations[:, 1].unique(dim=0),
-        ],
-        dim=0,
+        [activations[:, 0].unique(dim=0), activations[:, 1].unique(dim=0)], dim=0
     ).to(activations.device)
     atom_start_size = len(atoms)
 
-    # Initialize atom_indices to track which activations are added
     atom_indices = torch.arange(atom_start_size).tolist()
 
     remaining_activations = (
         activations[:, 2:].permute(1, 0, 2).reshape(-1, activations.size(-1))
     )
-
     losses = []
     ratio_history = []
 
@@ -519,7 +483,7 @@ def construct_atoms(
                 losses,
                 atom_start_size,
                 ratio_history,
-                model_name,
+                run_dir=run_dir,
             )
 
     update_plot(
@@ -527,7 +491,7 @@ def construct_atoms(
         losses,
         atom_start_size,
         ratio_history,
-        model_name,
+        run_dir=run_dir,
     )
 
     pbar.close()
@@ -543,6 +507,25 @@ def evaluate(sae, model_activations, batch_size=32):
         loss = (batch - recon) ** 2
         losses.extend(loss.detach().cpu())
     return torch.stack(losses)
+
+
+def get_atom_indices(atoms, activations, batch_size: int = 256):
+    flattened_activations = activations.view(-1, activations.size(-1))
+    num_atoms = atoms.size(0)
+    flattened_idxs = torch.empty(num_atoms, dtype=torch.long, device=atoms.device)
+    for start_idx in tqdm(range(0, flattened_activations.size(0), batch_size)):
+        end_idx = min(start_idx + batch_size, flattened_activations.size(0))
+        activations_batch = flattened_activations[start_idx:end_idx].to(atoms.device)
+        matches = torch.all(atoms[:, None, :] == activations_batch[None, :, :], dim=2)
+        matched_idxs = matches.sum(dim=1).nonzero().squeeze(-1)
+        if matched_idxs.numel() > 0:
+            flattened_idxs[matched_idxs] = (
+                matches[matched_idxs].float().argmax(dim=1) + start_idx
+            )
+    return torch.stack(
+        [flattened_idxs // activations.size(1), flattened_idxs % activations.size(1)],
+        dim=1,
+    )
 
 
 # TODO: separate this for gemma and gpt2 as the parameters are totally different
@@ -582,26 +565,67 @@ def load_model(
     return model, saes, token_dataset
 
 
-def get_model_name(model_name, layer, l0, target_loss):
-    return f"{model_name}_layer_{layer}_l0_{l0}_target_loss_{target_loss}"
-
-
-def get_atom_indices(atoms, activations, batch_size: int = 256):
-    flattened_activations = activations.view(-1, activations.size(-1))
-    num_atoms = atoms.size(0)
-    flattened_idxs = torch.empty(num_atoms, dtype=torch.long, device=atoms.device)
-    for start_idx in tqdm(range(0, flattened_activations.size(0), batch_size)):
-        end_idx = min(start_idx + batch_size, flattened_activations.size(0))
-        activations_batch = flattened_activations[start_idx:end_idx].to(atoms.device)
-        matches = torch.all(atoms[:, None, :] == activations_batch[None, :, :], dim=2)
-        matched_idxs = matches.sum(dim=1).nonzero().squeeze(-1)
-        flattened_idxs[matched_idxs] = (
-            matches[matched_idxs].float().argmax(dim=1) + start_idx
-        )
-    return torch.stack(
-        [flattened_idxs // activations.size(1), flattened_idxs % activations.size(1)],
-        dim=1,
+def load_model_activations(args, device):
+    # Load the model and dataset
+    model, saes, token_dataset = load_model(
+        args.model, layer=args.layer, device=device, gpt2_saes=list(range(1, 2))
     )
+    hook_name = saes[0].cfg.hook_name
+    del saes
+
+    tokens = token_dataset["tokens"][:, : args.seq_len].to(device)
+    activations_path = f"data/{args.model}/model_activations.pt"
+
+    # Try to load precomputed activations
+    try:
+        model_activations = torch.load(activations_path, weights_only=True)
+    except FileNotFoundError:
+        # Need to generate activations
+        model_activations = []
+
+        def add_activations(acts, hook=None):
+            model_activations.append(acts.cpu())
+
+        model.remove_all_hook_fns()
+        # Add a forward hook to capture the activations at the specified hook_name
+        model.add_hook(hook_name, add_activations)
+
+        # Run the model over the dataset and record activations
+        for batch in tqdm(torch.split(tokens, args.batch_size), desc="Model"):
+            model(batch)
+
+        model.remove_all_hook_fns()
+
+        # Concatenate all recorded activations
+        model_activations = torch.cat(model_activations)
+        # Save them for future use
+        os.makedirs(f"data/{args.model}", exist_ok=True)
+        torch.save(model_activations, activations_path)
+
+    # Clean up references
+    del model, token_dataset, tokens
+    return model_activations
+
+
+def filter_runs(base_dir="runs", **criteria):
+    """
+    Iterate over all run directories in `base_dir`, load metadata.yaml,
+    and return a list of run directories that match all specified criteria.
+    """
+    if not os.path.exists(base_dir):
+        return []
+    matching_runs = []
+    for run_id in os.listdir(base_dir):
+        run_path = os.path.join(base_dir, run_id)
+        if os.path.isdir(run_path):
+            meta_path = os.path.join(run_path, "metadata.yaml")
+            if os.path.isfile(meta_path):
+                with open(meta_path, "r") as f:
+                    meta = yaml.safe_load(f)
+                # Check if all criteria match
+                if all(meta.get(k) == v for k, v in criteria.items()):
+                    matching_runs.append(run_path)
+    return matching_runs
 
 
 if __name__ == "__main__":
@@ -616,135 +640,132 @@ if __name__ == "__main__":
     parser.add_argument("--layer", type=int, default=8)
     parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
     parser.add_argument("--target_loss", type=float, default=2.0)
-    parser.parse_args()
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
 
-    model, saes, token_dataset = load_model(
-        args.model, layer=args.layer, device=device, gpt2_saes=list(range(1, 2))
-    )
-    tokens = token_dataset["tokens"][:, : args.seq_len].to(device)
-
-    # don't need the saes for this
-    hook_name = saes[0].cfg.hook_name
-    del saes
-
-    model_name = get_model_name(args.model, args.layer, args.l0, args.target_loss)
-
-    # TODO: Store metadata about the training run
-    os.makedirs(f"data/{model_name}", exist_ok=True)
-
-    try:
-        model_activations = torch.load(f"data/{model_name}/model_activations.pt")
-    except FileNotFoundError:
-        model_activations = []
-
-        def add_activations(acts, hook=None):
-            model_activations.append(acts.cpu())
-
-        model.remove_all_hook_fns()
-        model.add_hook(hook_name, add_activations)
-
-        for batch in tqdm(torch.split(tokens, args.batch_size), desc="Model"):
-            model(batch)
-
-        model.remove_all_hook_fns()
-
-        model_activations = torch.cat(model_activations)
-        print("Writing model activations")
-        torch.save(model_activations, f"data/{model_name}/model_activations.pt")
-
-    del model, token_dataset, tokens
-
-    train_size = int(model_activations.size(0) * 0.7) // 4
-    train_activations = model_activations[:train_size].to(device)
-
-    try:
-        atoms = torch.load(f"data/{model_name}/atoms.pt")
-        print("Found atoms so not training")
-    except FileNotFoundError:
-        atoms, atom_indices, losses = construct_atoms(
-            train_activations,
-            batch_size=args.batch_size,
-            l0=args.l0,
-            model_name=model_name,
-            target_loss=args.target_loss,
-        )
-        print(f"Trained a model with {len(atoms)} atoms")
-
-        torch.save(atoms, f"data/{model_name}/atoms.pt")
-        with open(f"data/{model_name}/losses.pkl", "wb") as f:
-            pickle.dump(losses, f)
-
-        # TODO: Can do this whilst we generate the atoms.
-        atom_indices = get_atom_indices(
-            atoms.to(device), model_activations, batch_size=1024
-        ).cpu()
-        torch.save(atom_indices, f"data/{model_name}/atom_indices.pt")
-
-    del train_activations
-    model_activations = torch.load(f"data/{model_name}/model_activations.pt")
-    test_activations = model_activations.cpu()
-    del model_activations
-
-    model, saes, token_dataset = load_model(
-        args.model, layer=args.layer, device=device, gpt2_saes=list(range(1, 9))
-    )
-    del model, token_dataset
-
-    test_activations = test_activations[-1_000:].to(device)
-
-    # saes_losses = []
-    # for sae in saes:
-    #     losses = evaluate(
-    #         sae,
-    #         test_activations,
-    #         batch_size=4,
-    #     )
-    #     saes_losses.append(losses)
-    #     print(
-    #         f"{sae.W_dec.size(0)} SAE loss:",
-    #         losses.mean().item(),
-    #         "on",
-    #         len(losses),
-    #         "samples",
-    #     )
-
-    ito_sae = ITO_SAE(saes[-3].W_dec.cpu(), l0=args.l0)
-    print(f"Evaluating ITO W_dec SAE with {saes[-3].W_dec.size(0)} atoms")
-    del saes
-    losses = evaluate(
-        ito_sae,
-        test_activations.cpu(),
+    matching_runs = filter_runs(
+        base_dir="runs",
+        model=args.model,
         batch_size=args.batch_size,
-    )
-    print(
-        "Mean ITO W_dec loss:",
-        losses.mean().item(),
-        "on",
-        len(losses),
-        "samples",
+        l0=args.l0,
+        layer=args.layer,
+        seq_len=args.seq_len,
+        target_loss=args.target_loss,
     )
 
-    # for l0 in [8, 10, 12,16, 32]:
-    #     print(f"Evaluating ITO SAE with {atoms.size(0)} atoms with l0 {l0}")
-    #     ito_sae = ITO_SAE(atoms.to(device), l0=l0)
-    #     # ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
-    #     losses = evaluate(
-    #         ito_sae,
-    #         # TODO: Improve decide handling for large datasets of activations
-    #         test_activations.to(device),
-    #         batch_size=args.batch_size,
-    #     )
+    if len(matching_runs) > 0:
+        # Use the first matching run directory
+        run_dir = matching_runs[0]
+        print(f"Found existing run with these parameters: {run_dir}")
+        # Load metadata to confirm atom count, etc.
+        with open(os.path.join(run_dir, "metadata.yaml"), "r") as f:
+            metadata = yaml.safe_load(f)
 
-    #     plt.hist(torch.log(losses.mean(-1)).cpu().numpy(), bins=100)
-    #     plt.savefig(f"data/{model_name}/loss_hist.png")
+        # Load previously computed atoms
+        atoms_path = os.path.join(run_dir, "atoms.pt")
+        if not os.path.exists(atoms_path):
+            raise FileNotFoundError(
+                f"Matched run at {run_dir} does not have atoms.pt, something is wrong."
+            )
+        atoms = torch.load(atoms_path, weights_only=True)
 
-    #     print(
-    #         "Mean ITO loss:",
-    #         losses.mean().item(),
-    #         "on",
-    #         len(losses),
-    #         "samples",
-    #     )
+        # Load model activations (for validation)
+        model_activations = load_model_activations(args, device)
+        test_activations = model_activations[-1000:].to(device)
+        ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+        eval_losses = evaluate(
+            ito_sae, test_activations.to(device), batch_size=args.batch_size
+        )
+
+        plt.hist(torch.log(eval_losses.mean(-1)).cpu().numpy(), bins=100)
+        plt.savefig(os.path.join(run_dir, "loss_hist.png"))
+        plt.close()
+
+        print(
+            "Mean ITO loss:",
+            eval_losses.mean().item(),
+            "on",
+            len(eval_losses),
+            "samples",
+        )
+
+    else:
+        # Create a new run if no existing run matches
+        run_id = str(uuid.uuid4())
+        run_dir = os.path.join("runs", run_id)
+        os.makedirs(run_dir, exist_ok=True)
+
+        # Save arguments and metadata in metadata.yaml (initial)
+        metadata = {
+            "model": args.model,
+            "batch_size": args.batch_size,
+            "l0": args.l0,
+            "layer": args.layer,
+            "seq_len": args.seq_len,
+            "target_loss": args.target_loss,
+            "device": str(device),
+        }
+        with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
+            yaml.safe_dump(metadata, f)
+
+        model_activations = load_model_activations(args, device)
+
+        train_size = int(model_activations.size(0) * 0.7) // 4
+        train_activations = model_activations[:train_size].to(device)
+
+        # Construct atoms
+        atoms_path = os.path.join(run_dir, "atoms.pt")
+        losses_path = os.path.join(run_dir, "losses.pkl")
+        indices_path = os.path.join(run_dir, "atom_indices.pt")
+
+        if not os.path.exists(atoms_path):
+            atoms, atom_indices, losses = construct_atoms(
+                train_activations,
+                batch_size=args.batch_size,
+                l0=args.l0,
+                target_loss=args.target_loss,
+                run_dir=run_dir,
+            )
+            torch.save(atoms, atoms_path)
+            with open(losses_path, "wb") as f:
+                pickle.dump(losses, f)
+
+            atom_indices = get_atom_indices(
+                atoms.to(device), model_activations, batch_size=1024
+            ).cpu()
+            torch.save(atom_indices, indices_path)
+
+            # Update metadata with the number of atoms
+            metadata["num_atoms"] = atoms.size(0)
+            with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
+                yaml.safe_dump(metadata, f)
+        else:
+            # If already present, just load them
+            atoms = torch.load(atoms_path, weights_only=True)
+            metadata["num_atoms"] = atoms.size(0)
+            with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
+                yaml.safe_dump(metadata, f)
+
+        # Evaluate
+        test_activations = model_activations[-1000:].to(device)
+        ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+        eval_losses = evaluate(
+            ito_sae, test_activations.to(device), batch_size=args.batch_size
+        )
+
+        plt.hist(torch.log(eval_losses.mean(-1)).cpu().numpy(), bins=100)
+        plt.savefig(os.path.join(run_dir, "loss_hist.png"))
+        plt.close()
+
+        print(
+            "Mean ITO loss:",
+            eval_losses.mean().item(),
+            "on",
+            len(eval_losses),
+            "samples",
+        )
+
+        # Example usage of filter_runs
+        matched = filter_runs(base_dir="runs", model="gpt2", layer=8)
+        print("Matching runs with model=gpt2, layer=8:", matched)
