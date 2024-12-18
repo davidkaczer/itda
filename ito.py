@@ -392,7 +392,6 @@ def omp_incremental_cholesky_with_fallback(D, x, n_nonzero_coefs, device=None):
     return activations
 
 
-
 def update_plot(atoms, losses, atom_start_size, ratio_history, run_dir):
     window = 1000
     np_losses = np.array(losses)
@@ -501,7 +500,9 @@ def construct_atoms(
 
 def evaluate(sae, model_activations, batch_size=32):
     losses = []
-    for batch in tqdm(torch.split(model_activations.flatten(end_dim=1), batch_size), desc="Evaluating"):
+    for batch in tqdm(
+        torch.split(model_activations.flatten(end_dim=1), batch_size), desc="Evaluating"
+    ):
         recon = sae(batch)
         loss = (batch - recon) ** 2
         losses.extend(loss.detach().cpu())
@@ -513,7 +514,9 @@ def get_atom_indices(atoms, activations, batch_size: int = 256):
     flattened_activations = activations.view(-1, activations.size(-1))
     num_atoms = atoms.size(0)
     flattened_idxs = torch.empty(num_atoms, dtype=torch.long, device=atoms.device)
-    for start_idx in tqdm(range(0, flattened_activations.size(0), batch_size), desc="Getting atom indices"):
+    for start_idx in tqdm(
+        range(0, flattened_activations.size(0), batch_size), desc="Getting atom indices"
+    ):
         end_idx = min(start_idx + batch_size, flattened_activations.size(0))
         activations_batch = flattened_activations[start_idx:end_idx].to(atoms.device)
         matches = torch.all(atoms[:, None, :] == activations_batch[None, :, :], dim=2)
@@ -640,9 +643,31 @@ if __name__ == "__main__":
     parser.add_argument("--layer", type=int, default=8)
     parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
     parser.add_argument("--target_loss", type=float, default=2.0)
+    parser.add_argument(
+        "--filter_runs",
+        action="store_true",
+        help="Print the run_id for the given parameters if found.",
+    )
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
+
+    if args.filter_runs:
+        matched = filter_runs(
+            base_dir="runs",
+            model=args.model,
+            layer=args.layer,
+            l0=args.l0,
+            target_loss=args.target_loss,
+            seq_len=args.seq_len,
+        )
+        if len(matched) > 0:
+            # Print the run_id (the directory name) of the first match
+            print(os.path.basename(matched[0]))
+        else:
+            # No matches
+            print("")
+        exit(0)
 
     matching_runs = filter_runs(
         base_dir="runs",

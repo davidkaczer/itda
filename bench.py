@@ -228,7 +228,7 @@ if __name__ == "__main__":
         _, saes, _ = load_model(
             model_name,
             device=device,
-            gpt2_saes=[2],
+            gpt2_saes=[2, 4, 6],
         )
         # Adjust batch size to avoid OOM for pretrained SAEs if needed
         llm_batch_size = 128
