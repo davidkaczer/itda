@@ -4,10 +4,10 @@
 #SBATCH -p res-gpu-small
 #SBATCH --qos short
 #SBATCH -t 02-00:00
-#SBATCH --gres=gpu
+#SBATCH --gres=gpu:pascal:1
 #SBATCH -o logs/train_all_ito_saes-%A_%a.out
 #SBATCH --mem 8G
-#SBATCH --array=0-15
+#SBATCH --array=0-10
 
 # Array of L0 values and target losses
 L0s=(4 8 16 32)
@@ -24,9 +24,9 @@ TARGET_LOSS=${LOSSES[$LOSS_INDEX]}
 echo "Training ITO SAE with L0=$L0 and TARGET_LOSS=$TARGET_LOSS"
 
 module load cuda/11.3
-source /path/to/your/venv/bin/activate
+source /home3/wclv88/venv/bin/activate
 
-python train_ito_sae.py \
+python ../ito.py \
   --model gpt2 \
   --layer 8 \
   --l0 ${L0} \

@@ -4,10 +4,10 @@
 #SBATCH -p res-gpu-small
 #SBATCH --qos short
 #SBATCH -t 01-00:00
-#SBATCH --gres=gpu
+#SBATCH --gres=gpu:pascal:1
 #SBATCH -o logs/eval_all_ito_saes-%A_%a.out
 #SBATCH --mem 8G
-#SBATCH --array=0-15
+#SBATCH --array=0-0
 
 L0s=(4 8 16 32)
 LOSSES=(1.5 2.0 2.5 3.0)
@@ -21,8 +21,8 @@ TARGET_LOSS=${LOSSES[$LOSS_INDEX]}
 
 echo "Evaluating ITO SAE with L0=$L0 and TARGET_LOSS=$TARGET_LOSS"
 
-module load cuda/11.3 # adjust if needed
-source /path/to/your/venv/bin/activate
+module load cuda/11.3
+source /wclv88/wclv88/venv/bin/activate
 
 # Use the filter_runs function within `train_ito_sae.py` or a separate script
 # that you have written to find the run. Suppose `train_ito_sae.py` has a
@@ -42,7 +42,7 @@ fi
 echo "Found run_id: $RUN_ID"
 
 # Now run the benchmarking code on this run_id
-python benchmark_sae.py \
+python ../bench.py \
   --model gpt2 \
   --ito_run_id $RUN_ID \
   --eval_types core scr tpp sparse_probing
