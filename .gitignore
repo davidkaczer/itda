@@ -7,3 +7,4 @@ cuda/
 __pycache__/
 scratch.py
 
+wandb/

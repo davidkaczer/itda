@@ -13,7 +13,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,6 +38,11 @@ GP = "gp"
 
 SEQ_LEN = 128
 DATASET = "NeelNanda/pile-10k"
+
+# Top-level artefacts directory
+ARTEFACTS_DIR = "artefacts"
+DATA_DIR = os.path.join(ARTEFACTS_DIR, "data")
+RUNS_DIR = os.path.join(ARTEFACTS_DIR, "runs")
 
 
 @dataclass
@@ -391,50 +395,11 @@ def omp_incremental_cholesky_with_fallback(D, x, n_nonzero_coefs, device=None):
     return activations
 
 
-def update_plot(atoms, losses, atom_start_size, ratio_history, run_dir):
-    window = 1000
-    np_losses = np.array(losses)
-    np_ratios = np.array(ratio_history)
-
-    # Smooth the losses if we have enough data points
-    if len(np_losses) >= window:
-        smoothed_losses = np.convolve(np_losses, np.ones(window) / window, mode="valid")
-    else:
-        smoothed_losses = np_losses
-
-    # Smooth the ratio history if we have enough data points
-    if len(np_ratios) >= window:
-        smoothed_ratios = np.convolve(np_ratios, np.ones(window) / window, mode="valid")
-    else:
-        smoothed_ratios = np_ratios
-
-    plt.clf()
-    fig, axes = plt.subplots(2, 1, figsize=(10, 10))
-
-    # Plot smoothed losses
-    axes[0].set_title(f"Added {len(atoms)} of {len(losses) + atom_start_size} atoms")
-    axes[0].plot(smoothed_losses)
-    axes[0].set_ylabel("Smoothed Losses")
-    axes[0].set_xlabel("Iterations")
-
-    # Plot smoothed ratio history
-    axes[1].set_title("Ratio of len(atoms) / (len(losses) + atom_start_size)")
-    axes[1].plot(smoothed_ratios)
-    axes[1].set_ylabel("Smoothed Ratio")
-    axes[1].set_xlabel("Plot Update Interval")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(run_dir, "losses_and_ratio.png"))
-    plt.close()
-
-
 def construct_atoms(
     activations,
     batch_size=OMP_BATCH_SIZE,
     l0=OMP_L0,
     target_loss=2.0,
-    plot_update_interval=10,
-    run_dir=".",
 ):
     atoms = torch.cat(
         [activations[:, 0].unique(dim=0), activations[:, 1].unique(dim=0)], dim=0
@@ -451,6 +416,7 @@ def construct_atoms(
 
     pbar = tqdm(total=remaining_activations.size(0), desc="Constructing Atoms")
     batch_counter = 0
+
     while remaining_activations.size(0) > 0:
         batch_activations = remaining_activations[:batch_size]
         remaining_activations = remaining_activations[batch_size:]
@@ -458,7 +424,8 @@ def construct_atoms(
         sae = ITO_SAE(atoms, l0)
         recon = sae(batch_activations)
         loss = ((batch_activations - recon) ** 2).mean(dim=1)
-        losses.extend(loss[loss < 100.0].cpu().tolist())
+        valid_losses = loss[loss < 100.0].cpu().tolist()
+        losses.extend(valid_losses)
 
         mask = loss > target_loss
         new_atoms = batch_activations[mask]
@@ -475,22 +442,17 @@ def construct_atoms(
         ratio = new_atoms.size(0) / batch_size
         ratio_history.append(ratio)
 
-        if batch_counter % plot_update_interval == 0:
-            update_plot(
-                atoms,
-                losses,
-                atom_start_size,
-                ratio_history,
-                run_dir=run_dir,
-            )
+        if len(valid_losses) > 0:
+            mean_loss = np.mean(valid_losses)
+        else:
+            mean_loss = float("nan")
 
-    update_plot(
-        atoms,
-        losses,
-        atom_start_size,
-        ratio_history,
-        run_dir=run_dir,
-    )
+        wandb.log({
+            "loss": mean_loss,
+            "ratio": ratio,
+            "atoms": len(atoms),
+            "step": batch_counter
+        })
 
     pbar.close()
 
@@ -508,7 +470,6 @@ def evaluate(sae, model_activations, batch_size=32):
     return torch.stack(losses)
 
 
-# TODO: Commonise this into training
 def get_atom_indices(atoms, activations, batch_size: int = 256):
     flattened_activations = activations.view(-1, activations.size(-1))
     num_atoms = atoms.size(0)
@@ -530,7 +491,6 @@ def get_atom_indices(atoms, activations, batch_size: int = 256):
     )
 
 
-# TODO: separate this for gemma and gpt2 as the parameters are totally different
 def load_model(
     model_name,
     layer=12,
@@ -568,6 +528,11 @@ def load_model(
 
 
 def load_model_activations(args, device):
+    # Create directories
+    os.makedirs(DATA_DIR, exist_ok=True)
+    model_data_dir = os.path.join(DATA_DIR, args.model)
+    os.makedirs(model_data_dir, exist_ok=True)
+
     # Load the model and dataset
     model, saes, token_dataset = load_model(
         args.model, layer=args.layer, device=device, gpt2_saes=list(range(1, 2))
@@ -576,7 +541,7 @@ def load_model_activations(args, device):
     del saes
 
     tokens = token_dataset["tokens"][:, : args.seq_len].to(device)
-    activations_path = f"data/{args.model}/model_activations.pt"
+    activations_path = os.path.join(model_data_dir, "model_activations.pt")
 
     # Try to load precomputed activations
     try:
@@ -601,7 +566,6 @@ def load_model_activations(args, device):
         # Concatenate all recorded activations
         model_activations = torch.cat(model_activations)
         # Save them for future use
-        os.makedirs(f"data/{args.model}", exist_ok=True)
         torch.save(model_activations, activations_path)
 
     # Clean up references
@@ -609,7 +573,7 @@ def load_model_activations(args, device):
     return model_activations
 
 
-def filter_runs(base_dir="runs", **criteria):
+def filter_runs(base_dir=RUNS_DIR, **criteria):
     """
     Iterate over all run directories in `base_dir`, load metadata.yaml,
     and return a list of run directories that match all specified criteria.
@@ -651,9 +615,11 @@ if __name__ == "__main__":
 
     torch.set_grad_enabled(False)
 
+    os.makedirs(RUNS_DIR, exist_ok=True)
+
     if args.filter_runs:
         matched = filter_runs(
-            base_dir="runs",
+            base_dir=RUNS_DIR,
             model=args.model,
             layer=args.layer,
             l0=args.l0,
@@ -669,7 +635,7 @@ if __name__ == "__main__":
         exit(0)
 
     matching_runs = filter_runs(
-        base_dir="runs",
+        base_dir=RUNS_DIR,
         model=args.model,
         batch_size=args.batch_size,
         l0=args.l0,
@@ -697,7 +663,7 @@ if __name__ == "__main__":
     else:
         # Create a new run if no existing run matches
         run_id = str(uuid.uuid4())
-        run_dir = os.path.join("runs", run_id)
+        run_dir = os.path.join(RUNS_DIR, run_id)
         os.makedirs(run_dir, exist_ok=True)
 
         # Save arguments and metadata in metadata.yaml (initial)
@@ -713,6 +679,9 @@ if __name__ == "__main__":
         with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
             yaml.safe_dump(metadata, f)
 
+        # Initialize wandb run here with config
+        wandb.init(project="example_saes", config=metadata)
+
         train_size = int(model_activations.size(0) * 0.7)
         train_activations = model_activations[:train_size].to(device)
 
@@ -726,7 +695,6 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             l0=args.l0,
             target_loss=args.target_loss,
-            run_dir=run_dir,
         )
         torch.save(atoms, atoms_path)
         with open(losses_path, "wb") as f:
@@ -742,6 +710,12 @@ if __name__ == "__main__":
         with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
             yaml.safe_dump(metadata, f)
 
+    # If run was loaded from existing directory, ensure wandb run is initialized with config
+    if wandb.run is None:
+        with open(os.path.join(run_dir, "metadata.yaml"), "r") as f:
+            metadata = yaml.safe_load(f)
+        wandb.init(project="example_saes", config=metadata)
+
     # Evaluate
     test_size = int(model_activations.size(0) * 0.3)
     test_activations = model_activations[-test_size:].to(device)
@@ -750,10 +724,15 @@ if __name__ == "__main__":
         ito_sae, test_activations.to(device), batch_size=args.batch_size
     )
 
+    mean_ito_loss = eval_losses.mean().item()
+    wandb.log({"mean_ITO_loss": mean_ito_loss})
+
     print(
         "Mean ITO loss:",
-        eval_losses.mean().item(),
+        mean_ito_loss,
         "on",
         len(eval_losses),
         "samples",
     )
+
+    wandb.finish()
