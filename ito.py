@@ -39,10 +39,10 @@ GP = "gp"
 SEQ_LEN = 128
 DATASET = "NeelNanda/pile-10k"
 
-# Top-level artefacts directory
-ARTEFACTS_DIR = "artefacts"
-DATA_DIR = os.path.join(ARTEFACTS_DIR, "data")
-RUNS_DIR = os.path.join(ARTEFACTS_DIR, "runs")
+# Top-level artifacts directory
+ARTIFACTS_DIR = "artifacts"
+DATA_DIR = os.path.join(ARTIFACTS_DIR, "data")
+RUNS_DIR = os.path.join(ARTIFACTS_DIR, "runs")
 
 
 @dataclass
