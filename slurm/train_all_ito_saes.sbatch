@@ -4,14 +4,14 @@
 #SBATCH -p res-gpu-small
 #SBATCH --qos short
 #SBATCH -t 02-00:00
-#SBATCH --gres=gpu:pascal:1
+#SBATCH --gres=gpu:ampere:1
 #SBATCH -o logs/train_all_ito_saes-%A_%a.out
-#SBATCH --mem 8G
-#SBATCH --array=0-10
+#SBATCH --mem 28G
+#SBATCH --array=0-0
 
 # Array of L0 values and target losses
 L0s=(4 8 16 32)
-LOSSES=(1.5 2.0 2.5 3.0)
+LOSSES=(2.0 2.5 3.0)
 
 # Determine indices from the job array task ID
 INDEX=${SLURM_ARRAY_TASK_ID}
@@ -32,5 +32,5 @@ python ../ito.py \
   --l0 ${L0} \
   --target_loss ${TARGET_LOSS} \
   --seq_len 128 \
-  --batch_size 512
+  --batch_size 256
 
