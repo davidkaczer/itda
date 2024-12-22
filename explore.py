@@ -4,12 +4,11 @@ from copy import copy
 import torch
 import matplotlib.pyplot as plt
 from IPython.display import HTML, display
-from ito import (
-    ITO_SAE,
+from example_saes.ito_sae import ITO_SAE, to_unbounded_activations
+from example_saes.train import (
     get_model_name,
     load_model,
     get_atom_indices,
-    to_unbounded_activations,
 )
 from tqdm import tqdm
 
@@ -187,7 +186,6 @@ if MAIN:
 
 
 # %%
-
 
 def print_max_activating_samples(all_acts, atom_idx, tokens, tokenizer, n=20):
     sparse_active_idxs = (all_acts.indices()[2] == atom_idx) & (all_acts.values() > 0.2)

@@ -13,7 +13,8 @@ import evals.sparse_probing.main as sparse_probing
 import evals.unlearning.main as unlearning
 import sae_bench_utils.general_utils as general_utils
 
-from ito import load_model, ITO_SAE, ITO_SAEConfig
+from example_saes.ito_sae import ITO_SAE, ITO_SAEConfig
+from example_saes.train import load_model
 
 RANDOM_SEED = 42
 
