@@ -17,7 +17,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+import zarr
 from datasets import load_dataset
+from ito_sae import ITO_SAE
 from sae_lens import SAE
 from sae_lens.load_model import load_model as sae_lens_load_model  # Possibly unused now
 from sae_lens.toolkit.pretrained_saes_directory import get_pretrained_saes_directory
@@ -27,9 +29,7 @@ from transformer_lens.utils import tokenize_and_concatenate
 
 import wandb
 
-from ito_sae import ITO_SAE
-
-OMP_BATCH_SIZE = 512
+OMP_BATCH_SIZE = 16
 OMP_L0 = 40
 
 SEQ_LEN = 128
@@ -56,22 +56,26 @@ def get_gpu_tensors():
 
 
 def construct_atoms(
-    activations: torch.Tensor,
+    activations: zarr.DirectoryStore,
+    atoms: torch.Tensor = None,
     batch_size=OMP_BATCH_SIZE,
     l0=OMP_L0,
     target_dict_size: int = 1024,
+    train_size: int = -1,
     device="cpu",
 ):
-    atoms = torch.zeros(1, activations.size(-1), device=device)
-    atom_start_size = 0
+    if atoms is None:
+        print("Initialising atoms")
+        first_two_pos_acts = torch.from_numpy(activations[:, :2]).flatten(end_dim=1).to(device)
+        unique_rows, counts = torch.unique(first_two_pos_acts, dim=0, return_counts=True)
+        _, topk_indices = torch.topk(counts, k=activations.shape[-1])
+        atoms = unique_rows[topk_indices]
 
-    remaining_activations = (
-        activations.permute(1, 0, 2)
-        .reshape(-1, activations.size(-1))
-    )
+    if train_size < 0:
+        train_size = activations.shape[0]
 
-    total_tokens = activations.size(0) * activations.size(1)
-    fraction_x = (target_dict_size - atom_start_size) / total_tokens
+    total_tokens = activations.shape[0] * activations.shape[1]
+    fraction_x = target_dict_size / total_tokens
 
     if fraction_x <= 0:
         raise ValueError(
@@ -79,16 +83,17 @@ def construct_atoms(
             "Please provide a larger target_dict_size or fewer initial atoms."
         )
 
-    atoms_per_batch = max(1, int(np.ceil(fraction_x * batch_size)))
+    atoms_per_batch = max(1, int(np.ceil(fraction_x * batch_size * activations.shape[1])))
 
     losses = []
     ratio_history = []
-    pbar = tqdm(total=remaining_activations.size(0), desc="Constructing Atoms")
+    pbar = tqdm(total=train_size, desc="Constructing Atoms")
     batch_counter = 0
 
-    while remaining_activations.size(0) > 0:
-        batch_activations = remaining_activations[:batch_size].to(device)
-        remaining_activations = remaining_activations[batch_size:]
+    for start_idx in range(0, train_size, batch_size):
+        batch_activations = activations[start_idx : min(start_idx + batch_size, train_size)]
+        batch_activations = torch.from_numpy(batch_activations).to(device)
+        batch_activations = batch_activations.flatten(end_dim=1)
 
         sae = ITO_SAE(atoms, l0)
         recon = sae(batch_activations)
@@ -104,7 +109,7 @@ def construct_atoms(
         if new_atoms.size(0) > 0:
             atoms = torch.cat([atoms, new_atoms], dim=0)
 
-        pbar.update(len(batch_activations))
+        pbar.update(batch_size)
         pbar.set_postfix({"dict_size": atoms.size(0)})
         batch_counter += 1
 
@@ -130,15 +135,37 @@ def construct_atoms(
 
 
 def evaluate(
-    sae: ITO_SAE, model_activations: torch.Tensor, batch_size=32
+    sae: ITO_SAE,
+    store: zarr.DirectoryStore,
+    batch_size: int = 32,
+    val_size: int = 0,
+    device: str = "cpu",
 ) -> torch.Tensor:
+    """
+    Evaluate reconstruction loss over the last `val_size` sequences in the Zarr store.
+    Returns a 1D tensor with the MSE for each token in that evaluation range.
+    """
+    zf = zarr.open_group(store=store, mode="r")
+    total_sequences = zf["activations"].shape[0]
+
+    # We evaluate on the last `val_size` sequences
+    start_idx = max(0, total_sequences - val_size)
+
     losses = []
-    for batch in tqdm(
-        torch.split(model_activations.flatten(end_dim=1), batch_size), desc="Evaluating"
-    ):
-        recon = sae(batch)
-        loss = (batch - recon) ** 2
-        losses.extend(loss.detach().cpu())
+    # Iterate over sequences in batches
+    for seq_start in tqdm(range(start_idx, total_sequences, batch_size), desc="Evaluating"):
+        seq_end = min(seq_start + batch_size, total_sequences)
+        batch_activations = zf["activations"][seq_start:seq_end]  # shape: (B, seq_len, d_model)
+        batch_activations = torch.from_numpy(batch_activations).to(device)
+        # Flatten from (B, seq_len, d_model) -> (B * seq_len, d_model)
+        batch_activations = batch_activations.flatten(end_dim=1)
+
+        with torch.no_grad():
+            recon = sae(batch_activations)
+            # Per-token MSE
+            batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
+            losses.extend(batch_loss.detach().cpu())
+
     return torch.stack(losses)
 
 
@@ -165,59 +192,6 @@ def get_atom_indices(
     )
 
 
-def load_transformer_and_collect_activations(
-    model: str,
-    dataset: str,
-    hook_point: str,
-    seq_len: int,
-    batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Loads a HuggingFace model via `transformer_lens.HookedTransformer`,
-    then tokenizes a dataset from the HuggingFace Hub, hooks into the specified
-    layer/resid point, and collects all activations into a single Tensor.
-    """
-    # Make sure device is recognized
-    print(f"Loading model {model} on {device}...")
-
-    # Load the model from transformer_lens
-    model = HookedTransformer.from_pretrained(model, device=device)
-    model.eval()
-
-    # Load dataset
-    dataset = load_dataset(path=dataset, split="train", streaming=False)
-    token_dataset = tokenize_and_concatenate(
-        dataset=dataset,
-        tokenizer=model.tokenizer,
-        streaming=False,
-        max_length=seq_len,
-        add_bos_token=True,
-    )
-    tokens = token_dataset["tokens"].to(device)
-
-    # Container to store chunked activations
-    model_activations = []
-
-    def cache_activations(acts, hook=None):
-        # Save to CPU to avoid GPU OOM
-        model_activations.append(acts.cpu())
-
-    # Hook into the user-specified point
-    model.remove_all_hook_fns()
-    model.add_hook(hook_point, cache_activations)
-
-    # Forward pass in batches to store all activations
-    for chunk in tqdm(torch.split(tokens, batch_size), desc="Collecting Activations"):
-        model(chunk)
-
-    model.remove_all_hook_fns()
-    model_activations = torch.cat(model_activations, dim=0)
-
-    del model, dataset, token_dataset, tokens
-    return model_activations
-
-
 def filter_runs(base_dir=RUNS_DIR, **criteria):
     """
     Iterate over all run directories in `base_dir`, load metadata.yaml,
@@ -239,39 +213,57 @@ def filter_runs(base_dir=RUNS_DIR, **criteria):
     return matching_runs
 
 
-def load_model_activations(args, device):
-    """
-    Now relies on the new function load_transformer_and_collect_activations,
-    using arguments that explicitly define:
-      - The transformer-lens model name (args.model)
-      - The dataset name (args.dataset)
-      - The hook point (args.hook_name)
-    """
-    # Create directories
-    os.makedirs(DATA_DIR, exist_ok=True)
-    model_data_dir = os.path.join(DATA_DIR, args.model)
-    os.makedirs(model_data_dir, exist_ok=True)
-
-    activations_path = os.path.join(model_data_dir, "model_activations.pt")
+def get_activations(
+    model_name, dataset_name, hook_name, seq_len, batch_size, device, activations_path
+):
     if os.path.exists(activations_path):
-        print(f"Loading existing activations from {activations_path}")
-        model_activations = torch.load(activations_path, weights_only=True)
-    else:
-        print(
-            f"Collecting activations for model={args.model}, "
-            f"hook={args.hook_name}, dataset={args.dataset}"
-        )
-        model_activations = load_transformer_and_collect_activations(
-            model=args.model,
-            dataset=args.dataset,
-            hook_point=args.hook_name,
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            device=device,
-        )
-        torch.save(model_activations, activations_path)
+        return activations_path
 
-    return model_activations
+    model = HookedTransformer.from_pretrained(model_name, device=device)
+    model.eval()
+
+    ds = load_dataset(path=dataset_name, split="train", streaming=False)
+    token_ds = tokenize_and_concatenate(
+        dataset=ds,
+        tokenizer=model.tokenizer,
+        streaming=False,
+        max_length=seq_len,
+        add_bos_token=True,
+    )
+    tokens = token_ds["tokens"].to(device)
+
+    store = zarr.DirectoryStore(activations_path)
+    zf = zarr.open_group(store=store, mode="w")
+    dset = None
+
+    def cache_activations(acts, hook=None):
+        nonlocal dset
+        acts_cpu = acts.detach().cpu().numpy()
+        if dset is None:
+            shape = (0,) + acts_cpu.shape[1:]
+            max_shape = (None,) + acts_cpu.shape[1:]
+            chunk_shape = (batch_size,) + acts_cpu.shape[1:]
+            dset = zf.create_dataset(
+                "activations",
+                shape=shape,
+                maxshape=max_shape,
+                chunks=chunk_shape,
+                dtype=acts_cpu.dtype,
+            )
+        old_size = dset.shape[0]
+        new_size = old_size + acts_cpu.shape[0]
+        dset.resize((new_size,) + dset.shape[1:])
+        dset[old_size:new_size, ...] = acts_cpu
+
+    model.remove_all_hook_fns()
+    model.add_hook(hook_name, cache_activations)
+
+    for chunk in tqdm(torch.split(tokens, batch_size), desc="Collecting Activations"):
+        model(chunk)
+
+    model.remove_all_hook_fns()
+    del model, ds, token_ds, tokens
+    return activations_path
 
 
 if __name__ == "__main__":
@@ -344,9 +336,25 @@ if __name__ == "__main__":
         seq_len=args.seq_len,
     )
 
-    model_activations = load_model_activations(args, device)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    model_dir = os.path.join(DATA_DIR, args.model)
+    os.makedirs(model_dir, exist_ok=True)
+    act_path = os.path.join(model_dir, "model_activations.zarr")
+
+    act_path = get_activations(
+        model_name=args.model,
+        dataset_name=args.dataset,
+        hook_name=args.hook_name,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        device=device,
+        activations_path=act_path,
+    )
 
     atoms = None
+    store = zarr.DirectoryStore(act_path)
+    zf = zarr.open_group(store=store, mode="r")
+    total_sequences = zf["activations"].shape[0]
     if len(matching_runs) > 0:
         # Use the first matching run directory
         run_dir = matching_runs[0]
@@ -378,17 +386,17 @@ if __name__ == "__main__":
 
         wandb.init(project="example_saes", config=metadata)
 
-        train_size = int(model_activations.size(0) * 0.7)
-        train_activations = model_activations[:train_size]
+        train_size = int(total_sequences * 0.7)
 
         atoms_path = os.path.join(run_dir, "atoms.pt")
         losses_path = os.path.join(run_dir, "losses.pkl")
 
         atoms, losses = construct_atoms(
-            train_activations,
+            zf["activations"],
             batch_size=args.batch_size,
             l0=args.l0,
             target_dict_size=args.target_dict_size,
+            train_size=train_size,
             device=device,
         )
         torch.save(atoms, atoms_path)
@@ -406,12 +414,15 @@ if __name__ == "__main__":
             metadata = yaml.safe_load(f)
         wandb.init(project="example_saes", config=metadata)
 
-    # Evaluate
-    test_size = int(model_activations.size(0) * 0.3)
-    test_activations = model_activations[-test_size:].to(device)
+    test_size = int(total_sequences * 0.3)
     ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+
     eval_losses = evaluate(
-        ito_sae, test_activations.to(device), batch_size=args.batch_size
+        ito_sae,
+        store,
+        batch_size=args.batch_size,
+        val_size=test_size,
+        device=device,
     )
 
     mean_ito_loss = eval_losses.mean().item()
@@ -422,7 +433,7 @@ if __name__ == "__main__":
         mean_ito_loss,
         "on",
         len(eval_losses),
-        "samples",
+        "tokens",
     )
 
     wandb.finish()
