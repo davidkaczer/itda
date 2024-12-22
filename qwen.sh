@@ -30,7 +30,7 @@ else
 fi
 
 echo "Running command for model: $MODEL, layer: $LAYER, batch_size: $BATCH_SIZE"
-python3 ito.py \
+python3 train.py \
   --model "$MODEL" \
   --batch_size "$BATCH_SIZE" \
   --target_dict_size 50000 \
