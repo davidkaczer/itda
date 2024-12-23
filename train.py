@@ -6,26 +6,17 @@ point explicitly for transformer_lens loading.
 """
 
 import argparse
-import contextlib
 import gc
 import os
 import pickle
 import uuid
-from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import yaml
 import zarr
-from datasets import load_dataset
 from ito_sae import ITO_SAE
-from sae_lens import SAE
-from sae_lens.load_model import load_model as sae_lens_load_model  # Possibly unused now
-from sae_lens.toolkit.pretrained_saes_directory import get_pretrained_saes_directory
 from tqdm import tqdm
-from transformer_lens import HookedTransformer
-from transformer_lens.utils import tokenize_and_concatenate
 
 import wandb
 
@@ -65,9 +56,13 @@ def construct_atoms(
     device="cpu",
 ):
     if atoms is None:
-        print("Initialising atoms")
-        first_two_pos_acts = torch.from_numpy(activations[:, :2]).flatten(end_dim=1).to(device)
-        unique_rows, counts = torch.unique(first_two_pos_acts, dim=0, return_counts=True)
+        print("Initialising atoms... This may take a while to load the activations from disk")
+        first_two_pos_acts = (
+            torch.from_numpy(activations[:, :2]).flatten(end_dim=1).to(device)
+        )
+        unique_rows, counts = torch.unique(
+            first_two_pos_acts, dim=0, return_counts=True
+        )
         _, topk_indices = torch.topk(counts, k=activations.shape[-1])
         atoms = unique_rows[topk_indices]
 
@@ -83,7 +78,9 @@ def construct_atoms(
             "Please provide a larger target_dict_size or fewer initial atoms."
         )
 
-    atoms_per_batch = max(1, int(np.ceil(fraction_x * batch_size * activations.shape[1])))
+    atoms_per_batch = max(
+        1, int(np.ceil(fraction_x * batch_size * activations.shape[1]))
+    )
 
     losses = []
     ratio_history = []
@@ -91,7 +88,9 @@ def construct_atoms(
     batch_counter = 0
 
     for start_idx in range(0, train_size, batch_size):
-        batch_activations = activations[start_idx : min(start_idx + batch_size, train_size)]
+        batch_activations = activations[
+            start_idx : min(start_idx + batch_size, train_size)
+        ]
         batch_activations = torch.from_numpy(batch_activations).to(device)
         batch_activations = batch_activations.flatten(end_dim=1)
 
@@ -153,9 +152,13 @@ def evaluate(
 
     losses = []
     # Iterate over sequences in batches
-    for seq_start in tqdm(range(start_idx, total_sequences, batch_size), desc="Evaluating"):
+    for seq_start in tqdm(
+        range(start_idx, total_sequences, batch_size), desc="Evaluating"
+    ):
         seq_end = min(seq_start + batch_size, total_sequences)
-        batch_activations = zf["activations"][seq_start:seq_end]  # shape: (B, seq_len, d_model)
+        batch_activations = zf["activations"][
+            seq_start:seq_end
+        ]  # shape: (B, seq_len, d_model)
         batch_activations = torch.from_numpy(batch_activations).to(device)
         # Flatten from (B, seq_len, d_model) -> (B * seq_len, d_model)
         batch_activations = batch_activations.flatten(end_dim=1)
@@ -211,59 +214,6 @@ def filter_runs(base_dir=RUNS_DIR, **criteria):
                 if all(meta.get(k) == v for k, v in criteria.items()):
                     matching_runs.append(run_path)
     return matching_runs
-
-
-def get_activations(
-    model_name, dataset_name, hook_name, seq_len, batch_size, device, activations_path
-):
-    if os.path.exists(activations_path):
-        return activations_path
-
-    model = HookedTransformer.from_pretrained(model_name, device=device)
-    model.eval()
-
-    ds = load_dataset(path=dataset_name, split="train", streaming=False)
-    token_ds = tokenize_and_concatenate(
-        dataset=ds,
-        tokenizer=model.tokenizer,
-        streaming=False,
-        max_length=seq_len,
-        add_bos_token=True,
-    )
-    tokens = token_ds["tokens"].to(device)
-
-    store = zarr.DirectoryStore(activations_path)
-    zf = zarr.open_group(store=store, mode="w")
-    dset = None
-
-    def cache_activations(acts, hook=None):
-        nonlocal dset
-        acts_cpu = acts.detach().cpu().numpy()
-        if dset is None:
-            shape = (0,) + acts_cpu.shape[1:]
-            max_shape = (None,) + acts_cpu.shape[1:]
-            chunk_shape = (batch_size,) + acts_cpu.shape[1:]
-            dset = zf.create_dataset(
-                "activations",
-                shape=shape,
-                maxshape=max_shape,
-                chunks=chunk_shape,
-                dtype=acts_cpu.dtype,
-            )
-        old_size = dset.shape[0]
-        new_size = old_size + acts_cpu.shape[0]
-        dset.resize((new_size,) + dset.shape[1:])
-        dset[old_size:new_size, ...] = acts_cpu
-
-    model.remove_all_hook_fns()
-    model.add_hook(hook_name, cache_activations)
-
-    for chunk in tqdm(torch.split(tokens, batch_size), desc="Collecting Activations"):
-        model(chunk)
-
-    model.remove_all_hook_fns()
-    del model, ds, token_ds, tokens
-    return activations_path
 
 
 if __name__ == "__main__":
@@ -336,25 +286,12 @@ if __name__ == "__main__":
         seq_len=args.seq_len,
     )
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    model_dir = os.path.join(DATA_DIR, args.model)
-    os.makedirs(model_dir, exist_ok=True)
-    act_path = os.path.join(model_dir, "model_activations.zarr")
-
-    act_path = get_activations(
-        model_name=args.model,
-        dataset_name=args.dataset,
-        hook_name=args.hook_name,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        device=device,
-        activations_path=act_path,
-    )
+    act_path = os.path.join(DATA_DIR, args.model, args.dataset)
 
     atoms = None
     store = zarr.DirectoryStore(act_path)
     zf = zarr.open_group(store=store, mode="r")
-    total_sequences = zf["activations"].shape[0]
+    total_sequences = zf[args.hook_name].shape[0]
     if len(matching_runs) > 0:
         # Use the first matching run directory
         run_dir = matching_runs[0]
@@ -392,7 +329,7 @@ if __name__ == "__main__":
         losses_path = os.path.join(run_dir, "losses.pkl")
 
         atoms, losses = construct_atoms(
-            zf["activations"],
+            zf[args.hook_name],
             batch_size=args.batch_size,
             l0=args.l0,
             target_dict_size=args.target_dict_size,
