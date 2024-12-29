@@ -27,8 +27,8 @@ LAYER=$((INDEX % 24))
 MODEL=${MODELS[$MODEL_INDEX]}
 
 echo "Running command for model: $MODEL, layer: $LAYER, batch_size: 1024"
-python3 train.py \
+python3 ../train.py \
   --model "$MODEL" \
-  --batch_size 1024 \
+  --batch_size 32 \
   --target_dict_size 50000 \
   --hook_name "blocks.$LAYER.hook_resid_pre"

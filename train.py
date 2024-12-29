@@ -56,13 +56,17 @@ def construct_atoms(
     device="cpu",
 ):
     if atoms is None:
-        print("Initialising atoms... This may take a while to load the activations from disk")
-        first_two_pos_acts = (
-            torch.from_numpy(activations[:, :2]).flatten(end_dim=1).to(device)
-        )
-        unique_rows, counts = torch.unique(
-            first_two_pos_acts, dim=0, return_counts=True
-        )
+        all_rows = []
+        for start_idx in tqdm(range(0, activations.shape[0], batch_size), desc="Initializing Atoms"):
+            end_idx = min(start_idx + batch_size, activations.shape[0])
+            chunk = torch.from_numpy(activations[start_idx:end_idx, :2])
+            chunk = chunk.flatten(end_dim=1)
+            all_rows.append(chunk)
+
+        first_two_pos_acts = torch.cat(all_rows, dim=0).to(device)
+        del all_rows
+
+        unique_rows, counts = torch.unique(first_two_pos_acts, dim=0, return_counts=True)
         _, topk_indices = torch.topk(counts, k=activations.shape[-1])
         atoms = unique_rows[topk_indices]
 
