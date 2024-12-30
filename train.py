@@ -302,8 +302,9 @@ if __name__ == "__main__":
     store = zarr.DirectoryStore(act_path)
     zf = zarr.open_group(store=store, mode="r")
     total_sequences = zf[args.hook_name].shape[0]
+
+    # If a matching run directory with saved atoms exists, load it.
     if len(matching_runs) > 0:
-        # Use the first matching run directory
         run_dir = matching_runs[0]
         print(f"Found existing run with these parameters: {run_dir}")
         with open(os.path.join(run_dir, "metadata.yaml"), "r") as f:
@@ -313,11 +314,9 @@ if __name__ == "__main__":
         if os.path.exists(atoms_path):
             atoms = torch.load(atoms_path, weights_only=True)
 
+    # If no existing atoms, create a new run
     if atoms is None:
-        run_id = str(uuid.uuid4())
-        run_dir = os.path.join(RUNS_DIR, run_id)
-        os.makedirs(run_dir, exist_ok=True)
-
+        # Initialize W&B
         metadata = {
             "model": args.model,
             "dataset": args.dataset,
@@ -328,16 +327,23 @@ if __name__ == "__main__":
             "target_dict_size": args.target_dict_size,
             "device": str(device),
         }
+        run = wandb.init(project="example_saes", config=metadata)
+        run_id = wandb.run.id  # Use the W&B run ID as the directory name
+
+        # Create the run directory named with the W&B run ID
+        run_dir = os.path.join(RUNS_DIR, run_id)
+        os.makedirs(run_dir, exist_ok=True)
+
+        # Save metadata
         with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
             yaml.safe_dump(metadata, f)
-
-        wandb.init(project="example_saes", config=metadata)
 
         train_size = int(total_sequences * 0.7)
 
         atoms_path = os.path.join(run_dir, "atoms.pt")
         losses_path = os.path.join(run_dir, "losses.pkl")
 
+        # Construct atoms
         atoms, losses = construct_atoms(
             zf[args.hook_name],
             batch_size=args.batch_size,
@@ -350,17 +356,18 @@ if __name__ == "__main__":
         with open(losses_path, "wb") as f:
             pickle.dump(losses, f)
 
-        # Update metadata with number of atoms
+        # Update metadata with number of atoms and overwrite
         metadata["num_atoms"] = atoms.size(0)
         with open(os.path.join(run_dir, "metadata.yaml"), "w") as f:
             yaml.safe_dump(metadata, f)
 
-    # If run was loaded from existing directory, ensure wandb run is initialized
+    # Ensure wandb run is initialized for evaluation
     if wandb.run is None:
         with open(os.path.join(run_dir, "metadata.yaml"), "r") as f:
             metadata = yaml.safe_load(f)
         wandb.init(project="example_saes", config=metadata)
 
+    # Evaluate
     test_size = int(total_sequences * 0.3)
     ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
 
