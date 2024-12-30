@@ -9,9 +9,9 @@
 #SBATCH -o logs/qwen_sae-%A_%a.out
 #SBATCH --mem 28G
 #SBATCH --array=0-47
+#SBATCH --requeue
 
 # Assumes that the model activations are already saved in the data directory.
-# Will probably OOM if not.
 
 module load cuda/11.3
 source /home3/wclv88/venv/bin/activate
