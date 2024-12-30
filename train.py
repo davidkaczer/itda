@@ -57,7 +57,9 @@ def construct_atoms(
 ):
     if atoms is None:
         all_rows = []
-        for start_idx in tqdm(range(0, activations.shape[0], batch_size), desc="Initializing Atoms"):
+        for start_idx in tqdm(
+            range(0, activations.shape[0], batch_size), desc="Initializing Atoms"
+        ):
             end_idx = min(start_idx + batch_size, activations.shape[0])
             chunk = torch.from_numpy(activations[start_idx:end_idx, :2])
             chunk = chunk.flatten(end_dim=1)
@@ -66,7 +68,9 @@ def construct_atoms(
         first_two_pos_acts = torch.cat(all_rows, dim=0).to(device)
         del all_rows
 
-        unique_rows, counts = torch.unique(first_two_pos_acts, dim=0, return_counts=True)
+        unique_rows, counts = torch.unique(
+            first_two_pos_acts, dim=0, return_counts=True
+        )
         _, topk_indices = torch.topk(counts, k=activations.shape[-1])
         atoms = unique_rows[topk_indices]
 
@@ -160,9 +164,7 @@ def evaluate(
         range(start_idx, total_sequences, batch_size), desc="Evaluating"
     ):
         seq_end = min(seq_start + batch_size, total_sequences)
-        batch_activations = zf["activations"][
-            seq_start:seq_end
-        ]  # shape: (B, seq_len, d_model)
+        batch_activations = zf[seq_start:seq_end]  # shape: (B, seq_len, d_model)
         batch_activations = torch.from_numpy(batch_activations).to(device)
         # Flatten from (B, seq_len, d_model) -> (B * seq_len, d_model)
         batch_activations = batch_activations.flatten(end_dim=1)
@@ -223,7 +225,11 @@ def filter_runs(base_dir=RUNS_DIR, **criteria):
 if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available..")
+    device = "cuda"
+
     torch.set_grad_enabled(False)
 
     parser = argparse.ArgumentParser()
