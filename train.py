@@ -178,29 +178,6 @@ def evaluate(
     return torch.stack(losses)
 
 
-def get_atom_indices(
-    atoms: torch.Tensor, activations: torch.Tensor, batch_size: int = 256
-) -> torch.Tensor:
-    flattened_activations = activations.view(-1, activations.size(-1))
-    num_atoms = atoms.size(0)
-    flattened_idxs = torch.empty(num_atoms, dtype=torch.long, device=atoms.device)
-    for start_idx in tqdm(
-        range(0, flattened_activations.size(0), batch_size), desc="Getting atom indices"
-    ):
-        end_idx = min(start_idx + batch_size, flattened_activations.size(0))
-        activations_batch = flattened_activations[start_idx:end_idx].to(atoms.device)
-        matches = torch.all(atoms[:, None, :] == activations_batch[None, :, :], dim=2)
-        matched_idxs = matches.sum(dim=1).nonzero().squeeze(-1)
-        if matched_idxs.numel() > 0:
-            flattened_idxs[matched_idxs] = (
-                matches[matched_idxs].float().argmax(dim=1) + start_idx
-            )
-    return torch.stack(
-        [flattened_idxs // activations.size(1), flattened_idxs % activations.size(1)],
-        dim=1,
-    )
-
-
 def filter_runs(base_dir=RUNS_DIR, **criteria):
     """
     Iterate over all run directories in `base_dir`, load metadata.yaml,

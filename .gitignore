@@ -6,5 +6,6 @@ eval_results/
 cuda/
 __pycache__/
 scratch.py
-
 wandb/
+prompt_context.txt
+.env
