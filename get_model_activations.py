@@ -1,88 +1,159 @@
 import argparse
-import fnmatch
 import os
-from functools import partial
-
-import torch
+import math
 import zarr
-from datasets import load_dataset
+import torch
 from tqdm import tqdm
-from transformer_lens import HookedTransformer
-from transformer_lens.utils import tokenize_and_concatenate
-from typing import List
+from datasets import load_dataset, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import itertools
+import shutil
 
-from train import DATA_DIR
 
-def get_activations(
+def get_activations_hf(
     model_name: str,
     dataset_name: str,
-    hook_name: List[str],
     activations_path: str,
     seq_len: int,
     batch_size: int,
     device: torch.device,
+    num_examples: int,
 ):
-    activations_path = os.path.join(activations_path, model_name, dataset_name)
-    if os.path.exists(activations_path):
-        print(f"Activations already exist at {activations_path}. Skipping.")
+    """
+    Collect hidden states (residual-stream-like) from a Hugging Face model
+    for up to `num_examples` items, and store them in a Zarr directory.
+
+    We'll produce one dataset per layer, named 'layer_{i}', where i starts
+    at 1 for the hidden states after the first layer, up to `num_layers`.
+
+    Args:
+        model_name (str): Hugging Face model name or path.
+        dataset_name (str): Hugging Face dataset to load (split=train).
+        activations_path (str): Path to directory in which to store Zarr outputs.
+        seq_len (int): Sequence length for tokenization.
+        batch_size (int): Batch size for forward passes.
+        device (torch.device): Device to run on (cpu or cuda).
+        num_examples (int): How many examples to process in total.
+    """
+
+    # Prepare final directory where Zarr data will be stored
+    save_dir = os.path.join(activations_path, model_name, dataset_name)
+
+    # If this directory already exists, assume we've done it before and skip
+    if os.path.exists(save_dir):
+        print(f"Activations already exist at {save_dir}, skipping.")
         return
 
-    model = HookedTransformer.from_pretrained(model_name, device=device)
+    # -------------------------------------------------------------------------
+    # 1. Load/prepare data first (so we don't create the folder until successful)
+    # -------------------------------------------------------------------------
+    print(f"Loading dataset {dataset_name} for {num_examples} examples ...")
+    ds_stream = load_dataset(dataset_name, split="train", streaming=True)
+
+    # Collect first `num_examples` from the streaming dataset
+    limited_samples = list(itertools.islice(ds_stream, num_examples))
+    if len(limited_samples) == 0:
+        print(f"No data available in dataset {dataset_name}!")
+        return
+
+    # Convert to an in-memory Dataset
+    ds_local = Dataset.from_list(limited_samples)
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Tokenization function
+    def tokenize_fn(example):
+        return tokenizer(
+            example["text"],
+            max_length=seq_len,
+            truncation=True,
+            padding="max_length",
+        )
+
+    # Remove the original text column to save space
+    ds_local = ds_local.map(tokenize_fn, batched=True, remove_columns=["text"])
+    ds_local.set_format(type="torch", columns=["input_ids"])
+
+    if len(ds_local) == 0:
+        print(f"No data left after tokenization in dataset {dataset_name}!")
+        return
+
+    # -------------------------------------------------------------------------
+    # 2. Load model + run a probe pass
+    # -------------------------------------------------------------------------
+    print(f"Loading model {model_name} ...")
+    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     model.eval()
 
-    hook_names = model.hook_dict.keys()
-    if hook_name in hook_names:
-        hook_names = [hook_name]
-    else:
-        # assume there's a wild-card
-        hook_names = fnmatch.filter(hook_names, hook_name)
-    if not hook_names:
-        raise ValueError(f"No hook found matching {hook_name}.")
+    # Probe pass to figure out dimensions
+    probe_input = ds_local[0]["input_ids"].unsqueeze(0).to(device)
+    with torch.no_grad():
+        probe_out = model(probe_input, output_hidden_states=True)
+    probe_hs = probe_out.hidden_states
+    num_layers = len(probe_hs) - 1  # ignoring hidden_states[0] if you want post-layer
+    hidden_dim = probe_hs[-1].size(-1)
+    print(f"Model has {num_layers} layers. Hidden size = {hidden_dim}")
 
-    print(f"Collecting activations from {hook_names} in {model_name}.")
+    # -------------------------------------------------------------------------
+    # 3. Create folder only after successful data/model prep; if something
+    #    fails *after* creation, we clean up.
+    # -------------------------------------------------------------------------
+    created_dir = False
+    try:
+        os.makedirs(save_dir, exist_ok=False)
+        created_dir = True
+        print(f"Created directory {save_dir} to store activations.")
 
-    ds = load_dataset(path=dataset_name, split="train", streaming=False)
-    token_ds = tokenize_and_concatenate(
-        dataset=ds,
-        tokenizer=model.tokenizer,
-        streaming=False,
-        max_length=seq_len,
-        add_bos_token=True,
-    )
-    tokens = token_ds["tokens"].to(device)
+        # Prepare Zarr store
+        store = zarr.DirectoryStore(save_dir)
+        zf = zarr.open_group(store=store, mode="w")
 
-    store = zarr.DirectoryStore(activations_path)
-    zf = zarr.open_group(store=store, mode="w")
-    dsets = {hook_name: None for hook_name in hook_names}
-
-    def cache_activations(hook_name, dsets, acts, hook=None):
-        acts_cpu = acts.detach().cpu().numpy()
-        if dsets[hook_name] is None:
-            shape = (0,) + acts_cpu.shape[1:]
-            max_shape = (None,) + acts_cpu.shape[1:]
-            chunk_shape = (batch_size,) + acts_cpu.shape[1:]
-            dsets[hook_name] = zf.create_dataset(
-                hook_name,
-                shape=shape,
-                maxshape=max_shape,
-                chunks=chunk_shape,
-                dtype=acts_cpu.dtype,
+        print("Creating Zarr datasets ...")
+        dsets = []
+        for layer_idx in range(1, num_layers + 1):
+            layer_dset = zf.create_dataset(
+                f"layer_{layer_idx}",
+                shape=(0, seq_len, hidden_dim),
+                maxshape=(None, seq_len, hidden_dim),
+                chunks=(batch_size, seq_len, hidden_dim),
+                dtype="float32",
             )
-        old_size = dsets[hook_name].shape[0]
-        new_size = old_size + acts_cpu.shape[0]
-        dsets[hook_name].resize((new_size,) + dsets[hook_name].shape[1:])
-        dsets[hook_name][old_size:new_size, ...] = acts_cpu
+            dsets.append(layer_dset)
 
-    model.remove_all_hook_fns()
-    for hook_name in hook_names:
-        model.add_hook(hook_name, partial(cache_activations, hook_name, dsets))
+        # ---------------------------------------------------------------------
+        # 4. Collect hidden states
+        # ---------------------------------------------------------------------
+        print("Collecting hidden states ...")
+        num_processed = 0
+        total_batches = math.ceil(len(ds_local) / batch_size)
 
-    for chunk in tqdm(torch.split(tokens, batch_size), desc="Collecting Activations"):
-        model(chunk)
+        with torch.no_grad():
+            for start_idx in tqdm(range(0, len(ds_local), batch_size), desc="Batches", total=total_batches):
+                end_idx = min(start_idx + batch_size, len(ds_local))
+                batch = ds_local[start_idx:end_idx]["input_ids"].to(device)
+                outputs = model(batch, output_hidden_states=True)
+                hidden_states = outputs.hidden_states
 
-    model.remove_all_hook_fns()
-    del model, ds, token_ds, tokens
-    return activations_path
+                # hidden_states[1:] are the post-layer states for layers 1..num_layers
+                for layer_idx, layer_acts in enumerate(hidden_states[1:], start=1):
+                    old_size = dsets[layer_idx - 1].shape[0]
+                    new_size = old_size + layer_acts.size(0)
+                    dsets[layer_idx - 1].resize((new_size, seq_len, hidden_dim))
+                    dsets[layer_idx - 1][old_size:new_size, :, :] = layer_acts.cpu().numpy()
+
+                num_processed += batch.size(0)
+
+        print(f"Done! Saved hidden states for {num_processed} sequences to {save_dir}.")
+
+    except Exception as e:
+        # If we created the directory during this run, clean up
+        if created_dir:
+            print(f"An error occurred, removing directory {save_dir} ...")
+            shutil.rmtree(save_dir, ignore_errors=True)
+        raise e  # re-raise so you see the actual error
 
 
 if __name__ == "__main__":
@@ -96,30 +167,46 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="gpt2",
-        help="Model name as recognized by transformer_lens, e.g. 'gpt2', 'EleutherAI/pythia-1.4b', etc.",
+        help="Hugging Face model name or path, e.g. 'gpt2', 'EleutherAI/pythia-1.4b', etc.",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default="NeelNanda/pile-10k",
-        help="HuggingFace dataset name for tokenization and activation collection, e.g. 'NeelNanda/pile-10k'.",
+        help="HuggingFace dataset name (split=train) for tokenization/activation collection.",
     )
     parser.add_argument(
-        "--hook_name",
-        type=str,
-        default="blocks.8.hook_resid_pre",
-        help="List of hook points at which to collect activations from the transformer. Can also be a regex.",
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size for forward passes.",
     )
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--seq_len", type=int, default=128)
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=128,
+        help="Maximum sequence length for tokenization.",
+    )
+    parser.add_argument(
+        "--activations_path",
+        type=str,
+        default="artifacts/data",
+        help="Where to store final Zarr outputs. The final path is <activations_path>/<model>/<dataset>.",
+    )
+    parser.add_argument(
+        "--num_examples",
+        type=int,
+        default=10_000,
+        help="How many total examples to read from the dataset (and load into memory).",
+    )
     args = parser.parse_args()
 
-    get_activations(
+    get_activations_hf(
         model_name=args.model,
         dataset_name=args.dataset,
-        hook_name=args.hook_name,
-        activations_path=DATA_DIR,
+        activations_path=args.activations_path,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         device=device,
+        num_examples=args.num_examples,
     )

@@ -6,19 +6,6 @@ import torch
 from optim import omp_incremental_cholesky_with_fallback
 
 
-def to_nonnegative_activations(activations: torch.Tensor) -> torch.Tensor:
-    positive_activations = activations.clamp(min=0.0)
-    negative_activations = activations.clamp(max=0.0)
-    return torch.cat([positive_activations, negative_activations], dim=-1)
-
-
-def to_unbounded_activations(activations: torch.Tensor) -> torch.Tensor:
-    half_dim = activations.size(-1) // 2
-    positive_activations = activations[..., :half_dim]
-    negative_activations = activations[..., half_dim:]
-    return positive_activations + negative_activations
-
-
 class ITO_SAE:
     def __init__(self, atoms, l0=8, cfg=None):
         self.atoms = atoms
@@ -29,22 +16,25 @@ class ITO_SAE:
         shape = x.size()
         x = x.view(-1, shape[-1])
         activations = omp_incremental_cholesky_with_fallback(self.atoms, x, self.l0)
-        activations = to_nonnegative_activations(activations)
         return activations.view(*shape[:-1], -1)
 
     def decode(self, activations):
-        original_activations = to_unbounded_activations(activations)
-        original_device = original_activations.device
-        original_activations = original_activations.to(self.atoms.device)
-        return torch.matmul(original_activations, self.atoms).to(original_device)
+        return torch.matmul(activations, self.atoms)
 
     @property
     def W_dec(self):
-        return torch.cat([self.atoms, -self.atoms], dim=0)
+        return self.atoms
 
     def __call__(self, x):
         acts = self.encode(x)
         return self.decode(acts)
+
+    @property
+    def W_enc(self):
+        # necessary for running core evals with sae bench
+        return torch.zeros(
+            (self.atoms.size(1), self.atoms.size(0)), device=self.atoms.device
+        )
 
     @property
     def device(self):
@@ -59,6 +49,11 @@ class ITO_SAE:
             self.atoms = self.atoms.to(device)
         if dtype:
             self.atoms = self.atoms.to(dtype)
+        return self
+
+    def normalize_decoder(self):
+        norms = torch.norm(self.atoms, dim=1)
+        self.atoms /= norms[:, None]
         return self
 
 
