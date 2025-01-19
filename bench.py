@@ -271,8 +271,7 @@ if __name__ == "__main__":
     if not os.path.exists(atoms_path):
         raise FileNotFoundError("No atoms.pt found for the specified ITO run")
 
-    atoms = torch.load(atoms_path, weights_only=False).to(device)
-
+    atoms = torch.load(atoms_path).to(device)
     ito_sae = ITO_SAE(
         atoms,
         l0=metadata["l0"],
