@@ -24,6 +24,9 @@ echo "Layer: $LAYER"
 echo "Target loss: $TARGET_LOSS"
 echo "L0: $L0"
 
+module load cuda/11.3
+source /wclv88/wclv88/venv/bin/activate
+
 # Run the Python script with the provided parameters
 python3 train.py \
     --model "$MODEL" \
