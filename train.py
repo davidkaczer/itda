@@ -1,13 +1,3 @@
-"""
-Implementations of inference time optimization (ITO) algorithms for dictionary
-learning. Refactored to rely on hidden states stored by layer index 
-(i.e. "layer_0", "layer_1", etc.) instead of a hook point.
-
-In this updated version, we add new atoms if their reconstruction loss exceeds
-a specified threshold (provided via --target_loss) rather than adding a 
-fixed ratio of the "worst" activations.
-"""
-
 import argparse
 import gc
 from collections import Counter
@@ -132,9 +122,7 @@ def top_k_most_repeated_rows(tensor, k):
         return None
 
     tensor_tuples = tuple(tuple(row.tolist()) for row in tensor)
-
     row_counts = Counter(tensor_tuples)
-
     top_k_rows_with_counts = row_counts.most_common(k)
 
     indices = []
@@ -393,6 +381,7 @@ if __name__ == "__main__":
     }
     if args.load_run_id is not None:
         metadata["load_run_id"] = args.load_run_id
+
     wandb.init(project="example_saes", config=metadata)
     run_id = wandb.run.id
 
@@ -406,7 +395,8 @@ if __name__ == "__main__":
     if args.load_run_id is not None:
         continue_run_dir = os.path.join(RUNS_DIR, args.load_run_id)
         continue_atom_indices_path = os.path.join(continue_run_dir, "atom_indices.pt")
-        atom_indices = torch.load(continue_atom_indices_path, weights_only=True)
+        # Note: `weights_only=True` is not a valid argument for torch.load, removing it
+        atom_indices = torch.load(continue_atom_indices_path)
 
     # Build dictionary using the threshold-based approach
     atoms, atom_indices, losses = construct_atoms(
@@ -453,7 +443,19 @@ if __name__ == "__main__":
     mean_ito_loss = eval_losses.mean().item()
     print(f"Mean ITO loss: {mean_ito_loss:.4f} over {len(eval_losses)} activations")
 
-    # If this is a new run, log to W&B
-    if wandb.run is not None:
-        wandb.log({"eval_loss": mean_ito_loss})
-        wandb.finish()
+    # Log final evaluation loss
+    wandb.log({"eval_loss": mean_ito_loss})
+
+    artifact = wandb.Artifact(
+        name=f"ito_dictionary_{run_id}",
+        type="model",
+        description="Dictionary atoms and indices for ITO",
+        metadata={"num_atoms": atoms.size(0)},
+    )
+    artifact.add_file(atoms_path)
+    artifact.add_file(atom_indices_path)
+    artifact.add_file(losses_path)
+    artifact.add_file(os.path.join(run_dir, "metadata.yaml"))
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
