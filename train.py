@@ -138,64 +138,45 @@ def construct_atoms(
     """
     Dictionary construction with two modes:
       1) Fixed threshold: Add atoms if recon loss > target_loss_threshold.
-      2) Top fraction (if target_dict_size > 0):
-         fraction = target_dict_size / (train_size * seq_len),
+      2) Top fraction (if target_dict_size > 0): 
+         fraction = target_dict_size / (train_size * seq_len), 
          and in each batch select top fraction of tokens by reconstruction loss.
 
     If residual_atoms=True, we add (activation - reconstruction) as new atoms
     rather than the raw activations themselves.
-
-    This updated version processes tokens in order of token index: all position-0
-    tokens from all sequences first, then position-1 tokens from all sequences, and so on.
     """
-    seq_len = activations.shape[1]
-    d_model = activations.shape[2]
-    batch_size = batch_size * seq_len
-
     if train_size < 0:
         train_size = activations.shape[0]
-
-    total_tokens = train_size * seq_len
+    total_tokens = train_size * activations.shape[1]
 
     # Pre-initialize from existing indices or from top-k in first positions
     if atom_indices is None:
-        # Collect all position=0 activations to find the most repeated rows
         all_rows = []
-        for start_idx in tqdm(range(0, train_size, batch_size), desc="Initializing Atoms"):
+        for start_idx in tqdm(
+            range(0, train_size, batch_size), desc="Initializing Atoms"
+        ):
             end_idx = min(start_idx + batch_size, train_size)
-            # shape [B, 1, d_model] for pos=0
-            chunk = torch.from_numpy(
-                activations[start_idx:end_idx, :1]
-            )  # shape [B, 1, d_model]
-            chunk = chunk.flatten(end_dim=1)  # shape [B, d_model]
+            chunk = torch.from_numpy(activations[start_idx:end_idx, :1]).flatten(end_dim=1)
             all_rows.append(chunk)
 
         first_pos_acts = torch.cat(all_rows, dim=0).to(device)
         del all_rows
-
-        topk = min(d_model, first_pos_acts.shape[0])
+        topk = min(activations.shape[-1], first_pos_acts.shape[0])
         result = top_k_most_repeated_rows(first_pos_acts, topk)
         if result is not None:
-            # result = (indices, rows)
-            init_atom_rel_idx, init_atoms = result
-            # We only have sequence indices relative to first_pos_acts, so build full (seq, pos)
-            # For repeated rows, we can't directly recover which sequence they came from,
-            # so we store dummy indices: [-1, -1] or keep them separate.
-            # Alternatively, you could skip storing indices for duplicates.
+            atom_indices, atoms = result
             atom_indices = torch.cat(
                 [
-                    init_atom_rel_idx.unsqueeze(-1),
-                    torch.zeros((init_atom_rel_idx.size(0), 1), dtype=torch.long, device=device),
+                    atom_indices.unsqueeze(-1),
+                    torch.zeros((atom_indices.size(0), 1), dtype=torch.long, device=device),
                 ],
                 dim=1,
             )
-            atoms = init_atoms
         else:
             # In case there are no valid rows (extreme edge case)
-            atoms = torch.empty((0, d_model), device=device)
+            atoms = torch.empty((0, activations.shape[-1]), device=device)
             atom_indices = torch.empty((0, 2), dtype=torch.long, device=device)
     else:
-        # Load from existing indices
         atoms = gather_token_activations(activations, atom_indices, device=device)
 
     losses = []
@@ -203,107 +184,91 @@ def construct_atoms(
     if target_dict_size > 0:
         fraction = float(target_dict_size) / float(total_tokens)
 
-    # We'll have a single progress bar for all positions
-    pbar = tqdm(total=train_size * seq_len, desc="Constructing Atoms")
+    pbar = tqdm(total=train_size, desc="Constructing Atoms")
     batch_counter = 0
 
-    # Process tokens in order of token index
-    for pos_idx in range(seq_len):
-        # pos_desc = f"Constructing Atoms (pos={pos_idx})"
-        for start_idx in range(0, train_size, batch_size):
-            end_idx = min(start_idx + batch_size, train_size)
+    for start_idx in range(0, train_size, batch_size):
+        end_idx = min(start_idx + batch_size, train_size)
+        batch_np = activations[start_idx:end_idx]
+        B, seq_len, d_model = batch_np.shape
+        batch_activations = torch.from_numpy(batch_np).to(device).flatten(end_dim=1)
 
-            # Gather the [start_idx:end_idx, pos_idx:pos_idx+1] slice
-            # shape will be [B, 1, d_model]
-            batch_np = activations[start_idx:end_idx, pos_idx : pos_idx + 1]
-            B, _, _ = batch_np.shape
-            batch_activations = torch.from_numpy(batch_np).to(device).view(B, d_model)
+        token_indices = (
+            torch.stack(
+                torch.meshgrid(
+                    torch.arange(start_idx, end_idx),
+                    torch.arange(seq_len),
+                    indexing="ij",
+                ),
+                dim=-1,
+            )
+            .reshape(-1, 2)
+            .to(device)
+        )
 
-            # Create matching token_indices
-            seq_indices = torch.arange(start_idx, end_idx, device=device)
-            pos_indices = torch.full((B,), pos_idx, device=device)
-            token_indices_this_batch = torch.stack((seq_indices, pos_indices), dim=-1)
+        sae = ITO_SAE(atoms, l0)
+        recon = sae(batch_activations)
+        batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
 
-            if atoms.size(0) > 0:
-                sae = ITO_SAE(atoms, l0)
-                recon = sae(batch_activations)
-            else:
-                # If we have no atoms yet, reconstruction is just zero
-                recon = torch.zeros_like(batch_activations, device=device)
+        # Filter out extremely large losses
+        valid_mask = batch_loss < 1e8
+        valid_losses = batch_loss[valid_mask]
+        valid_activations = batch_activations[valid_mask]
+        valid_recon = recon[valid_mask]
+        valid_token_indices = token_indices[valid_mask]
+        losses.extend(valid_losses.cpu().tolist())
 
-            batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
-
-            # Filter out extremely large or invalid losses
-            valid_mask = batch_loss < 1e8
-            valid_losses = batch_loss[valid_mask]
-            valid_activations = batch_activations[valid_mask]
-            valid_recon = recon[valid_mask]
-            valid_token_indices = token_indices_this_batch[valid_mask]
-            losses.extend(valid_losses.cpu().tolist())
-
-            # Decide which new atoms to add
-            if target_dict_size > 0:
-                # Top fraction approach
-                top_count = int(np.ceil(fraction * valid_losses.size(0)))
-                if top_count > 0:
-                    top_count = min(top_count, valid_losses.size(0))
-                    _, selected_idx = torch.topk(valid_losses, k=top_count)
-                    if residual_atoms:
-                        new_atoms = (valid_activations - valid_recon)[selected_idx]
-                    else:
-                        new_atoms = valid_activations[selected_idx]
-                    new_indices = valid_token_indices[selected_idx]
-                else:
-                    new_atoms = torch.empty((0, d_model), device=device)
-                    new_indices = torch.empty((0, 2), dtype=torch.long, device=device)
-            else:
-                # Threshold approach
-                new_mask = valid_losses > target_loss_threshold
+        if target_dict_size > 0:
+            # Top fraction approach
+            top_count = int(np.ceil(fraction * valid_losses.size(0)))
+            if top_count > 0:
+                top_count = min(top_count, valid_losses.size(0))
+                selected_vals, selected_idx = torch.topk(valid_losses, k=top_count)
                 if residual_atoms:
-                    new_atoms = (valid_activations - valid_recon)[new_mask]
+                    new_atoms = (valid_activations - valid_recon)[selected_idx]
                 else:
-                    new_atoms = valid_activations[new_mask]
-                new_indices = valid_token_indices[new_mask]
+                    new_atoms = valid_activations[selected_idx]
+                new_indices = valid_token_indices[selected_idx]
+            else:
+                new_atoms = torch.empty((0, d_model), device=device)
+                new_indices = torch.empty((0, 2), dtype=torch.long, device=device)
+        else:
+            new_mask = valid_losses > target_loss_threshold
+            if residual_atoms:
+                new_atoms = (valid_activations - valid_recon)[new_mask]
+            else:
+                new_atoms = valid_activations[new_mask]
+            new_indices = valid_token_indices[new_mask]
 
-            # If we have new atoms, concatenate them
-            if new_atoms.size(0) > 0:
-                atoms = torch.cat([atoms, new_atoms], dim=0)
-                atom_indices = torch.cat([atom_indices, new_indices], dim=0)
+        if new_atoms.size(0) > 0:
+            atoms = torch.cat([atoms, new_atoms], dim=0)
+            atom_indices = torch.cat([atom_indices, new_indices], dim=0)
 
-            batch_counter += 1
-            pbar.update(end_idx - start_idx)
-            pbar.set_postfix(
-                {
-                    "dict_size": atoms.size(0),
-                    "pos": pos_idx,
-                    "mean_loss": float(valid_losses.mean().cpu().item())
-                    if valid_losses.numel() > 0
-                    else 0.0,
-                }
-            )
+        batch_counter += 1
+        pbar.update(end_idx - start_idx)
+        pbar.set_postfix(
+            {
+                "dict_size": atoms.size(0),
+                "mean_loss": float(valid_losses.mean().cpu().item()),
+            }
+        )
 
-            wandb.log(
-                {
-                    "batch_step": batch_counter,
-                    "mean_loss": float(valid_losses.mean().cpu().item())
-                    if valid_losses.numel() > 0
-                    else 0.0,
-                    "batch_new_atoms": new_atoms.size(0),
-                    "dict_size": atoms.size(0),
-                    "pos": pos_idx,
-                }
-            )
+        wandb.log(
+            {
+                "batch_step": batch_counter,
+                "mean_loss": float(valid_losses.mean().cpu().item()),
+                "batch_new_atoms": new_atoms.size(0),
+                "dict_size": atoms.size(0),
+            }
+        )
 
     pbar.close()
 
-    # Remove exact duplicates in the final set of atoms
-    # (This does not remove near-duplicates; you can do a cos-sim pass if you want.)
-    # unique_indices is the first occurrence index for each unique row in `atoms`
+    # Remove duplicates
     atoms, unique_indices = torch.unique(atoms, return_inverse=True, dim=0)
     atom_indices = atom_indices[unique_indices]
 
     return atoms, atom_indices, losses
-
 
 def deduplicate_atoms(
     atoms: torch.Tensor, atom_indices: torch.Tensor, cos_threshold=0.7
