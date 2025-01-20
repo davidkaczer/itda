@@ -12,7 +12,7 @@ from tqdm import tqdm
 # %%
 # === USER CONFIGURATION ===
 
-RUN_ID = "jppyqjur"
+RUN_ID = "9vrfil97"
 
 # Highlight colors (dark background, so text is presumably white)
 TOKEN_OF_INTEREST_COLOR = "#3B1E6B"  # Indigo-ish
@@ -102,10 +102,7 @@ def gather_atom_origin_snippet(atom_idx, atom_indices, ds, tokenizer, context=5)
 
 # %%
 def match_atoms_in_activations(
-    atoms: torch.Tensor,
-    zarr_acts,
-    threshold: float = 1e-6,
-    batch_size: int = 128
+    atoms: torch.Tensor, zarr_acts, threshold: float = 1e-6, batch_size: int = 128
 ) -> dict[int, list[tuple[int, int]]]:
     """
     Naively search a Zarr dataset of activations for each atom’s exact (or near-exact)
@@ -119,7 +116,7 @@ def match_atoms_in_activations(
         batch_size:   How many sequences to process at a time
 
     Note: This method is O(num_seqs * seq_len * n_atoms * d_model) in the worst case,
-          so it can be very slow for large datasets. 
+          so it can be very slow for large datasets.
     """
     device = atoms.device if atoms.is_cuda else "cpu"
     n_atoms, d_model = atoms.shape
@@ -216,10 +213,7 @@ if __name__ == "__main__":
         atom_indices = torch.load(atom_indices_path, weights_only=True)
     except FileNotFoundError:
         atom_indices = match_atoms_in_activations(
-            atoms=atoms, 
-            zarr_acts=zf_layer, 
-            threshold=1e-6, 
-            batch_size=128
+            atoms=atoms, zarr_acts=zf_layer, threshold=1e-6, batch_size=128
         )
 
     ito_sae = ITO_SAE(atoms, l0=l0)
@@ -227,9 +221,9 @@ if __name__ == "__main__":
 # %%
 
 if __name__ == "__main__":
-    SAMPLE_IDX = 3
-    TOKEN_IDX = 14
-    SAMPLE_IDX = int(0.7*len(ds)) + SAMPLE_IDX
+    SAMPLE_IDX = 9
+    TOKEN_IDX = 20
+    SAMPLE_IDX = int(0.7 * len(ds)) + SAMPLE_IDX
 
     if SAMPLE_IDX >= zf_layer.shape[0]:
         raise IndexError(
@@ -290,3 +284,204 @@ if __name__ == "__main__":
                 f"<b>#{rank} Atom {atom_idx.item()} Act {score:.4f}</b>): {origin_snippet}"
             )
         )
+
+# %%
+
+# %%
+# In this cell, we add a method to find the top activating samples for a given latent (atom) index.
+# Inspired by diff.py, we collect all encoded activations in a single sparse tensor, where the
+# sparse indices represent (sequence_idx, token_idx, atom_idx). Then we can retrieve the top
+# activating positions for any chosen atom.
+
+import torch
+from tqdm import tqdm
+from IPython.display import HTML, display
+
+
+def get_all_activations_sparse(
+    sae,
+    zf_layer,
+    batch_size=128,
+):
+    """
+    Encode the entire dataset's activations into the SAE’s representation
+    and store them in a sparse tensor of shape [num_positions, n_atoms],
+    with an expanded 3-row indices for (seq_idx, token_idx, atom_idx).
+
+    zf_layer: A Zarr array of shape (num_sequences, seq_len, d_model).
+    sae:      An ITO_SAE (or compatible) model with .encode() -> (B, n_atoms).
+
+    Returns: A sparse tensor with:
+      - all_acts.indices(): shape [3, nnz], representing (seq_idx, token_idx, atom_idx).
+      - all_acts.values(): shape [nnz], the corresponding activation magnitude.
+
+    This function takes inspiration from `diff.py` but adapts to the Zarr-based dataset,
+    converting each batch's dense SAE-encoded output to a 3D index layout.
+    """
+    device = sae.device
+    num_sequences, seq_len, d_model = zf_layer.shape
+
+    # We'll accumulate all partial sparse results, then torch.cat them at the end.
+    all_sparse_pieces = []
+    row_arange = torch.arange(seq_len, device=device)
+
+    for start_idx in tqdm(
+        range(0, num_sequences, batch_size), desc="Encoding to sparse"
+    ):
+        end_idx = min(start_idx + batch_size, num_sequences)
+        # (this_batch, seq_len, d_model)
+        chunk_np = zf_layer[start_idx:end_idx]
+        chunk_acts = torch.from_numpy(chunk_np).to(device)
+
+        # Flatten to [this_batch * seq_len, d_model]
+        bsize = chunk_acts.size(0)
+        chunk_acts = chunk_acts.view(-1, d_model)  # shape: [bsize * seq_len, d_model]
+
+        # Encode with SAE -> shape: [bsize * seq_len, n_atoms]
+        encoded = sae.encode(chunk_acts)  # dense
+
+        # Convert to sparse: indices -> shape [2, nnz], values -> [nnz]
+        sparse_encoded = encoded.to_sparse().coalesce()
+
+        # We must expand the row dimension (which is in [0..bsize*seq_len-1]) into (seq_idx, token_idx).
+        # row_idx = row_in_flat
+        row_idx = sparse_encoded.indices()[0]  # [nnz]
+        col_idx = sparse_encoded.indices()[1]  # [nnz], i.e. which atom
+
+        # Convert row_idx into (seq_idx, token_idx)
+        # seq_idx = start_idx + row_idx // seq_len
+        # tok_idx = row_idx % seq_len
+        seq_idx = (row_idx // seq_len) + start_idx
+        tok_idx = row_idx % seq_len
+
+        # Build new 3-row indices: [3, nnz]
+        new_indices = torch.stack([seq_idx, tok_idx, col_idx], dim=0)
+
+        # Create a new sparse tensor with these 3-row indices
+        # shape logically is [num_sequences, seq_len, n_atoms], but we'll keep it 2D in .to_sparse()
+        piece_3d = torch.sparse_coo_tensor(
+            new_indices,
+            sparse_encoded.values(),
+            size=(num_sequences, seq_len, encoded.size(-1)),  # n_atoms
+            dtype=encoded.dtype,
+            device=encoded.device,
+        ).coalesce()
+
+        all_sparse_pieces.append(piece_3d)
+
+    # Now concatenate the pieces along the nnz dimension. We can do that by
+    # collecting their .indices() and .values(), then building one big coo_tensor.
+    # Then we'll coalesce to combine duplicates if any.
+    all_indices = []
+    all_values = []
+    for sp in all_sparse_pieces:
+        all_indices.append(sp.indices())
+        all_values.append(sp.values())
+
+    cat_indices = torch.cat(all_indices, dim=1)
+    cat_values = torch.cat(all_values, dim=0)
+
+    # Build final coalesced result
+    all_acts = torch.sparse_coo_tensor(
+        cat_indices,
+        cat_values,
+        size=(num_sequences, seq_len, sae.atoms.size(0)),
+        dtype=cat_values.dtype,
+        device=device,
+    ).coalesce()
+
+    return all_acts
+
+
+def highlight_string(
+    tokens, idx, tokenizer, crop=10, highlight_color="#144B39", prefix=""
+):
+    """
+    Utility to create HTML with a highlighted token at index `idx`.
+    We'll decode the region tokens[idx-crop : idx+crop+1], highlight the center token.
+    """
+    start_i = max(0, idx - crop)
+    end_i = min(len(tokens), idx + crop + 1)
+
+    out_html = prefix
+    for i in range(start_i, end_i):
+        token_str = tokenizer.decode([tokens[i]]).replace("\n", "\\n")
+        if i == idx:
+            out_html += f'<span style="background-color: {highlight_color}; font-weight: bold;">{token_str}</span>'
+        else:
+            out_html += token_str
+    return HTML(out_html)
+
+
+if __name__ == "__main__":
+    acts_path = os.path.join(run_dir, "all_acts.pt")
+    if os.path.exists(acts_path):
+        all_acts = torch.load(acts_path)
+    else:
+        all_acts = get_all_activations_sparse(ito_sae, zf_layer, batch_size=64)
+        torch.save(all_acts, acts_path)
+
+# %%
+
+
+def print_top_activating_samples(
+    all_acts,
+    atom_idx,
+    ds,
+    tokenizer,
+    n=10,
+    threshold=0.0,
+    highlight_color="#144B39",
+):
+    """
+    From a sparse activation tensor `all_acts` with indices [3, nnz]:
+      row 0 -> seq_idx
+      row 1 -> token_idx
+      row 2 -> atom_idx
+    and values -> activation magnitudes,
+    display the top `n` (seq_idx, token_idx) with highest activation for `atom_idx`
+    (above `threshold`).
+    """
+    # Identify entries for the given atom_idx
+    idx_matrix = all_acts.indices()  # shape [3, nnz]
+    val_matrix = all_acts.values()  # shape [nnz]
+
+    # Mask for this atom
+    is_this_atom = idx_matrix[2] == atom_idx
+    is_above_thresh = val_matrix > threshold
+    mask = is_this_atom & is_above_thresh
+
+    if not mask.any():
+        print(f"No activations for atom {atom_idx} above threshold {threshold}")
+        return
+
+    # Filter
+    these_indices = idx_matrix[:, mask]  # shape [3, M]
+    these_values = val_matrix[mask]  # shape [M]
+
+    # Sort by descending activation
+    sorted_order = torch.argsort(these_values, descending=True)[:n]
+    top_indices = these_indices[:, sorted_order]
+    top_values = these_values[sorted_order]
+
+    for act_val, (seq_i, tok_i, _) in zip(top_values, top_indices.T):
+        seq_i = seq_i.item()
+        tok_i = tok_i.item()
+        snippet = highlight_string(
+            ds[seq_i]["input_ids"],
+            tok_i,
+            tokenizer,
+            crop=10,
+            highlight_color=highlight_color,
+            prefix=f"<b>{act_val:.3f}</b>: ",
+        )
+        display(snippet)
+
+
+if __name__ == "__main__":
+    atom_idx = 6650
+    origin_snippet = gather_atom_origin_snippet(
+        atom_idx, atom_indices, ds, tokenizer, context=10
+    )
+    display(HTML(origin_snippet))
+    print_top_activating_samples(all_acts, atom_idx, ds, tokenizer, n=10, threshold=0.0)
