@@ -20,6 +20,9 @@ STOP_FORWARD_PASS_LAYER=${7}      # optional
 OFFLOAD_FOLDER=${8}               # optional
 LAYERS=${9}                       # optional
 
+module load cuda/11.3
+source /wclv88/wclv88/venv/bin/activate
+
 # Print the parameters for logging
 echo "Running activation collection with the following parameters:"
 echo "  BATCH_SIZE:             $BATCH_SIZE"
