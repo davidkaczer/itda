@@ -5,7 +5,7 @@
 #SBATCH -p res-gpu-small
 #SBATCH --qos short
 #SBATCH -t 02-00:00
-#SBATCH --gres=gpu:ampere:1
+#SBATCH --gres=gpu:pascal:1
 #SBATCH -o logs/activations-%A_%a.out
 #SBATCH --mem 28G
 
@@ -21,7 +21,7 @@ OFFLOAD_FOLDER=${8}               # optional
 LAYERS=${9}                       # optional
 
 module load cuda/11.3
-source /wclv88/wclv88/venv/bin/activate
+source /home3/wclv88/venv/bin/activate
 
 # Print the parameters for logging
 echo "Running activation collection with the following parameters:"
