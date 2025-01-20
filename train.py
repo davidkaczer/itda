@@ -145,6 +145,7 @@ def construct_atoms(
     target_loss_threshold: float = 3.0,
     train_size: int = -1,
     device="cpu",
+    has_bos=False,
 ):
     if atom_indices is None:
         # Get activations from the first position to seed the dictionary
@@ -153,7 +154,10 @@ def construct_atoms(
             range(0, activations.shape[0], batch_size), desc="Initializing Atoms"
         ):
             end_idx = min(start_idx + batch_size, activations.shape[0])
-            chunk = torch.from_numpy(activations[start_idx:end_idx, :1])
+            if has_bos:
+                chunk = torch.from_numpy(activations[start_idx:end_idx, :2])
+            else:
+                chunk = torch.from_numpy(activations[start_idx:end_idx, :1])
             chunk = chunk.flatten(end_dim=1)
             all_rows.append(chunk)
 
@@ -174,6 +178,8 @@ def construct_atoms(
         print("loading atoms")
         atoms = gather_token_activations(activations, atom_indices, device=device)
 
+    print(f"Initialised with {atoms.size(0)} atoms.")
+    
     if train_size < 0:
         train_size = activations.shape[0]
 
@@ -407,6 +413,7 @@ if __name__ == "__main__":
         target_loss_threshold=args.target_loss,
         train_size=train_size,
         device=device,
+        has_bos=True if "llama" in args.model else False,
     )
 
     run_dir = os.path.join(RUNS_DIR, run_id)
