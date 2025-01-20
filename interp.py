@@ -12,8 +12,7 @@ from tqdm import tqdm
 # %%
 # === USER CONFIGURATION ===
 
-RUN_ID = "dtm39x3g"
-
+RUN_ID = "jppyqjur"
 
 # Highlight colors (dark background, so text is presumably white)
 TOKEN_OF_INTEREST_COLOR = "#3B1E6B"  # Indigo-ish
@@ -212,7 +211,7 @@ if __name__ == "__main__":
 
     atoms_path = os.path.join(run_dir, "atoms.pt")
     atoms = torch.load(atoms_path, weights_only=True)
-    atom_indices_path = os.path.join(run_dir, "atom_indices_.pt")
+    atom_indices_path = os.path.join(run_dir, "atom_indices.pt")
     try:
         atom_indices = torch.load(atom_indices_path, weights_only=True)
     except FileNotFoundError:

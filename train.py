@@ -138,7 +138,7 @@ def top_k_most_repeated_rows(tensor, k):
 
 
 def construct_atoms(
-    activations: zarr.Array,
+    activations,
     atom_indices=None,
     batch_size=OMP_BATCH_SIZE,
     l0=OMP_L0,
@@ -147,115 +147,196 @@ def construct_atoms(
     device="cpu",
     has_bos=False,
 ):
+    """
+    Constructs a dictionary of `atoms` from the given `activations` (zarr array).
+    Each row of `atoms` is a vector in R^d_model.
+    The matching `atom_indices` has shape [num_atoms, 2],
+      specifying (sequence_idx, token_idx) for each atom.
+
+    Steps:
+      1) If `atom_indices` is not provided, initialize by taking the
+         most frequent rows from the first position(s).
+      2) Loop through the dataset in batches, reconstruct with current dictionary,
+         and if reconstruction error > threshold, add that activation as a new atom.
+      3) Deduplicate at the end, ensuring that `atoms` and `atom_indices` remain
+         aligned row-by-row.
+    """
+    # -------------------------
+    # (1) Initialization
+    # -------------------------
     if atom_indices is None:
-        # Get activations from the first position to seed the dictionary
+        # We want to gather either the first one or two tokens from each sequence
+        # so we can seed our initial atoms with them. We'll keep track of the
+        # actual (sequence_idx, token_idx) so we can map them properly.
+
         all_rows = []
+        all_token_indices = []
+
+        # We'll iterate in batches to avoid loading everything at once
+        num_sequences = activations.shape[0]
+        seq_len = activations.shape[1]
+        d_model = activations.shape[-1]
+
         for start_idx in tqdm(
-            range(0, activations.shape[0], batch_size), desc="Initializing Atoms"
+            range(0, num_sequences, batch_size), desc="Initializing Atoms"
         ):
-            end_idx = min(start_idx + batch_size, activations.shape[0])
+            end_idx = min(start_idx + batch_size, num_sequences)
+
+            # Slice out the first position(s)
             if has_bos:
-                chunk = torch.from_numpy(activations[start_idx:end_idx, :2])
+                # e.g. first 2 tokens
+                chunk_np = activations[start_idx:end_idx, :2]  # shape: [B, 2, d_model]
             else:
-                chunk = torch.from_numpy(activations[start_idx:end_idx, :1])
-            chunk = chunk.flatten(end_dim=1)
+                # only first token
+                chunk_np = activations[start_idx:end_idx, :1]  # shape: [B, 1, d_model]
+
+            # Convert to torch and flatten so shape = [B*seq_len_slice, d_model]
+            chunk = torch.from_numpy(chunk_np).to(device).flatten(end_dim=1)
+
+            # Build the matching (sequence_idx, token_idx)
+            B = end_idx - start_idx
+            seq_len_slice = chunk_np.shape[1]
+            # meshgrid -> shape [B, seq_len_slice, 2], then flatten -> [B*seq_len_slice, 2]
+            idx_grid = torch.stack(
+                torch.meshgrid(
+                    torch.arange(start_idx, end_idx, device=device),
+                    torch.arange(seq_len_slice, device=device),
+                    indexing="ij",
+                ),
+                dim=-1,
+            ).reshape(-1, 2)
+
             all_rows.append(chunk)
+            all_token_indices.append(idx_grid)
 
-        first_pos_acts = torch.cat(all_rows, dim=0).to(device)
-        del all_rows
+        # Combine into one big tensor of "first few tokens"
+        first_pos_acts = torch.cat(all_rows, dim=0)  # shape [N, d_model]
+        first_pos_indices = torch.cat(all_token_indices, dim=0)  # shape [N, 2]
 
-        atom_indices, atoms = top_k_most_repeated_rows(
-            first_pos_acts, activations.shape[-1]
-        )
-        atom_indices = torch.cat(
-            [
-                atom_indices.unsqueeze(-1),
-                torch.zeros((atom_indices.size(0), 1), dtype=torch.long, device=device),
-            ],
-            dim=1,
-        )
+        # Find most-frequent rows among these first-pos activations
+        topk_indices, topk_atoms = top_k_most_repeated_rows(first_pos_acts, d_model)
+
+        # Now we map from those "topk_indices" (in the combined 0..N-1 space)
+        # to the real (sequence_idx, token_idx)
+        initial_atom_indices = first_pos_indices[topk_indices]
+
+        # That seeds our dictionary
+        atoms = topk_atoms
+        atom_indices = initial_atom_indices
+
+        # Clean up big intermediate
+        del all_rows, all_token_indices, first_pos_acts, first_pos_indices
+
     else:
-        print("loading atoms")
+        print("Loading existing atoms from given atom_indices...")
         atoms = gather_token_activations(activations, atom_indices, device=device)
 
-    print(f"Initialised with {atoms.size(0)} atoms.")
-    
+    print(f"Initialized with {atoms.size(0)} atoms.")
+
+    # Decide how much of the data we use to do the next stage
     if train_size < 0:
         train_size = activations.shape[0]
 
+    # -------------------------
+    # (2) Iterative dictionary construction
+    # -------------------------
     losses = []
     pbar = tqdm(total=train_size, desc="Constructing Atoms (Loss-Threshold)")
 
     batch_counter = 0
+    num_sequences = activations.shape[0]
+    seq_len = activations.shape[1]
+    d_model = activations.shape[-1]
+
     for start_idx in range(0, train_size, batch_size):
         end_idx = min(start_idx + batch_size, train_size)
-        batch_np = activations[start_idx:end_idx]  # shape [B, seq_len, d_model]
-        B, seq_len, d_model = batch_np.shape
 
-        # Flatten: [B*seq_len, d_model]
+        # [B, seq_len, d_model]
+        batch_np = activations[start_idx:end_idx]
+        B = batch_np.shape[0]
+
+        # Flatten: [B * seq_len, d_model]
         batch_activations = torch.from_numpy(batch_np).to(device)
         batch_activations = batch_activations.flatten(end_dim=1)
 
-        # Create token indices for each activation to track their position
-        token_indices = (
-            torch.stack(
-                torch.meshgrid(
-                    torch.arange(start_idx, start_idx + B),
-                    torch.arange(seq_len),
-                    indexing="ij",
-                ),
-                dim=-1,
-            )
-            .reshape(-1, 2)
-            .to(device)
-        )
+        # Build the (seq_idx, token_idx) for each of these flattened rows
+        token_indices = torch.stack(
+            torch.meshgrid(
+                torch.arange(start_idx, end_idx, device=device),
+                torch.arange(seq_len, device=device),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
 
-        # Reconstruct with current dictionary
+        # OMP reconstruction with current dictionary
         sae = ITO_SAE(atoms, l0)
         recon = sae(batch_activations)
         batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
 
-        # Filter out any extreme numeric explosions (avoid adding nonsense)
+        # Filter out extreme numeric explosions
         valid_mask = batch_loss < 1e8
         valid_losses = batch_loss[valid_mask]
         valid_activations = batch_activations[valid_mask]
-        token_indices = token_indices[valid_mask]
+        valid_indices = token_indices[valid_mask]
         losses.extend(valid_losses.cpu().tolist())
 
-        # Identify which activations exceed the loss threshold
+        # Identify new atoms: those with reconstruction loss > threshold
         new_atoms_mask = valid_losses > target_loss_threshold
         new_atoms = valid_activations[new_atoms_mask]
-        new_indices = token_indices[new_atoms_mask]
+        new_atom_indices = valid_indices[new_atoms_mask]
 
-        # If any new atoms meet the threshold, add them
+        # If any new atoms meet the threshold, add them to dictionary
         if new_atoms.size(0) > 0:
             atoms = torch.cat([atoms, new_atoms], dim=0)
-            atom_indices = torch.cat([atom_indices, new_indices], dim=0)
+            atom_indices = torch.cat([atom_indices, new_atom_indices], dim=0)
 
         batch_counter += 1
         pbar.update(end_idx - start_idx)
         pbar.set_postfix(
             {
                 "dict_size": atoms.size(0),
-                "mean_loss": float(valid_losses.mean().cpu().item()),
+                "mean_loss": float(valid_losses.mean().item()),
             }
         )
 
-        # Optional logging to W&B if desired
+        # Optional logging
         wandb.log(
             {
                 "batch_step": batch_counter,
-                "mean_loss": float(valid_losses.mean().cpu().item()),
+                "mean_loss": float(valid_losses.mean().item()),
                 "batch_new_atoms": new_atoms.size(0),
                 "dict_size": atoms.size(0),
             }
         )
     pbar.close()
 
-    # remove duplicate atoms: due to the batching, we may have added the same
-    # atom multiple times
-    atoms, unique_indices = torch.unique(atoms, return_inverse=True, dim=0)
-    atom_indices = atom_indices[unique_indices]
+    # -------------------------
+    # (3) Remove duplicate atoms, preserving alignment
+    # -------------------------
+    # Easiest stable method: switch to numpy, find unique rows (earliest occurrence)
+    def stable_unique(tensor, indices):
+        """
+        Returns (unique_tensor, unique_indices), preserving
+        the earliest occurrence for duplicates.
+        """
+        tensor_np = tensor.cpu().numpy()
+        indices_np = indices.cpu().numpy()
+        # Find unique rows, returning the earliest row index for each unique row
+        _, unique_row_idx = np.unique(tensor_np, axis=0, return_index=True)
+        unique_row_idx = np.sort(unique_row_idx)  # keep them in ascending order
+
+        unique_tensor_np = tensor_np[unique_row_idx]
+        unique_indices_np = indices_np[unique_row_idx]
+
+        # Convert back to torch (on the same device)
+        unique_tensor = torch.from_numpy(unique_tensor_np).to(tensor.device)
+        unique_indices = torch.from_numpy(unique_indices_np).to(indices.device)
+        return unique_tensor, unique_indices
+
+    atoms, atom_indices = stable_unique(atoms, atom_indices)
+
+    print(f"Final dictionary size after dedup: {atoms.size(0)} atoms.")
 
     return atoms, atom_indices, losses
 
