@@ -99,7 +99,7 @@ def get_activations_hf(
         )
     else:
         # Default loading
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
     # If stop_forward_pass_layer is specified, check model type and slice layers
     if stop_forward_pass_layer is not None:
