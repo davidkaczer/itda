@@ -20,7 +20,7 @@ import wandb
 RANDOM_SEED = 42
 
 MODEL_CONFIGS = {
-    "pythia-70m-deduped": {
+    "EleutherAI/pythia-70m-deduped": {
         "batch_size": 512,
         "dtype": "float32",
         "layers": [3, 4],
@@ -214,12 +214,6 @@ def flatten_dict(d, parent_key="", sep="/"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="gpt2",
-        help="Model to evaluate",
-    )
     parser.add_argument("--run_id", type=str, help="Run ID for ITO_SAE")
     parser.add_argument(
         "--eval_types", nargs="+", default=["core"], help="List of eval types"
@@ -231,12 +225,7 @@ if __name__ == "__main__":
 
     device = general_utils.setup_environment()
 
-    model_name = args.model
-    if model_name not in MODEL_CONFIGS:
-        raise ValueError(f"Unsupported model choose from {list(MODEL_CONFIGS.keys())}")
-
     eval_types = args.eval_types
-
     # If autointerp is requested, load API key if present
     if "autointerp" in eval_types:
         raise NotImplementedError("Autointerp evaluation is not yet supported")
@@ -249,11 +238,6 @@ if __name__ == "__main__":
         api_key = None
 
     # Load model configs
-    model_config = MODEL_CONFIGS[model_name]
-    d_model = model_config["d_model"]
-    llm_batch_size = model_config["batch_size"]
-    llm_dtype = model_config["dtype"]
-    hook_layer = model_config["layers"][0]
 
     selected_saes = []
 
@@ -265,8 +249,13 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"No metadata.yaml found in {run_dir}")
 
     with open(meta_path, "r") as f:
-        metadata = yaml.safe_load(f)
+        sae_metadata = yaml.safe_load(f)
 
+    model_config = MODEL_CONFIGS[sae_metadata["model"]]
+    d_model = model_config["d_model"]
+    llm_batch_size = model_config["batch_size"]
+    llm_dtype = model_config["dtype"]
+    hook_layer = model_config["layers"][0]
     atoms_path = os.path.join(run_dir, "atoms.pt")
     if not os.path.exists(atoms_path):
         raise FileNotFoundError("No atoms.pt found for the specified ITO run")
@@ -274,13 +263,13 @@ if __name__ == "__main__":
     atoms = torch.load(atoms_path).to(device)
     ito_sae = ITO_SAE(
         atoms,
-        l0=metadata["l0"],
+        l0=sae_metadata["l0"],
         cfg=ITO_SAEConfig(
-            model_name=model_name,
+            model_name=sae_metadata["model"],
             dtype=llm_dtype,
             d_in=d_model,
             d_sae=atoms.size(0),
-            hook_layer=metadata["layer"],
+            hook_layer=sae_metadata["layer"],
             hook_name=f"blocks.{hook_layer}.hook_resid_post",  # Assuming same hook name as GPT-2 SAEs
             prepend_bos=True,
             normalize_activations="none",
@@ -297,8 +286,9 @@ if __name__ == "__main__":
             "No SAEs selected. Provide either an ITO run ID or use --pretrained_saes."
         )
 
+
     run_evals(
-        model_name,
+        sae_metadata["model"],
         selected_saes,
         llm_batch_size,
         llm_dtype,
