@@ -10,3 +10,4 @@ wandb/
 prompt_context.txt
 .env
 
+dictionary_learning/

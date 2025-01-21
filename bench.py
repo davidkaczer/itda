@@ -1,4 +1,5 @@
 import argparse
+import pickle
 import json
 import os
 from typing import Any, Optional
@@ -10,6 +11,7 @@ import sae_bench.evals.scr_and_tpp.main as scr_and_tpp
 import sae_bench.evals.sparse_probing.main as sparse_probing
 import sae_bench.evals.unlearning.main as unlearning
 import sae_bench.sae_bench_utils.general_utils as general_utils
+from dictionary_learning.dictionary import AutoEncoder
 import torch
 import yaml
 from ito_sae import ITO_SAE, ITO_SAEConfig
@@ -256,19 +258,41 @@ if __name__ == "__main__":
     llm_batch_size = model_config["batch_size"]
     llm_dtype = model_config["dtype"]
     hook_layer = model_config["layers"][0]
-    atoms_path = os.path.join(run_dir, "atoms.pt")
-    if not os.path.exists(atoms_path):
-        raise FileNotFoundError("No atoms.pt found for the specified ITO run")
 
-    atoms = torch.load(atoms_path).to(device)
-    ito_sae = ITO_SAE(
-        atoms,
-        l0=sae_metadata["l0"],
-        cfg=ITO_SAEConfig(
+    if ("method" not in sae_metadata) or (sae_metadata["method"] != "dictlearn"):
+        atoms_path = os.path.join(run_dir, "atoms.pt")
+        if not os.path.exists(atoms_path):
+            raise FileNotFoundError("No atoms.pt found for the specified ITO run")
+
+        atoms = torch.load(atoms_path).to(device)
+        ito_sae = ITO_SAE(
+            atoms,
+            l0=sae_metadata["l0"],
+            cfg=ITO_SAEConfig(
+                model_name=sae_metadata["model"],
+                dtype=llm_dtype,
+                d_in=d_model,
+                d_sae=atoms.size(0),
+                hook_layer=sae_metadata["layer"],
+                hook_name=f"blocks.{hook_layer}.hook_resid_post",  # Assuming same hook name as GPT-2 SAEs
+                prepend_bos=True,
+                normalize_activations="none",
+                dataset_trust_remote_code=True,
+                seqpos_slice=(None,),
+                device=device,
+            ),
+        )
+        ito_sae.normalize_decoder()
+        selected_saes.append((args.run_id, ito_sae))
+    else:
+        # load pickle of ae from run_dir, "ae.pt"
+        with open(os.path.join(run_dir, "ae.pt"), "rb") as f:
+            ae = pickle.load(f)
+        ae.cfg = ITO_SAEConfig(
             model_name=sae_metadata["model"],
             dtype=llm_dtype,
             d_in=d_model,
-            d_sae=atoms.size(0),
+            d_sae=ae.W_dec.size(0),
             hook_layer=sae_metadata["layer"],
             hook_name=f"blocks.{hook_layer}.hook_resid_post",  # Assuming same hook name as GPT-2 SAEs
             prepend_bos=True,
@@ -276,16 +300,13 @@ if __name__ == "__main__":
             dataset_trust_remote_code=True,
             seqpos_slice=(None,),
             device=device,
-        ),
-    )
-    ito_sae.normalize_decoder()
-    selected_saes.append((args.run_id, ito_sae))
+        )
+        selected_saes.append((args.run_id, ae))
 
     if not selected_saes:
         raise ValueError(
             "No SAEs selected. Provide either an ITO run ID or use --pretrained_saes."
         )
-
 
     run_evals(
         sae_metadata["model"],
