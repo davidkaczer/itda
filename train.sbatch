@@ -5,7 +5,7 @@
 #SBATCH -p res-gpu-small
 #SBATCH --qos short
 #SBATCH -t 02-00:00
-#SBATCH --gres=gpu:ampere:1
+#SBATCH --gres=gpu:pascal:1
 #SBATCH -o logs/qwen_sae-%A_%a.out
 #SBATCH --mem 28G
 
