@@ -348,7 +348,7 @@ def train_ito_saes(args, device):
 
     # Evaluate on last 30%
     # Pass sklearn arg during final initialization
-    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0, speedy=False, sklearn=args.sklearn)
+    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0, sklearn=args.sklearn)
     test_size = int(total_sequences * 0.3)
     eval_losses = evaluate_ito(
         ito_sae,
