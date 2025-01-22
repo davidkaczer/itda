@@ -34,7 +34,7 @@ class TrainingConfig:
     # We no longer rely on multiple runs in this file. 
     # Instead, a single seed is passed in via command line.
 
-    max_train_steps: int = 200_000
+    max_train_steps: int = 500_000
     logging_steps: int = 50
     save_steps: int = 500
     warmup_steps: int = 200
