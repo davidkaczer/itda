@@ -105,7 +105,6 @@ def construct_atoms(
     train_size: int = -1,
     device="cpu",
     has_bos=False,
-    sklearn=False,
 ):
     """
     The dictionary-building procedure used for ITO SAEs.
@@ -208,7 +207,9 @@ def construct_atoms(
             dim=-1,
         ).reshape(-1, 2)
 
-        sae = ITO_SAE(atoms, l0, sklearn=sklearn)
+        atoms = atoms / atoms.norm(dim=1, keepdim=True)
+
+        sae = ITO_SAE(atoms, l0)
         recon = sae(batch_activations)
         batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
         valid_mask = batch_loss < 1e8
@@ -315,7 +316,6 @@ def train_ito_saes(args, device):
         train_size=train_size,
         device=device,
         has_bos=("llama" in args.model.lower()),
-        sklearn=args.sklearn,  # Pass sklearn arg
     )
 
     # Save results
@@ -347,8 +347,8 @@ def train_ito_saes(args, device):
         pickle.dump(losses, f)
 
     # Evaluate on last 30%
-    # Pass sklearn arg during final initialization
-    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0, sklearn=args.sklearn)
+    atoms = atoms / atoms.norm(dim=1, keepdim=True)
+    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
     test_size = int(total_sequences * 0.3)
     eval_losses = evaluate_ito(
         ito_sae,
@@ -613,12 +613,6 @@ if __name__ == "__main__":
         type=float,
         default=1e-3,
         help="Learning rate for dictionary_learning approach.",
-    )
-
-    parser.add_argument(
-        "--sklearn",
-        action="store_true",
-        help="If set, use the scikit-learn solver in ITO_SAE.",
     )
 
     args = parser.parse_args()

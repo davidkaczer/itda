@@ -6,20 +6,33 @@ import torch
 from optim import omp_incremental_cholesky_with_fallback, omp_sklearn
 
 
+def omp(D, x, n_nonzero_coefs):
+    batch_size, signal_dim = x.size()
+    num_dict_atoms = D.size(0)
+
+    residuals = x.clone()
+    coefficients = torch.zeros(batch_size, num_dict_atoms, device=x.device)
+
+    for _ in range(n_nonzero_coefs):
+        correlations = torch.matmul(residuals, D.T)
+        best_atoms = torch.argmax(torch.abs(correlations), dim=1)
+        coefficients_for_atoms = correlations[torch.arange(batch_size), best_atoms]
+        coefficients[torch.arange(batch_size), best_atoms] += coefficients_for_atoms
+        residuals -= coefficients_for_atoms.unsqueeze(1) * D[best_atoms]
+
+    return coefficients
+
+
 class ITO_SAE:
-    def __init__(self, atoms, l0=8, cfg=None, sklearn=True):
+    def __init__(self, atoms, l0=8, cfg=None):
         self.atoms = atoms
         self.l0 = l0
         self.cfg = cfg
-        self.sklearn = sklearn
 
     def encode(self, x):
         shape = x.size()
         x = x.view(-1, shape[-1])
-        if not self.sklearn:
-            activations = omp_incremental_cholesky_with_fallback(self.atoms, x, self.l0)
-        else:
-            activations = omp_sklearn(self.atoms, x, self.l0)
+        activations = omp(self.atoms, x, self.l0)
         return activations.view(*shape[:-1], -1)
 
     def decode(self, activations):
