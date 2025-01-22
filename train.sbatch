@@ -36,4 +36,4 @@ python3 train.py \
     --layer "$LAYER" \
     --target_loss "$TARGET_LOSS" \
     --l0 "$L0" \
-    --sklearn "$SKLEARN"
+    $(if [ "$SKLEARN" = true ]; then echo "--sklearn"; fi)
