@@ -3,19 +3,23 @@ from typing import Dict, Optional
 
 import torch
 
-from optim import omp_incremental_cholesky_with_fallback
+from optim import omp_incremental_cholesky_with_fallback, omp_sklearn
 
 
 class ITO_SAE:
-    def __init__(self, atoms, l0=8, cfg=None):
+    def __init__(self, atoms, l0=8, cfg=None, sklearn=True):
         self.atoms = atoms
         self.l0 = l0
         self.cfg = cfg
+        self.sklearn = sklearn
 
     def encode(self, x):
         shape = x.size()
         x = x.view(-1, shape[-1])
-        activations = omp_incremental_cholesky_with_fallback(self.atoms, x, self.l0)
+        if not self.sklearn:
+            activations = omp_incremental_cholesky_with_fallback(self.atoms, x, self.l0)
+        else:
+            activations = omp_sklearn(self.atoms, x, self.l0)
         return activations.view(*shape[:-1], -1)
 
     def decode(self, activations):

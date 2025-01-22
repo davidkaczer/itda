@@ -33,6 +33,7 @@ RUNS_DIR = os.path.join(ARTIFACTS_DIR, "runs")
 # I. Utility functions
 # -----------------------------------------
 
+
 def get_gpu_tensors():
     """
     Utility to print out GPU memory usage for debugging if needed.
@@ -91,8 +92,9 @@ def gather_token_activations(zf, token_indices: torch.Tensor, device="cpu"):
 
 
 # -----------------------------------------
-# II. ITO-SAE training code (unchanged)
+# II. ITO-SAE training code
 # -----------------------------------------
+
 
 def construct_atoms(
     activations,
@@ -103,10 +105,10 @@ def construct_atoms(
     train_size: int = -1,
     device="cpu",
     has_bos=False,
+    sklearn=False,
 ):
     """
-    The dictionary-building procedure used for ITO SAEs. 
-    (Same as your original code.)
+    The dictionary-building procedure used for ITO SAEs.
     """
     import numpy as np
     import torch
@@ -125,7 +127,9 @@ def construct_atoms(
             index = tensor_tuples.index(row_tuple)
             indices.append(index)
             rows.append(tensor[index])
-        return torch.tensor(indices, dtype=torch.long, device=tensor.device), torch.stack(rows)
+        return torch.tensor(
+            indices, dtype=torch.long, device=tensor.device
+        ), torch.stack(rows)
 
     def stable_unique(tensor, indices):
         tensor_np = tensor.cpu().numpy()
@@ -204,7 +208,7 @@ def construct_atoms(
             dim=-1,
         ).reshape(-1, 2)
 
-        sae = ITO_SAE(atoms, l0)
+        sae = ITO_SAE(atoms, l0, sklearn=sklearn)
         recon = sae(batch_activations)
         batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
         valid_mask = batch_loss < 1e8
@@ -286,6 +290,10 @@ def train_ito_saes(args, device):
         raise ValueError(f"Layer dataset '{layer_name}' not found in {act_path}.")
     layer_acts = zf[layer_name]
 
+    # If we have a --max_sequences argument, limit how many sequences we load:
+    if args.max_sequences is not None:
+        layer_acts = layer_acts[: args.max_sequences]
+
     total_sequences = layer_acts.shape[0]
     train_size = int(total_sequences * 0.7)
     print(f"Total sequences = {total_sequences}, train_size = {train_size}")
@@ -307,6 +315,7 @@ def train_ito_saes(args, device):
         train_size=train_size,
         device=device,
         has_bos=("llama" in args.model.lower()),
+        sklearn=args.sklearn,  # Pass sklearn arg
     )
 
     # Save results
@@ -338,9 +347,16 @@ def train_ito_saes(args, device):
         pickle.dump(losses, f)
 
     # Evaluate on last 30%
-    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+    # Pass sklearn arg during final initialization
+    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0, speedy=False, sklearn=args.sklearn)
     test_size = int(total_sequences * 0.3)
-    eval_losses = evaluate_ito(ito_sae, layer_acts, batch_size=args.batch_size, val_size=test_size, device=device)
+    eval_losses = evaluate_ito(
+        ito_sae,
+        layer_acts,
+        batch_size=args.batch_size,
+        val_size=test_size,
+        device=device,
+    )
     mean_ito_loss = eval_losses.mean().item()
     print(f"Mean ITO loss: {mean_ito_loss:.4f} over {len(eval_losses)} activations")
     wandb.log({"eval_loss": mean_ito_loss})
@@ -363,6 +379,7 @@ def train_ito_saes(args, device):
 # III. Dictionary-learning-based training
 # -----------------------------------------
 
+
 class ZarrActivationDataset(torch.utils.data.Dataset):
     """
     Loads the full Zarr activations into memory once, then
@@ -372,6 +389,7 @@ class ZarrActivationDataset(torch.utils.data.Dataset):
     We assume that the Zarr array has shape (N, seq_len, d_model).
     We'll flatten it to (N * seq_len, d_model).
     """
+
     def __init__(self, zarr_array):
         super().__init__()
         # Read entire array into memory (a NumPy array)
@@ -381,7 +399,9 @@ class ZarrActivationDataset(torch.utils.data.Dataset):
         self.all_activations = torch.from_numpy(full_np).float()
 
         # Flatten from (N, seq_len, d_model) to (N * seq_len, d_model)
-        self.all_activations = self.all_activations.view(-1, self.all_activations.size(-1))
+        self.all_activations = self.all_activations.view(
+            -1, self.all_activations.size(-1)
+        )
 
         # Keep track of shape
         self.num_sequences_times_seq_len = self.all_activations.size(0)
@@ -403,14 +423,17 @@ def collate_fn(batch):
     """
     return torch.stack(batch, dim=0)
 
+
 def train_dictlearn_saes(args, device):
     """
     Train a dictionary-learning–based SAE (e.g. StandardTrainer + AutoEncoder).
     This reuses your existing Zarr activation store as the dataset.
     """
     if (AutoEncoderTopK is None) or (trainSAE is None) or (TopKTrainer is None):
-        raise ImportError("dictionary_learning not found or not importable. "
-                          "Please install and retry.")
+        raise ImportError(
+            "dictionary_learning not found or not importable. "
+            "Please install and retry."
+        )
 
     # Create run dir
     run_id = wandb.run.id
@@ -426,6 +449,11 @@ def train_dictlearn_saes(args, device):
         raise ValueError(f"Layer dataset '{layer_name}' not found in {act_path}.")
 
     layer_acts = zf[layer_name]  # shape (N, seq_len, d_model)
+
+    # If we have a --max_sequences argument, limit how many sequences we load:
+    if args.max_sequences is not None:
+        layer_acts = layer_acts[: args.max_sequences]
+
     num_sequences, seq_len, d_model = layer_acts.shape
     print(f"Dictionary-learning SAE on shape = ({num_sequences}, {seq_len}, {d_model})")
 
@@ -442,13 +470,10 @@ def train_dictlearn_saes(args, device):
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn,
-        drop_last=True
+        drop_last=True,
     )
 
-    # Put trainer config together
-    # For example: StandardTrainer with an AutoEncoder
-    # The dictionary size can be, for instance, args.dict_size
-    # The activation_dim is d_model
+    # Configure the trainer (using TopKTrainer as an example)
     trainer_cfg = {
         "trainer": TopKTrainer,
         "dict_class": AutoEncoderTopK,
@@ -462,17 +487,9 @@ def train_dictlearn_saes(args, device):
         "warmup_steps": 0,
         "k": args.l0,
     }
-    wandb.log(
-        {
-            "dict_size": args.dict_size,
-        }
-    )
+    wandb.log({"dict_size": args.dict_size})
 
-    # Now we call trainSAE. 
-    # The dictionary_learning library expects an iterator that yields Tensors.
-    # Our train_loader is a standard PyTorch DataLoader, which is fine.
-    # We'll pass `data=train_loader` directly.
-    # Optionally, pass in a "val_data" for validation if you want. We'll skip for brevity.
+    # Train
     trainers = trainSAE(
         data=train_loader,
         trainer_configs=[trainer_cfg],
@@ -511,13 +528,12 @@ def train_dictlearn_saes(args, device):
     wandb.log_artifact(artifact)
 
     # Optional: Evaluate on the test set
-    # Just do a quick MSE check
     test_loader = torch.utils.data.DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        drop_last=False
+        drop_last=False,
     )
 
     final_ae.to(device)
@@ -544,9 +560,13 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", type=str, default="ito",
-                        choices=["ito", "dictlearn"],
-                        help="Which approach to train: 'ito' or 'dictlearn'")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="ito",
+        choices=["ito", "dictlearn"],
+        help="Which approach to train: 'ito' or 'dictlearn'",
+    )
 
     # Shared arguments
     parser.add_argument("--model", type=str, default="EleutherAI/pythia-70m-deduped")
@@ -554,20 +574,52 @@ if __name__ == "__main__":
     parser.add_argument("--layer", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
+    parser.add_argument(
+        "--max_sequences",
+        type=int,
+        default=None,
+        help="Optionally limit the total number of sequences to load from the dataset.",
+    )
 
     # ITO-specific arguments
-    parser.add_argument("--l0", type=int, default=OMP_L0,
-                        help="Max # of dictionary atoms in each OMP reconstruction.")
-    parser.add_argument("--target_loss", type=float, default=3.0,
-                        help="If reconstruction loss > this threshold, add a new atom.")
-    parser.add_argument("--load_run_id", type=str, default=None,
-                        help="If specified, continue from that run's token indices for ITO.")
+    parser.add_argument(
+        "--l0",
+        type=int,
+        default=OMP_L0,
+        help="Max # of dictionary atoms in each OMP reconstruction.",
+    )
+    parser.add_argument(
+        "--target_loss",
+        type=float,
+        default=3.0,
+        help="If reconstruction loss > this threshold, add a new atom.",
+    )
+    parser.add_argument(
+        "--load_run_id",
+        type=str,
+        default=None,
+        help="If specified, continue from that run's token indices for ITO.",
+    )
 
     # Dictionary-learning-specific arguments
-    parser.add_argument("--dict_size", type=int, default=65536,
-                        help="For dictionary_learning, how many features to learn.")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate for dictionary_learning approach.")
+    parser.add_argument(
+        "--dict_size",
+        type=int,
+        default=65536,
+        help="For dictionary_learning, how many features to learn.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for dictionary_learning approach.",
+    )
+
+    parser.add_argument(
+        "--sklearn",
+        action="store_true",
+        help="If set, use the scikit-learn solver in ITO_SAE.",
+    )
 
     args = parser.parse_args()
 
@@ -575,13 +627,11 @@ if __name__ == "__main__":
     if device == "cpu":
         print("WARNING: CUDA not available. Running on CPU may be slow.")
 
-    # Initialize wandb
     wandb.init(project="example_saes", config=vars(args))
 
     if args.method == "ito":
         train_ito_saes(args, device)
     else:
-        # dictionary-learning approach
         train_dictlearn_saes(args, device)
 
     wandb.finish()

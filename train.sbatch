@@ -15,6 +15,7 @@ BATCH_SIZE=${2:-32}
 LAYER=${3:-3}
 TARGET_LOSS=${4:-0.01}
 L0=${5:-40}
+SKLEARN=${6:-false}
 
 # Print the parameters for logging
 echo "Running training with the following parameters:"
@@ -23,6 +24,7 @@ echo "Batch size: $BATCH_SIZE"
 echo "Layer: $LAYER"
 echo "Target loss: $TARGET_LOSS"
 echo "L0: $L0"
+echo "Sklearn: $SKLEARN"
 
 module load cuda/11.3
 source /wclv88/wclv88/venv/bin/activate
@@ -33,4 +35,5 @@ python3 train.py \
     --batch_size "$BATCH_SIZE" \
     --layer "$LAYER" \
     --target_loss "$TARGET_LOSS" \
-    --l0 "$L0"
+    --l0 "$L0" \
+    --sklearn "$SKLEARN"

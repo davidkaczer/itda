@@ -1,4 +1,5 @@
 import torch
+from sklearn.linear_model import orthogonal_mp
 
 
 def omp_incremental_cholesky(D, x, n_nonzero_coefs, device=None):
@@ -129,6 +130,25 @@ def omp_pytorch(D, x, n_nonzero_coefs):
     activations = torch.zeros((x.size(0), n_atoms), device=x.device)
     activations.scatter_(1, indices, coef)
     return activations
+
+
+def omp_sklearn(D, x, n_nonzero_coefs):
+    """
+    D: (n, d) torch.Tensor
+    x: (b, d) torch.Tensor
+    """
+    D_np = D.cpu().numpy()  # shape (n, d)
+    x_np = x.cpu().numpy()  # shape (b, d)
+
+    # But we must pass X as shape (d, n) to orthogonal_mp, so we do D_np.T
+    # And we pass multiple targets as shape (d, b), so we do x_np.T
+    codes_np = orthogonal_mp(D_np.T, x_np.T, n_nonzero_coefs=n_nonzero_coefs)
+    # codes_np is now shape (n, b)
+
+    codes_np = codes_np.T  # shape (b, n)
+    codes_torch = torch.from_numpy(codes_np).to(D.device, D.dtype)
+
+    return codes_torch
 
 
 def omp_incremental_cholesky_with_fallback(D, x, n_nonzero_coefs, device=None):
