@@ -17,7 +17,7 @@ from transformers import (
     GPTNeoXForCausalLM,
     GPT2TokenizerFast,
     AdamW,
-    get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup,
 )
 from accelerate import Accelerator
 
@@ -25,13 +25,14 @@ from accelerate import Accelerator
 # Configuration
 ##############################################################################
 
+
 @dataclass
 class TrainingConfig:
     project_name: str = "example_saes_llms"
     run_name_prefix: str = "small-pythia"
     model_output_dir: str = "./small_pythia_streaming_ckpts"
 
-    # We no longer rely on multiple runs in this file. 
+    # We no longer rely on multiple runs in this file.
     # Instead, a single seed is passed in via command line.
 
     max_train_steps: int = 500_000
@@ -43,9 +44,11 @@ class TrainingConfig:
     block_size: int = 256
     buffer_size: int = 10000
 
+
 ##############################################################################
 # Utilities
 ##############################################################################
+
 
 class PileChunkedDataset(torch.utils.data.IterableDataset):
     """
@@ -64,7 +67,7 @@ class PileChunkedDataset(torch.utils.data.IterableDataset):
         split: str = "train",
         block_size: int = 256,
         buffer_size: int = 10000,
-        seed: int = 42
+        seed: int = 42,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -72,7 +75,12 @@ class PileChunkedDataset(torch.utils.data.IterableDataset):
         self.seed = seed
 
         # Load streaming dataset
-        self.raw_dataset = load_dataset("SkyLion007/openwebtext", split=split, streaming=True)
+        self.raw_dataset = load_dataset(
+            "SkyLion007/openwebtext",
+            split=split,
+            streaming=True,
+            trust_remote_code=True,
+        )
         # Shuffle in streaming mode (requires a buffer).
         self.raw_dataset = self.raw_dataset.shuffle(buffer_size=buffer_size, seed=seed)
 
@@ -84,9 +92,7 @@ class PileChunkedDataset(torch.utils.data.IterableDataset):
         Tokenize a text string into input_ids (no chunking here).
         """
         return self.tokenizer(
-            text,
-            add_special_tokens=False,
-            return_attention_mask=False
+            text, add_special_tokens=False, return_attention_mask=False
         )["input_ids"]
 
     def chunk_tokens(self) -> Iterator[Dict[str, torch.Tensor]]:
@@ -95,8 +101,8 @@ class PileChunkedDataset(torch.utils.data.IterableDataset):
         tokens left to form another full block.
         """
         while len(self.token_buffer) >= self.block_size:
-            chunk = self.token_buffer[:self.block_size]
-            self.token_buffer = self.token_buffer[self.block_size:]
+            chunk = self.token_buffer[: self.block_size]
+            self.token_buffer = self.token_buffer[self.block_size :]
             yield {
                 "input_ids": torch.tensor(chunk, dtype=torch.long),
                 "attention_mask": torch.ones(self.block_size, dtype=torch.long),
@@ -118,8 +124,8 @@ class PileChunkedDataset(torch.utils.data.IterableDataset):
 
         # If we exhaust the stream, yield final partial chunks if enough tokens remain
         while len(self.token_buffer) >= self.block_size:
-            chunk = self.token_buffer[:self.block_size]
-            self.token_buffer = self.token_buffer[self.block_size:]
+            chunk = self.token_buffer[: self.block_size]
+            self.token_buffer = self.token_buffer[self.block_size :]
             yield {
                 "input_ids": torch.tensor(chunk, dtype=torch.long),
                 "attention_mask": torch.ones(self.block_size, dtype=torch.long),
@@ -128,7 +134,7 @@ class PileChunkedDataset(torch.utils.data.IterableDataset):
 
 def create_small_pythia_config() -> GPTNeoXConfig:
     """
-    Create a small GPTNeoX config. 
+    Create a small GPTNeoX config.
     Approx ~14M parameters, akin to smallest Pythia variant.
     """
     hidden_size = 128
@@ -145,9 +151,11 @@ def create_small_pythia_config() -> GPTNeoXConfig:
         eos_token_id=50256,
     )
 
+
 ##############################################################################
 # Training Loop
 ##############################################################################
+
 
 def train_one_run(cfg: TrainingConfig, seed: int, accelerator: Accelerator):
     # Set seed
@@ -165,8 +173,8 @@ def train_one_run(cfg: TrainingConfig, seed: int, accelerator: Accelerator):
             "max_steps": cfg.max_train_steps,
             "block_size": cfg.block_size,
             "lr": cfg.lr,
-            "batch_size": cfg.batch_size
-        }
+            "batch_size": cfg.batch_size,
+        },
     )
 
     # Create tokenizer & model
@@ -184,20 +192,17 @@ def train_one_run(cfg: TrainingConfig, seed: int, accelerator: Accelerator):
         split="train",
         block_size=cfg.block_size,
         buffer_size=cfg.buffer_size,
-        seed=seed
+        seed=seed,
     )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size
-    )
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=cfg.batch_size)
 
     # Prepare optimizer & scheduler
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
     scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=cfg.max_train_steps
+        num_training_steps=cfg.max_train_steps,
     )
 
     # Prepare with accelerator
@@ -214,7 +219,7 @@ def train_one_run(cfg: TrainingConfig, seed: int, accelerator: Accelerator):
         outputs = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            labels=batch["input_ids"]
+            labels=batch["input_ids"],
         )
         loss = outputs.loss
 
@@ -229,7 +234,9 @@ def train_one_run(cfg: TrainingConfig, seed: int, accelerator: Accelerator):
         if (global_step % cfg.save_steps) == 0:
             if accelerator.is_main_process:
                 # Save model checkpoint
-                ckpt_dir = os.path.join(cfg.model_output_dir, f"seed_{seed}", f"step_{global_step}")
+                ckpt_dir = os.path.join(
+                    cfg.model_output_dir, f"seed_{seed}", f"step_{global_step}"
+                )
                 os.makedirs(ckpt_dir, exist_ok=True)
                 unwrapped_model = accelerator.unwrap_model(model)
                 unwrapped_model.save_pretrained(ckpt_dir)
@@ -248,8 +255,7 @@ def train_one_run(cfg: TrainingConfig, seed: int, accelerator: Accelerator):
 
         # Log final model as artifact
         artifact = wandb.Artifact(
-            name=f"{cfg.run_name_prefix}-seed_{seed}-model",
-            type="model"
+            name=f"{cfg.run_name_prefix}-seed_{seed}-model", type="model"
         )
         artifact.add_dir(final_dir)
         wandb.log_artifact(artifact)
@@ -262,7 +268,9 @@ def main():
 
     # Command-line arg for seed
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, required=True, help="Random seed for training")
+    parser.add_argument(
+        "--seed", type=int, required=True, help="Random seed for training"
+    )
     args = parser.parse_args()
 
     # Create the config
