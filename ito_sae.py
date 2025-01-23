@@ -3,8 +3,6 @@ from typing import Dict, Optional
 
 import torch
 
-from optim import omp_incremental_cholesky_with_fallback, omp_sklearn
-
 
 def omp(D, x, n_nonzero_coefs):
     batch_size, signal_dim = x.size()

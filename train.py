@@ -12,7 +12,6 @@ from tqdm import tqdm
 import wandb
 
 from ito_sae import ITO_SAE
-from optim import omp_incremental_cholesky_with_fallback
 
 from dictionary_learning.training import trainSAE
 from dictionary_learning.trainers import TopKTrainer
@@ -245,8 +244,8 @@ def construct_atoms(
         )
     pbar.close()
 
-    # (3) deduplicate
     atoms, atom_indices = stable_unique(atoms, atom_indices)
+    atoms = atoms / atoms.norm(dim=1, keepdim=True)
     print(f"Final dictionary size after dedup: {atoms.size(0)} atoms.")
     return atoms, atom_indices, losses
 

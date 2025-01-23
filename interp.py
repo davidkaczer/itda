@@ -1,5 +1,6 @@
 # %%
 import os
+import random
 import yaml
 import torch
 import zarr
@@ -12,7 +13,7 @@ from tqdm import tqdm
 # %%
 # === USER CONFIGURATION ===
 
-RUN_ID = "uwg3tw1i"
+RUN_ID = "fhltcmik"
 
 # Highlight colors (dark background, so text is presumably white)
 TOKEN_OF_INTEREST_COLOR = "#3B1E6B"  # Indigo-ish
@@ -221,8 +222,8 @@ if __name__ == "__main__":
 # %%
 
 if __name__ == "__main__":
-    SAMPLE_IDX = 9
-    TOKEN_IDX = 20
+    SAMPLE_IDX = 6
+    TOKEN_IDX = 30
     SAMPLE_IDX = int(0.7 * len(ds)) + SAMPLE_IDX
 
     if SAMPLE_IDX >= zf_layer.shape[0]:
@@ -460,10 +461,17 @@ def print_top_activating_samples(
     these_values = val_matrix[mask]  # shape [M]
 
     # Sort by descending activation
-    sorted_order = torch.argsort(these_values, descending=True)[:n]
+    sorted_order = torch.argsort(these_values, descending=True)
     top_indices = these_indices[:, sorted_order]
     top_values = these_values[sorted_order]
 
+    # take a random sample of n indices and values
+    random_indices = random.sample(range(top_indices.shape[1]), n)
+    random_indices.sort()
+    top_indices = top_indices[:, random_indices]
+    top_values = top_values[random_indices]
+
+    snippets = []
     for act_val, (seq_i, tok_i, _) in zip(top_values, top_indices.T):
         seq_i = seq_i.item()
         tok_i = tok_i.item()
@@ -475,13 +483,14 @@ def print_top_activating_samples(
             highlight_color=highlight_color,
             prefix=f"<b>{act_val:.3f}</b>: ",
         )
-        display(snippet)
+        snippets.append(snippet)
+    display(*snippets)
 
 
 if __name__ == "__main__":
-    atom_idx = 6650
+    atom_idx = 2539
     origin_snippet = gather_atom_origin_snippet(
         atom_idx, atom_indices, ds, tokenizer, context=10
     )
     display(HTML(origin_snippet))
-    print_top_activating_samples(all_acts, atom_idx, ds, tokenizer, n=10, threshold=0.0)
+    print_top_activating_samples(all_acts, atom_idx, ds, tokenizer, n=10, threshold=-10.0)

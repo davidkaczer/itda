@@ -150,9 +150,10 @@ ax2.plot(
     worst_ito_df["dict_size"],
     marker="o",
     linestyle="--",
-    color="purple",
+    color="red",
     label="Worst ITO SAE Dictionary Sizes"
 )
+ax2.set_yscale("log")
 ax2.set_title("Dictionary Sizes of Best and Worst ITO SAEs", fontsize=14)
 ax2.set_xlabel("l0", fontsize=12)
 ax2.set_ylabel("Dictionary Size", fontsize=12)
