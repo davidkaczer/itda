@@ -48,6 +48,7 @@ def parse_layers(layers_str: str, max_layer: int = None):
 
 def get_activations_hf(
     model_name: str,
+    revision: str,
     dataset_name: str,
     activations_path: str,
     seq_len: int,
@@ -76,8 +77,13 @@ def get_activations_hf(
     (up to `stop_forward_pass_layer`, if set) are collected.
     """
 
+    # Make a friendly, filesystem-safe folder name that includes model and revision
+    output_model_nae = model_name
+    if revision:
+        output_model_nae += f"__{revision}"
+
     # Prepare final directory where Zarr data will be stored
-    save_dir = os.path.join(activations_path, model_name, dataset_name)
+    save_dir = os.path.join(activations_path, output_model_nae, dataset_name)
 
     # If this directory already exists, assume we've done it before and skip
     if os.path.exists(save_dir):
@@ -87,24 +93,31 @@ def get_activations_hf(
     # -------------------------------------------------------------------------
     # 1. Load the model
     # -------------------------------------------------------------------------
-    print(f"Loading model {model_name} ...")
-
-    # If offload_folder is set, use Accelerate-based offloading
     if offload_folder:
         print(f"Offloading parameters to disk at {offload_folder} ...")
+
+    if revision:
+        print(f"Loading model {model_name} at revision={revision} ...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="auto",
+            revision=revision,
+            device_map="auto" if offload_folder else None,
             offload_folder=offload_folder,
         )
     else:
-        # Default loading
-        model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        print(f"Loading model {model_name} with default branch ...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto" if offload_folder else None,
+            offload_folder=offload_folder,
+        )
+
+    if not offload_folder:
+        model = model.to(device)
 
     # If stop_forward_pass_layer is specified, check model type and slice layers
     if stop_forward_pass_layer is not None:
         # Only allow stop_forward_pass_layer for LLaMA-based models
-        # (adjust the check as needed for your naming convention)
         if "llama" not in getattr(model.config, "model_type", "").lower():
             raise ValueError(
                 "The 'stop_forward_pass_layer' argument can only be used with LLaMA-based models. "
@@ -155,7 +168,6 @@ def get_activations_hf(
     # -------------------------------------------------------------------------
     # 3. Probe pass to figure out dimension info
     # -------------------------------------------------------------------------
-    # If using offload/device_map="auto", watch out for device placement of your sample
     probe_input = ds_local[0]["input_ids"].unsqueeze(0).to(device)
     with torch.no_grad():
         probe_out = model(probe_input, output_hidden_states=True)
@@ -168,7 +180,6 @@ def get_activations_hf(
     print(f"Model has {num_layers} layers. Hidden size = {hidden_dim}")
 
     # Figure out which layers to collect
-    # If stop_forward_pass_layer is set, that's the upper bound for actual forward pass
     max_possible_layer = stop_forward_pass_layer if stop_forward_pass_layer else num_layers
 
     if layers_str:
@@ -256,8 +267,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt2",
-        help="Hugging Face model name or path, e.g. 'gpt2', 'EleutherAI/pythia-1.4b', etc.",
+        default="EleutherAI/pythia-70m-deduped",
+        help="Hugging Face model repository name or local path, e.g. 'EleutherAI/pythia-70m-deduped'.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Which HF revision/branch/tag to use from the model repository. E.g. 'step1000'.",
     )
     parser.add_argument(
         "--dataset",
@@ -281,7 +298,7 @@ if __name__ == "__main__":
         "--activations_path",
         type=str,
         default="artifacts/data",
-        help="Where to store final Zarr outputs. The final path is <activations_path>/<model>/<dataset>.",
+        help="Where to store final Zarr outputs. The final path is <activations_path>/<model_and_revision>/<dataset>.",
     )
     parser.add_argument(
         "--num_examples",
@@ -316,6 +333,7 @@ if __name__ == "__main__":
 
     get_activations_hf(
         model_name=args.model,
+        revision=args.revision,
         dataset_name=args.dataset,
         activations_path=args.activations_path,
         seq_len=args.seq_len,

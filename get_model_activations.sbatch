@@ -19,6 +19,7 @@ NUM_EXAMPLES=${6:-10000}
 STOP_FORWARD_PASS_LAYER=${7}      # optional
 OFFLOAD_FOLDER=${8}               # optional
 LAYERS=${9}                       # optional
+REVISION=${10}                    # optional
 
 module load cuda/11.3
 source /home3/wclv88/venv/bin/activate
@@ -34,6 +35,7 @@ echo "  NUM_EXAMPLES:           $NUM_EXAMPLES"
 echo "  STOP_FORWARD_PASS_LAYER: $STOP_FORWARD_PASS_LAYER"
 echo "  OFFLOAD_FOLDER:         $OFFLOAD_FOLDER"
 echo "  LAYERS:                 $LAYERS"
+echo "  REVISION:               $REVISION"
 
 # Build up the command with mandatory arguments
 CMD="python3 get_model_activations.py \
@@ -55,6 +57,10 @@ fi
 
 if [ -n "$LAYERS" ]; then
   CMD="$CMD --layers \"$LAYERS\""
+fi
+
+if [ -n "$REVISION" ]; then
+  CMD="$CMD --revision \"$REVISION\""
 fi
 
 echo "Final command:"

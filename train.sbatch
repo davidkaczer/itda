@@ -16,6 +16,7 @@ LAYER=${3:-3}
 TARGET_LOSS=${4:-0.01}
 L0=${5:-40}
 SKLEARN=${6:-false}
+MAX_SEQUENCES=${7:-1000000}
 
 # Print the parameters for logging
 echo "Running training with the following parameters:"
@@ -25,6 +26,7 @@ echo "Layer: $LAYER"
 echo "Target loss: $TARGET_LOSS"
 echo "L0: $L0"
 echo "Sklearn: $SKLEARN"
+echo "Max sequences: $MAX_SEQUENCES"
 
 module load cuda/11.3
 source /home3/wclv88/venv/bin/activate
@@ -36,4 +38,5 @@ python3 train.py \
     --layer "$LAYER" \
     --target_loss "$TARGET_LOSS" \
     --l0 "$L0" \
-    $(if [ "$SKLEARN" = true ]; then echo "--sklearn"; fi)
+    $(if [ "$SKLEARN" = true ]; then echo "--sklearn"; fi) \
+    --max_sequences "$MAX_SEQUENCES"
