@@ -6,7 +6,7 @@
 #SBATCH --qos short
 #SBATCH -t 02-00:00
 #SBATCH --gres=gpu:pascal:1
-#SBATCH -o logs/qwen_sae-%A_%a.out
+#SBATCH -o logs/train-%A_%a.out
 #SBATCH --mem 28G
 
 # -----------------------------------------------------------------------------
