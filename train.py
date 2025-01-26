@@ -28,10 +28,6 @@ ARTIFACTS_DIR = "artifacts"
 DATA_DIR = os.path.join(ARTIFACTS_DIR, "data")
 RUNS_DIR = os.path.join(ARTIFACTS_DIR, "runs")
 
-# -----------------------------------------
-# I. Utility functions
-# -----------------------------------------
-
 
 def get_gpu_tensors():
     """
@@ -90,11 +86,6 @@ def gather_token_activations(zf, token_indices: torch.Tensor, device="cpu"):
     return torch.from_numpy(activations_np).to(device)
 
 
-# -----------------------------------------
-# II. ITO-SAE training code
-# -----------------------------------------
-
-
 def construct_atoms(
     activations,
     atom_indices=None,
@@ -104,6 +95,7 @@ def construct_atoms(
     train_size: int = -1,
     device="cpu",
     has_bos=False,
+    max_atoms=None,
 ):
     """
     The dictionary-building procedure used for ITO SAEs.
@@ -226,6 +218,10 @@ def construct_atoms(
             atoms = torch.cat([atoms, new_atoms], dim=0)
             atom_indices = torch.cat([atom_indices, new_atom_indices], dim=0)
 
+        if max_atoms is not None and atoms.size(0) > max_atoms:
+            print(f"Reached max_atoms: {max_atoms}. Stopping.")
+            break
+
         batch_counter += 1
         pbar.update(end_idx - start_idx)
         pbar.set_postfix(
@@ -274,7 +270,7 @@ def evaluate_ito(
 
 def train_ito_saes(args, device):
     """
-    Train an ITO-SAE dictionary using your original threshold-based approach.
+    Train an ITO-SAE dictionary using threshold-based addition of new atoms.
     """
     run_id = wandb.run.id
     run_dir = os.path.join(RUNS_DIR, run_id)
@@ -315,6 +311,7 @@ def train_ito_saes(args, device):
         train_size=train_size,
         device=device,
         has_bos=("llama" in args.model.lower()),
+        max_atoms=args.max_atoms,
     )
 
     # Save results
@@ -345,20 +342,22 @@ def train_ito_saes(args, device):
     with open(losses_path, "wb") as f:
         pickle.dump(losses, f)
 
-    # Evaluate on last 30%
-    atoms = atoms / atoms.norm(dim=1, keepdim=True)
-    ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
-    test_size = int(total_sequences * 0.3)
-    eval_losses = evaluate_ito(
-        ito_sae,
-        layer_acts,
-        batch_size=args.batch_size,
-        val_size=test_size,
-        device=device,
-    )
-    mean_ito_loss = eval_losses.mean().item()
-    print(f"Mean ITO loss: {mean_ito_loss:.4f} over {len(eval_losses)} activations")
-    wandb.log({"eval_loss": mean_ito_loss})
+    # If skip_validation is True, do not evaluate
+    if not args.skip_validation:
+        # Evaluate on last 30%
+        atoms = atoms / atoms.norm(dim=1, keepdim=True)
+        ito_sae = ITO_SAE(atoms.to(device), l0=args.l0)
+        test_size = int(total_sequences * 0.3)
+        eval_losses = evaluate_ito(
+            ito_sae,
+            layer_acts,
+            batch_size=args.batch_size,
+            val_size=test_size,
+            device=device,
+        )
+        mean_ito_loss = eval_losses.mean().item()
+        print(f"Mean ITO loss: {mean_ito_loss:.4f} over {len(eval_losses)} activations")
+        wandb.log({"eval_loss": mean_ito_loss})
 
     # W&B artifact
     artifact = wandb.Artifact(
@@ -372,11 +371,6 @@ def train_ito_saes(args, device):
     artifact.add_file(losses_path)
     artifact.add_file(os.path.join(run_dir, "metadata.yaml"))
     wandb.log_artifact(artifact)
-
-
-# -----------------------------------------
-# III. Dictionary-learning-based training
-# -----------------------------------------
 
 
 class ZarrActivationDataset(torch.utils.data.Dataset):
@@ -526,33 +520,30 @@ def train_dictlearn_saes(args, device):
     artifact.add_file(os.path.join(run_dir, "metadata.yaml"))
     wandb.log_artifact(artifact)
 
-    # Optional: Evaluate on the test set
-    test_loader = torch.utils.data.DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
+    # Optional: Evaluate on the test set (skip if requested)
+    if not args.skip_validation:
+        test_loader = torch.utils.data.DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
 
-    final_ae.to(device)
-    final_ae.eval()
-    all_losses = []
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="DictLearn Eval"):
-            batch = batch.to(device)  # shape [B, d_model]
-            recon, feats = final_ae(batch, output_features=True)
-            loss = torch.mean((batch - recon) ** 2, dim=1)
-            all_losses.extend(loss.cpu().numpy())
+        final_ae.to(device)
+        final_ae.eval()
+        all_losses = []
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="DictLearn Eval"):
+                batch = batch.to(device)  # shape [B, d_model]
+                recon, feats = final_ae(batch, output_features=True)
+                loss = torch.mean((batch - recon) ** 2, dim=1)
+                all_losses.extend(loss.cpu().numpy())
 
-    test_mse = float(np.mean(all_losses))
-    wandb.log({"test_mse": test_mse})
-    print(f"[DictLearning] Test MSE: {test_mse:.4f}")
+        test_mse = float(np.mean(all_losses))
+        wandb.log({"test_mse": test_mse})
+        print(f"[DictLearning] Test MSE: {test_mse:.4f}")
 
-
-# -----------------------------------------
-# IV. Main
-# -----------------------------------------
 
 if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
@@ -566,7 +557,6 @@ if __name__ == "__main__":
         choices=["ito", "dictlearn"],
         help="Which approach to train: 'ito' or 'dictlearn'",
     )
-
     # Shared arguments
     parser.add_argument("--model", type=str, default="EleutherAI/pythia-70m-deduped")
     parser.add_argument("--dataset", type=str, default=DATASET)
@@ -578,6 +568,11 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Optionally limit the total number of sequences to load from the dataset.",
+    )
+    parser.add_argument(
+        "--skip_validation",
+        action="store_true",
+        help="If set, skip the evaluation/validation step after training.",
     )
 
     # ITO-specific arguments
