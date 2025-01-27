@@ -34,7 +34,7 @@ GPT2_MODELS = [
 GPT2_LAYERS = 12
 GPT2_TARGET_LOSS = 0.0005
 
-USE_GPT2 = True
+USE_GPT2 = False
 if USE_GPT2:
     MODELS = GPT2_MODELS
     NUM_LAYERS = GPT2_LAYERS
@@ -197,31 +197,15 @@ if __name__ == "__main__":
         (len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)
     )
 
-    # Create a list of tasks to distribute across processes
-    tasks = [
-        (mi, mj, li, lj, atom_indices)
-        for mi, mj, li, lj in product(
-            range(len(MODELS)),
-            range(len(MODELS)),
-            range(NUM_LAYERS - 1),
-            range(NUM_LAYERS - 1),
+    for mi, mj, li, lj in tqdm(product(
+        range(len(MODELS)),
+        range(len(MODELS)),
+        range(NUM_LAYERS - 1),
+        range(NUM_LAYERS - 1),
+    ), desc="Calculating similarities", total=len(MODELS) ** 2 * (NUM_LAYERS - 1) ** 2):
+        itda_similarities[mi, mj, li, lj] = get_similarity_measure(
+            atom_indices[mi][li], atom_indices[mj][lj]
         )
-    ]
-
-    # Use multiprocessing to compute in parallel
-    with Pool(cpu_count()) as pool:
-        results = list(
-            tqdm(
-                pool.imap(compute_similarity_task, tasks),
-                total=len(tasks),
-                desc="Calculating similarities",
-            )
-        )
-
-    # Populate the similarities array with results
-    for mi, mj, li, lj, similarity in results:
-        itda_similarities[mi, mj, li, lj] = similarity
-
 
 # %%
 
@@ -232,16 +216,15 @@ if __name__ == "__main__":
     im = ax.imshow(heatmap, cmap="viridis")
 
     # # Add values to the heatmap with dynamic text color
-    # for i in range(heatmap.shape[0]):
-    #     for j in range(heatmap.shape[1]):
-    #         value = heatmap[i, j]
-    #         # Use white text for dark colors and black for light colors
-    #         text_color = "white" if value < 0.5 else "black"
-    #         ax.text(j, i, f"{value:.2f}", ha="center", va="center", color=text_color)
+    for i in range(heatmap.shape[0]):
+        for j in range(heatmap.shape[1]):
+            value = heatmap[i, j]
+            # Use white text for dark colors and black for light colors
+            text_color = "white" if value < 0.5 else "black"
+            ax.text(j, i, f"{value:.2f}", ha="center", va="center", color=text_color)
 
     # Add a colorbar
     cbar = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Similarity", rotation=-90, va="bottom")
     cbar.set_ticks([heatmap.min(), heatmap.max()])
 
     # Label axes
