@@ -58,6 +58,7 @@ def get_activations_hf(
     stop_forward_pass_layer: int = None,
     offload_folder: str = None,
     layers_str: str = None,
+    tokenizer_name: str = None,
 ):
     """
     Collect hidden states (residual-stream-like) from a Hugging Face model
@@ -144,7 +145,9 @@ def get_activations_hf(
     ds_local = Dataset.from_list(limited_samples)
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer_name is None:
+        tokenizer_name = model_name
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 

@@ -5,7 +5,7 @@ import torch
 
 
 def omp(D, x, n_nonzero_coefs):
-    batch_size, signal_dim = x.size()
+    batch_size = x.size(0)
     num_dict_atoms = D.size(0)
 
     residuals = x.clone()

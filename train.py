@@ -202,6 +202,11 @@ def construct_atoms(
 
         sae = ITO_SAE(atoms, l0)
         recon = sae(batch_activations)
+
+        # normalize so mse is somewhat meaningful across hook points
+        batch_activations = batch_activations / batch_activations.norm(dim=1, keepdim=True)
+        recon = recon / recon.norm(dim=1, keepdim=True)
+
         batch_loss = ((batch_activations - recon) ** 2).mean(dim=1)
         valid_mask = batch_loss < 1e8
         valid_losses = batch_loss[valid_mask]

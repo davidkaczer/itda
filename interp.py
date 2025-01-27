@@ -493,4 +493,4 @@ if __name__ == "__main__":
         atom_idx, atom_indices, ds, tokenizer, context=10
     )
     display(HTML(origin_snippet))
-    print_top_activating_samples(all_acts, atom_idx, ds, tokenizer, n=10, threshold=-10.0)
+    print_top_activating_samples(all_acts, atom_idx, ds, tokenizer, n=10, threshold=0)
