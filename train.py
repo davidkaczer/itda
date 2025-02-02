@@ -8,14 +8,13 @@ import numpy as np
 import torch
 import yaml
 import zarr
-from tqdm import tqdm
-import wandb
-
-from ito_sae import ITO_SAE
-
-from dictionary_learning.training import trainSAE
 from dictionary_learning.trainers import TopKTrainer
 from dictionary_learning.trainers.top_k import AutoEncoderTopK
+from dictionary_learning.training import trainSAE
+from ito_sae import ITO_SAE
+from tqdm import tqdm
+
+import wandb
 
 OMP_BATCH_SIZE = 16
 OMP_L0 = 40
@@ -100,10 +99,11 @@ def construct_atoms(
     """
     The dictionary-building procedure used for ITO SAEs.
     """
+    from collections import Counter
+
     import numpy as np
     import torch
     from tqdm import tqdm
-    from collections import Counter
 
     def top_k_most_repeated_rows(tensor, k):
         if tensor.numel() == 0 or k <= 0 or k > tensor.shape[0]:
@@ -316,7 +316,6 @@ def train_ito_saes(args, device):
         train_size=train_size,
         device=device,
         has_bos=("llama" in args.model.lower()),
-        max_atoms=args.max_atoms,
     )
 
     # Save results
@@ -380,39 +379,73 @@ def train_ito_saes(args, device):
 
 class ZarrActivationDataset(torch.utils.data.Dataset):
     """
-    Loads the full Zarr activations into memory once, then
-    returns rows from the in-memory tensor. This avoids slow
-    on-the-fly Zarr lookups for each sample.
-
-    We assume that the Zarr array has shape (N, seq_len, d_model).
-    We'll flatten it to (N * seq_len, d_model).
+    A PyTorch Dataset that:
+      - Does *not* load the entire Zarr array into memory.
+      - Loads chunk-by-chunk from the underlying Zarr store.
+      - Returns rows of shape (d_model,).
+    We assume zarr_array has shape (N, seq_len, d_model).
     """
 
     def __init__(self, zarr_array):
         super().__init__()
-        # Read entire array into memory (a NumPy array)
-        full_np = zarr_array[:]  # shape (N, seq_len, d_model)
+        self.zarr = zarr_array
+        self.num_seq, self.seq_len, self.d_model = self.zarr.shape
 
-        # Convert to a float32 torch.Tensor on CPU
-        self.all_activations = torch.from_numpy(full_np).float()
+        # Flatten conceptually to [N * seq_len, d_model],
+        # but we won't actually load it all at once.
+        self.n_items = self.num_seq * self.seq_len
 
-        # Flatten from (N, seq_len, d_model) to (N * seq_len, d_model)
-        self.all_activations = self.all_activations.view(
-            -1, self.all_activations.size(-1)
-        )
+        # We'll read data chunk-by-chunk using these chunk sizes:
+        # zarr_array.chunks is typically a tuple like (chunkN, chunkS, d_model_chunk),
+        # but we only care about the first two since we fetch [chunkN, chunkS, :].
+        self.chunk_size_seq = self.zarr.chunks[0]  # how many sequences per chunk
+        self.chunk_size_pos = self.zarr.chunks[1]  # how many positions per chunk
 
-        # Keep track of shape
-        self.num_sequences_times_seq_len = self.all_activations.size(0)
-        self.d_model = self.all_activations.size(1)
+        # We'll store the current in-memory chunk + which chunk it corresponds to.
+        self.current_chunk_data = None
+        self.current_chunk_seq_index = None
+        self.current_chunk_pos_index = None
 
     def __len__(self):
-        return self.num_sequences_times_seq_len
+        return self.n_items
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         """
-        Returns a single row of shape (d_model,).
+        Return a single row of shape (d_model,).
+        The row corresponds to [seq_idx, pos_idx, :].
         """
-        return self.all_activations[idx]
+        # 1. Convert flattened index -> (seq_idx, pos_idx)
+        seq_idx = idx // self.seq_len
+        pos_idx = idx % self.seq_len
+
+        # 2. Determine which chunk in the Zarr store this index falls into.
+        chunk_seq_idx = seq_idx // self.chunk_size_seq
+        chunk_pos_idx = pos_idx // self.chunk_size_pos
+
+        # 3. If this is a new chunk, load it from the Zarr store.
+        if (chunk_seq_idx != self.current_chunk_seq_index) or \
+           (chunk_pos_idx != self.current_chunk_pos_index):
+            seq_start = chunk_seq_idx * self.chunk_size_seq
+            seq_end = min(seq_start + self.chunk_size_seq, self.num_seq)
+
+            pos_start = chunk_pos_idx * self.chunk_size_pos
+            pos_end = min(pos_start + self.chunk_size_pos, self.seq_len)
+
+            # Actually load the chunk from Zarr. Shape: [chunk_seq_dim, chunk_pos_dim, d_model]
+            chunk_data = self.zarr[seq_start:seq_end, pos_start:pos_end, :]
+
+            # Store this chunk in memory
+            self.current_chunk_data = chunk_data
+            self.current_chunk_seq_index = chunk_seq_idx
+            self.current_chunk_pos_index = chunk_pos_idx
+
+        # 4. Extract the local index inside the chunk
+        local_seq = seq_idx - (self.current_chunk_seq_index * self.chunk_size_seq)
+        local_pos = pos_idx - (self.current_chunk_pos_index * self.chunk_size_pos)
+
+        # 5. Return as a float32 Torch tensor
+        row_np = self.current_chunk_data[local_seq, local_pos, :]
+        return torch.from_numpy(row_np).float()
 
 
 def collate_fn(batch):
@@ -459,13 +492,13 @@ def train_dictlearn_saes(args, device):
     dataset = ZarrActivationDataset(layer_acts)
     # You can define your own sampler or random subset. E.g., 70% for train:
     train_size = int(0.7 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_ds, test_ds = torch.utils.data.random_split(dataset, [train_size, test_size])
+    train_ds, test_ds = torch.utils.data.Subset(dataset, range(train_size)), torch.utils.data.Subset(dataset, range(train_size, len(dataset)))
+
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=0,
         collate_fn=collate_fn,
         drop_last=True,

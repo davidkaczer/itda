@@ -28,13 +28,14 @@ class ITO_SAE:
         self.cfg = cfg
 
     def encode(self, x):
+        x = x.to(dtype=self.atoms.dtype)
         shape = x.size()
         x = x.view(-1, shape[-1])
         activations = omp(self.atoms, x, self.l0)
         return activations.view(*shape[:-1], -1)
 
     def decode(self, activations):
-        return torch.matmul(activations, self.atoms)
+        return torch.matmul(activations.to(dtype=self.atoms.dtype), self.atoms)
 
     @property
     def W_dec(self):

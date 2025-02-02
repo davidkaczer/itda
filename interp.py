@@ -9,11 +9,12 @@ from ito_sae import ITO_SAE
 from transformers import AutoTokenizer
 from IPython.display import HTML, display
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 # %%
 # === USER CONFIGURATION ===
 
-RUN_ID = "fhltcmik"
+RUN_ID = "tadbdwqi"
 
 # Highlight colors (dark background, so text is presumably white)
 TOKEN_OF_INTEREST_COLOR = "#3B1E6B"  # Indigo-ish
@@ -91,11 +92,11 @@ def gather_atom_origin_snippet(atom_idx, atom_indices, ds, tokenizer, context=5)
 
     snippet_html = ""
     for i in range(start_i, end_i):
-        decoded = tokenizer.decode([tok_ids[i]], skip_special_tokens=False).replace(
+        decoded = ''.join(tokenizer.decode([tok_ids[i]], skip_special_tokens=False).replace(
             "\n", "\\n"
-        )
+        ))
         if i == origin_pos_idx:
-            snippet_html += f'<span style="background-color:{ORIGIN_HIGHLIGHT_COLOR}; font-weight:bold">{decoded}</span> '
+            snippet_html += f'<span style="background-color:{ORIGIN_HIGHLIGHT_COLOR}; font-weight:bold">/hl{{{decoded}}}</span> '
         else:
             snippet_html += f"{decoded} "
     return snippet_html
@@ -222,7 +223,7 @@ if __name__ == "__main__":
 # %%
 
 if __name__ == "__main__":
-    SAMPLE_IDX = 6
+    SAMPLE_IDX = 110
     TOKEN_IDX = 30
     SAMPLE_IDX = int(0.7 * len(ds)) + SAMPLE_IDX
 
@@ -408,7 +409,7 @@ def highlight_string(
     for i in range(start_i, end_i):
         token_str = tokenizer.decode([tokens[i]]).replace("\n", "\\n")
         if i == idx:
-            out_html += f'<span style="background-color: {highlight_color}; font-weight: bold;">{token_str}</span>'
+            out_html += f'<span style="background-color: {highlight_color}; font-weight: bold;">\hl{{{token_str}}}</span>'
         else:
             out_html += token_str
     return HTML(out_html)
@@ -425,14 +426,20 @@ if __name__ == "__main__":
 # %%
 
 
+import random
+import torch
+from IPython.display import HTML, display
+
+
 def print_top_activating_samples(
     all_acts,
     atom_idx,
     ds,
     tokenizer,
     n=10,
-    threshold=0.0,
+    val_range=(0.0, float("inf")),
     highlight_color="#144B39",
+    random_sample=True,
 ):
     """
     From a sparse activation tensor `all_acts` with indices [3, nnz]:
@@ -440,57 +447,165 @@ def print_top_activating_samples(
       row 1 -> token_idx
       row 2 -> atom_idx
     and values -> activation magnitudes,
-    display the top `n` (seq_idx, token_idx) with highest activation for `atom_idx`
-    (above `threshold`).
+    display up to `n` (seq_idx, token_idx) positions with activations for `atom_idx`
+    that fall within the activation range `val_range = (min_val, max_val)`.
+
+    If `random_sample=True`, pick a random subset of size `n` from all matching samples.
+    Otherwise, display the top `n` by descending activation.
+
+    Args:
+        all_acts:        The sparse encoding tensor (coalesced) of shape
+                         [num_seqs, seq_len, n_atoms] in COO format.
+        atom_idx (int):  Index of the atom whose activations we want to inspect.
+        ds:              The dataset (or subset) containing "input_ids".
+        tokenizer:       The tokenizer used to decode integer token IDs.
+        n (int):         Number of samples to display.
+        val_range (tuple): (min_val, max_val) range for activation values
+                           that should be included.
+        highlight_color: The background color for highlighting the activated token.
+        random_sample:   Whether to take a random sample of the matches or the top n.
     """
-    # Identify entries for the given atom_idx
     idx_matrix = all_acts.indices()  # shape [3, nnz]
     val_matrix = all_acts.values()  # shape [nnz]
 
-    # Mask for this atom
+    # Filter only entries corresponding to this atom index
     is_this_atom = idx_matrix[2] == atom_idx
-    is_above_thresh = val_matrix > threshold
-    mask = is_this_atom & is_above_thresh
+
+    # Filter by the activation range [min_val, max_val]
+    min_val, max_val = val_range
+    is_in_range = (val_matrix >= min_val) & (val_matrix <= max_val)
+
+    # Combine both masks
+    mask = is_this_atom & is_in_range
 
     if not mask.any():
-        print(f"No activations for atom {atom_idx} above threshold {threshold}")
+        print(f"No activations for atom {atom_idx} within range {val_range}")
         return
 
     # Filter
     these_indices = idx_matrix[:, mask]  # shape [3, M]
     these_values = val_matrix[mask]  # shape [M]
 
-    # Sort by descending activation
+    # Sort by descending activation so we can pick top ones
     sorted_order = torch.argsort(these_values, descending=True)
-    top_indices = these_indices[:, sorted_order]
-    top_values = these_values[sorted_order]
+    sorted_indices = these_indices[:, sorted_order]
+    sorted_values = these_values[sorted_order]
 
-    # take a random sample of n indices and values
-    random_indices = random.sample(range(top_indices.shape[1]), n)
-    random_indices.sort()
-    top_indices = top_indices[:, random_indices]
-    top_values = top_values[random_indices]
+    # Decide how to pick the final subset
+    # 1) If random_sample=True, we'll randomly select `n` from all matching
+    # 2) Otherwise, just take the top `n`
+    if random_sample:
+        # Make sure we don't sample more than we have
+        total_matches = sorted_indices.shape[1]
+        n_to_take = min(n, total_matches)
+        random_indices = random.sample(range(total_matches), n_to_take)
+        final_indices = sorted_indices[:, random_indices]
+        final_values = sorted_values[random_indices]
+    else:
+        final_indices = sorted_indices[:, :n]
+        final_values = sorted_values[:n]
 
+    # For clarity, sort final picks by descending activation again
+    # so they appear from highest -> lowest
+    final_order = torch.argsort(final_values, descending=True)
+    final_indices = final_indices[:, final_order]
+    final_values = final_values[final_order]
+
+    # Display results
     snippets = []
-    for act_val, (seq_i, tok_i, _) in zip(top_values, top_indices.T):
+    for act_val, (seq_i, tok_i, _) in zip(final_values, final_indices.T):
         seq_i = seq_i.item()
         tok_i = tok_i.item()
-        snippet = highlight_string(
+
+        snippet_html = highlight_string(
             ds[seq_i]["input_ids"],
             tok_i,
             tokenizer,
             crop=10,
             highlight_color=highlight_color,
-            prefix=f"<b>{act_val:.3f}</b>: ",
+            prefix=f"<b>{act_val:.3f}</b> (Seq {seq_i}, Tok {tok_i}): ",
         )
-        snippets.append(snippet)
+        snippets.append(snippet_html)
+
     display(*snippets)
 
 
+def show_histogram_for_atom(all_acts, atom_idx, bins=50):
+    """
+    Plots a histogram of all activation values for the given `atom_idx`
+    from the sparse tensor `all_acts`, and displays the percentage of
+    inputs on which this atom is active.
+    """
+    # all_acts is a sparse tensor with shape [B, T, A] (Batch, Position, Atom)
+    # its .indices() has shape [3, nnz]
+    # its .values() has shape [nnz]
+    idx_matrix = all_acts.indices()  # shape [3, nnz]
+    val_matrix = all_acts.values()   # shape [nnz]
+
+    # --- 1) Identify which entries belong to the requested atom ---
+    atom_mask = (idx_matrix[2] == atom_idx)         # which nonzero entries are for this specific atom
+    these_values = val_matrix[atom_mask]            # the values for this atom
+    these_positions = idx_matrix[:2, atom_mask]     # the (batch, position) pairs for this atom
+
+    # --- 2) Determine how many unique (batch, position) pairs have this atom active ---
+    # Convert to NumPy for easy unique operation
+    these_positions_np = these_positions.detach().cpu().numpy()  # shape [2, #nonzero_for_atom]
+    # unique along axis=1 means we treat each column as a separate (batch, position) pair
+    unique_positions_for_atom = np.unique(these_positions_np, axis=1)
+    num_unique_positions_for_atom = unique_positions_for_atom.shape[1]
+
+    # --- 3) Total number of (batch, position) pairs in the entire dataset ---
+    B, T, A = all_acts.size()  # shape is [B, T, A]
+    total_positions = B * T
+
+    # --- 4) Fraction (as a percentage) of inputs where this atom is active ---
+    fraction_active = num_unique_positions_for_atom / total_positions
+    pct_text = f"Active on {fraction_active * 100:.2f}% of inputs"
+
+    # --- 5) Plot the histogram of activation values ---
+    # Convert the selected activation values to NumPy for plotting
+    these_values = these_values.detach().cpu().numpy()
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(these_values, bins=bins, color="skyblue", edgecolor="black")
+    plt.xlabel("Activation Value")
+    plt.ylabel("Frequency")
+
+    # Add text in the top-right corner (in Axes coordinates) so it doesn't overlap the histogram
+    plt.text(
+        0.95, 0.95, pct_text,
+        horizontalalignment='right',
+        verticalalignment='top',
+        transform=plt.gca().transAxes,
+        bbox=dict(facecolor='white', alpha=0.5, edgecolor='none')
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+
 if __name__ == "__main__":
-    atom_idx = 2539
+    atom_idx = 9110
+
     origin_snippet = gather_atom_origin_snippet(
-        atom_idx, atom_indices, ds, tokenizer, context=10
+        atom_idx, atom_indices, ds, tokenizer, context=40
     )
     display(HTML(origin_snippet))
-    print_top_activating_samples(all_acts, atom_idx, ds, tokenizer, n=10, threshold=0)
+    print_top_activating_samples( 
+        all_acts, atom_idx, ds, tokenizer, n=5, val_range=(2, float("inf"))
+    )
+    print_top_activating_samples( 
+        all_acts, atom_idx, ds, tokenizer, n=5, val_range=(0, 2)
+    )
+    print_top_activating_samples( 
+        all_acts, atom_idx, ds, tokenizer, n=5, val_range=(-2., 0)
+    )
+    print_top_activating_samples( 
+        all_acts, atom_idx, ds, tokenizer, n=5, val_range=(float("-inf"), -2.)
+    )
+
+    # Finally, call the histogram plotting function
+    show_histogram_for_atom(all_acts, atom_idx, bins=50)
+
+# %%

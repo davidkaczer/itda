@@ -156,6 +156,7 @@ import os
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
+from matplotlib import cm
 import torch
 
 if __name__ == "__main__":
@@ -220,25 +221,25 @@ if __name__ == "__main__":
         # Store steps and IoU values for later plotting
         iou_by_layer[layer] = (iou_steps, iou_values)
 
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(4, 3))
     cmap = plt.cm.viridis
     norm = plt.Normalize(1, NUM_LAYERS)
 
-    fig, ax = plt.subplots(figsize=(8, 5))  # Create figure and axes explicitly
 
     for layer in range(1, NUM_LAYERS):
         steps, iou_vals = iou_by_layer[layer]
         color = cmap(norm(layer))
-        ax.plot(steps, iou_vals, color=color)
+        plt.plot(steps, iou_vals, color=color)
 
     # Adding the color bar
-    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, ticks=[1, NUM_LAYERS])  # Associate colorbar with the axis
-    cbar.ax.set_yticklabels(['Layer 1', f'Layer {NUM_LAYERS}'])  # Label the endpoints
+    # sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    # sm.set_array([])
+    # cbar = fig.colorbar(sm, ax=ax, ticks=[1, NUM_LAYERS])  # Associate colorbar with the axis
+    # cbar.ax.set_yticklabels(['Layer 1', f'Layer {NUM_LAYERS}'])  # Label the endpoints
 
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Dictionary Similarity")
-    ax.grid(True)
+    plt.xlabel("Step")
+    plt.xticks(rotation=45)
+    plt.ylabel("Dictionary Similarity")
+    plt.grid(True)
 
     plt.show()

@@ -20,6 +20,9 @@ for run in runs:
     max_sequences = run.config.get("max_sequences")
     ce_loss_score = run.summary.get("core/model_performance_preservation/ce_loss_score")
     dict_size = run.summary.get("dict_size")
+     
+    if max_sequences is None:
+        max_sequences = 10_000
 
     if (method == "ito") and (target_loss != 0.07):
         continue
@@ -37,18 +40,21 @@ for run in runs:
 # Convert data to DataFrame
 df = pd.DataFrame(data)
 
+# get the max ce_loss_score for each pair of method and total_training_tokens
+df = df.groupby(["method", "total_training_tokens"]).max().reset_index()
+
 # Group data by method and target_loss
 grouped_data = df.groupby(["method", "target_loss"])
 
 # Create a combined figure with two vertically stacked plots
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 4), sharex=True)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(4, 4), sharex=True)
 
 # Plot CE Loss Score
 for (method, target_loss), group in grouped_data:
     group = group.sort_values("total_training_tokens")  # Sort by x-axis value
 
     if method == "ito":
-        label = f"ITO SAE - {target_loss}"
+        label = f"ITDA"
     else:
         label = "Top-K SAE"
     ax1.plot(group["total_training_tokens"], group["ce_loss_score"], label=label)
@@ -56,8 +62,7 @@ for (method, target_loss), group in grouped_data:
 # Customize CE Loss Score plot
 ax1.set_ylabel("CE Loss Score")
 ax1.set_xscale("log")
-ax1.set_title("CE Score by total training tokens")
-ax1.legend(title="Method - Target Loss")
+ax1.legend(title="Method")
 ax1.grid(True)
 
 # Plot Dictionary Size
@@ -65,7 +70,7 @@ for (method, target_loss), group in grouped_data:
     group = group.sort_values("total_training_tokens")  # Sort by x-axis value
 
     if method == "ito":
-        label = f"ITO SAE - {target_loss}"
+        label = "ITDA"
     else:
         label = "Top-K SAE"
     ax2.plot(group["total_training_tokens"], group["dict_size"], label=label)
@@ -74,7 +79,6 @@ for (method, target_loss), group in grouped_data:
 ax2.set_xlabel("Total Training Tokens")
 ax2.set_xscale("log")
 ax2.set_ylabel("Dictionary Size")
-ax2.set_title("Dictionary Size by total training tokens")
 ax2.grid(True)
 
 # Adjust layout and show the combined figure
@@ -129,21 +133,21 @@ ax1.fill_between(l0s, best_sae, worst_sae, color="blue", alpha=0.1, label="SAE B
 ax1.fill_between(l0s, best_ito, worst_ito, color="green", alpha=0.1, label="ITO Bounds")
 ax1.plot(l0s, best_sae, marker="o", label="Overall Best SAE", color="green")
 ax1.plot(l0s, worst_sae, marker="o", label="Best ReLU SAE", color="red")
-ax1.plot(l0s, best_ito, marker="o", label="Best ITO SAE", linestyle="--", color="green")
-ax1.plot(l0s, worst_ito, marker="o", linestyle="--", label="Worst ITO SAE", color="red")
+ax1.plot(l0s, best_ito, marker="o", label="Best ITDA", linestyle="--", color="green")
+ax1.plot(l0s, worst_ito, marker="o", linestyle="--", label="Worst ITDA", color="red")
 ax1.set_title("Performance by L0", fontsize=14)
 ax1.set_ylabel("CE Loss Score", fontsize=12)
 ax1.legend(fontsize=10)
 ax1.grid(True)
 
-# Second subplot: Dictionary Sizes of Best and Worst ITO SAEs
+# Second subplot: Dictionary Sizes of Best and Worst ITDAs
 ax2.plot(
     best_ito_df["l0"],
     best_ito_df["dict_size"],
     marker="o",
     linestyle="-",
     color="green",
-    label="Best ITO SAE Dictionary Sizes"
+    label="Best ITDA Dictionary Sizes"
 )
 ax2.plot(
     worst_ito_df["l0"],
@@ -151,10 +155,10 @@ ax2.plot(
     marker="o",
     linestyle="--",
     color="red",
-    label="Worst ITO SAE Dictionary Sizes"
+    label="Worst ITDA Dictionary Sizes"
 )
 ax2.set_yscale("log")
-ax2.set_title("Dictionary Sizes of Best and Worst ITO SAEs", fontsize=14)
+ax2.set_title("Dictionary Sizes of Best and Worst ITDAs", fontsize=14)
 ax2.set_xlabel("l0", fontsize=12)
 ax2.set_ylabel("Dictionary Size", fontsize=12)
 ax2.legend(fontsize=10)

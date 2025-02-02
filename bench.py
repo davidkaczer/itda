@@ -28,6 +28,12 @@ MODEL_CONFIGS = {
         "layers": [3, 4],
         "d_model": 512,
     },
+    "google/gemma-2-2b": {
+        "batch_size": 8,
+        "dtype": "bfloat16",
+        "layers": [5, 12, 19],
+        "d_model": 2304,
+    },
 }
 
 
@@ -95,7 +101,7 @@ def run_evals(
                 selected_saes=selected_saes,
                 n_eval_reconstruction_batches=200,
                 n_eval_sparsity_variance_batches=2000,
-                eval_batch_size_prompts=16,
+                eval_batch_size_prompts=4,
                 compute_featurewise_density_statistics=True,
                 compute_featurewise_weight_based_metrics=True,
                 exclude_special_tokens_from_reconstruction=True,
@@ -230,7 +236,6 @@ if __name__ == "__main__":
     eval_types = args.eval_types
     # If autointerp is requested, load API key if present
     if "autointerp" in eval_types:
-        raise NotImplementedError("Autointerp evaluation is not yet supported")
         try:
             with open("openai_api_key.txt") as f:
                 api_key = f.read().strip()
@@ -311,7 +316,7 @@ if __name__ == "__main__":
     run_evals(
         sae_metadata["model"],
         selected_saes,
-        llm_batch_size,
+        llm_batch_size // 32,
         llm_dtype,
         device,
         eval_types=eval_types,
@@ -339,9 +344,6 @@ if __name__ == "__main__":
         artifact.add_file(result_path)
         wandb.log_artifact(artifact)
         print(f"Uploaded {result_path} to wandb as artifact '{artifact_name}'.")
-
-        if eval_type != "core":
-            continue
 
         with open(result_path, "r") as f:
             results = json.load(f)

@@ -34,7 +34,7 @@ GPT2_MODELS = [
 GPT2_LAYERS = 12
 GPT2_TARGET_LOSS = 0.0005
 
-USE_GPT2 = False
+USE_GPT2 = True
 if USE_GPT2:
     MODELS = GPT2_MODELS
     NUM_LAYERS = GPT2_LAYERS
@@ -165,79 +165,62 @@ def get_similarity_measure(ai1, ai2):
     return len(ai1s.intersection(ai2s)) / len(ai1s.union(ai2s))
 
 
-def compute_similarity_task(task):
-    mi, mj, li, lj, atom_indices = task
-    return (
-        mi,
-        mj,
-        li,
-        lj,
-        get_similarity_measure(atom_indices[mi][li], atom_indices[mj][lj]),
-    )
-
+ITDA = "itda"
 
 if __name__ == "__main__":
-    atom_indices = []
-    for model in MODELS:
-        atom_indices.append([])
-        for layer in range(1, NUM_LAYERS):
-            run = existing_itdas[model][layer]
-            if not run:
-                continue
+    if os.path.exists(
+        f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{ITDA}.npy"
+    ):
+        itda_similarities = np.load(
+            f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{ITDA}.npy"
+        )
+    else:
+        api = wandb.Api()
+        atom_indices = []
+        for model in MODELS:
+            atom_indices.append([])
+            for layer in range(1, NUM_LAYERS):
+                run = existing_itdas[model][layer]
+                if not run:
+                    continue
 
-            atom_indices[-1].append(
-                torch.load(
-                    f"artifacts/runs/{run.id}/atom_indices.pt", weights_only=True
+                # Fetch the artifact using the API
+                artifact_ref = f"example_saes/ito_dictionary_{run.id}:latest"
+                artifact = api.artifact(artifact_ref, type="model")
+
+                # Download the artifact (returns the local directory containing artifact files)
+                artifact_dir = artifact.download()
+
+                # Load the file from the downloaded directory
+                atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
+                loaded_indices = (
+                    torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
                 )
-                .to("cpu")
-                .numpy()
-            )
 
-    itda_similarities = np.zeros(
-        (len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)
-    )
-
-    for mi, mj, li, lj in tqdm(product(
-        range(len(MODELS)),
-        range(len(MODELS)),
-        range(NUM_LAYERS - 1),
-        range(NUM_LAYERS - 1),
-    ), desc="Calculating similarities", total=len(MODELS) ** 2 * (NUM_LAYERS - 1) ** 2):
-        itda_similarities[mi, mj, li, lj] = get_similarity_measure(
-            atom_indices[mi][li], atom_indices[mj][lj]
+                atom_indices[-1].append(loaded_indices)
+        itda_similarities = np.zeros(
+            (len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)
         )
 
-# %%
+        for mi, mj, li, lj in tqdm(
+            product(
+                range(len(MODELS)),
+                range(len(MODELS)),
+                range(NUM_LAYERS - 1),
+                range(NUM_LAYERS - 1),
+            ),
+            desc="Calculating ITDA similarities",
+            total=len(MODELS) ** 2 * (NUM_LAYERS - 1) ** 2,
+        ):
+            itda_similarities[mi, mj, li, lj] = get_similarity_measure(
+                atom_indices[mi][li], atom_indices[mj][lj]
+            )
+        os.makedirs("artifacts/similarities", exist_ok=True)
+        np.save(
+            f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{ITDA}.npy",
+            itda_similarities,
+        )
 
-if __name__ == "__main__":
-    # Plot heatmap of the similarities
-    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
-    heatmap = itda_similarities.mean(axis=(0, 1))
-    im = ax.imshow(heatmap, cmap="viridis")
-
-    # # Add values to the heatmap with dynamic text color
-    for i in range(heatmap.shape[0]):
-        for j in range(heatmap.shape[1]):
-            value = heatmap[i, j]
-            # Use white text for dark colors and black for light colors
-            text_color = "white" if value < 0.5 else "black"
-            ax.text(j, i, f"{value:.2f}", ha="center", va="center", color=text_color)
-
-    # Add a colorbar
-    cbar = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_ticks([heatmap.min(), heatmap.max()])
-
-    # Label axes
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Layer")
-
-    # Update ticks to start from 1
-    ax.set_xticks(np.arange(heatmap.shape[1]))
-    ax.set_yticks(np.arange(heatmap.shape[0]))
-    ax.set_xticklabels(np.arange(1, heatmap.shape[1] + 1))
-    ax.set_yticklabels(np.arange(1, heatmap.shape[0] + 1))
-
-    plt.show()
 
 # %%
 
@@ -319,6 +302,8 @@ def linear_cka_torch(X, Y, center_data=True, eps=1e-12):
     if center_data:
         X = X - X.mean(dim=0, keepdim=True)
         Y = Y - Y.mean(dim=0, keepdim=True)
+        X = X / X.norm(dim=0, keepdim=True)
+        Y = Y / Y.norm(dim=0, keepdim=True)
 
     # Numerator: || X^T Y ||_F^2
     numerator = (X.T @ Y).norm(p="fro").pow(2)
@@ -357,6 +342,10 @@ def svcca(X, Y, num_components=20):
     # 1. Mean-center
     X = X - X.mean(axis=0, keepdims=True)
     Y = Y - Y.mean(axis=0, keepdims=True)
+
+    # Normalize
+    X = X / X.norm(dim=0, keepdim=True)
+    Y = Y / Y.norm(dim=0, keepdim=True)
 
     # 2. Truncate to top principal components with SVD
     #    We'll do a truncated SVD by taking the top 'num_components' from the full SVD.
@@ -416,6 +405,10 @@ def svcca_torch(X, Y, num_components=20, eps=1e-12):
     X = X - X.mean(dim=0, keepdim=True)
     Y = Y - Y.mean(dim=0, keepdim=True)
 
+    # normalize 
+    X = X / X.norm(dim=0, keepdim=True)
+    Y = Y / Y.norm(dim=0, keepdim=True)
+
     # 2. Partial SVD (low-rank SVD)
     Ux, Sx, Vx = torch.svd_lowrank(X, q=num_components)
     Uy, Sy, Vy = torch.svd_lowrank(Y, q=num_components)
@@ -455,7 +448,6 @@ def svcca_torch(X, Y, num_components=20, eps=1e-12):
 
 CKA = "cka"
 SVCCA = "svcca"
-ITDA = "itda"
 
 if __name__ == "__main__":
     similarities = {
@@ -464,34 +456,153 @@ if __name__ == "__main__":
         SVCCA: np.zeros((len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)),
     }
 
-    measures = [SVCCA, CKA]
-    for mi, mj, li, lj, measure in tqdm(
-        product(
-            range(len(MODELS)),
-            range(len(MODELS)),
-            range(1, NUM_LAYERS),
-            range(1, NUM_LAYERS),
-            measures,
-        ),
-        desc="Calculating similarities",
-        total=len(MODELS) ** 2 * (NUM_LAYERS - 1) ** 2 * len(measures),
-    ):
-        ai1 = load_activation_dataset(MODELS[mi], li).to(device)
-        ai2 = load_activation_dataset(MODELS[mj], lj).to(device)
+    measures = [CKA, SVCCA]
 
-        if measure == SVCCA:
-            similarity = svcca_torch(ai1, ai2)
-        elif measure == CKA:
-            similarity = linear_cka_torch(ai1, ai2)
-        else:
-            raise ValueError(f"Unknown similarity measure: {measure}")
+    # Calculate the total number of comparisons for the progress bar
+    total_comparisons = (
+        len(measures) * len(MODELS) * len(MODELS) * (NUM_LAYERS - 1) * (NUM_LAYERS - 1)
+    )
 
-        similarities[measure][mi, mj, li - 1, lj - 1] = similarity
+    # This is optimised for the setting where system memory is only enough for
+    # loading a single model's activations into memory.
+    pbar = tqdm(total=total_comparisons, desc="Calculating similarities")
+    for measure in measures:
+        if os.path.exists(
+            f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{measure}.npy"
+        ):
+            similarities[measure] = np.load(
+                f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{measure}.npy"
+            )
+            pbar.update(total_comparisons // 2)
+            continue
+
+        for mi, model_i_name in enumerate(MODELS):
+            model_i_activations = []
+            for li in range(1, NUM_LAYERS):
+                ai_cpu = load_activation_dataset(model_i_name, li)
+                model_i_activations.append(ai_cpu)
+
+            for mj, model_j_name in enumerate(MODELS):
+                for lj in range(1, NUM_LAYERS):
+                    aj_cpu = load_activation_dataset(model_j_name, lj)
+
+                    for li in range(1, NUM_LAYERS):
+                        ai_cpu = model_i_activations[li - 1]
+
+                        ai_gpu = ai_cpu.to(device)
+                        aj_gpu = aj_cpu.to(device)
+
+                        if measure == SVCCA:
+                            similarity = svcca_torch(ai_gpu, aj_gpu)
+                        elif measure == CKA:
+                            similarity = linear_cka_torch(ai_gpu, aj_gpu)
+                        else:
+                            raise ValueError(f"Unknown measure: {measure}")
+
+                        similarities[measure][mi, mj, li - 1, lj - 1] = similarity
+
+                        pbar.update(1)
+
+                        del ai_gpu
+                        del aj_gpu
+                        torch.cuda.empty_cache()
+
+            del model_i_activations
+            torch.cuda.empty_cache()
+
+            os.makedirs("artifacts/similarities", exist_ok=True)
+            np.save(
+                f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{measure}.npy",
+                similarities[measure],
+            )
+    pbar.close()
+
 
 # %%
 
 if __name__ == "__main__":
-    target = np.arange(5).reshape(1, 1, 5) + np.zeros((5, 5, 1), dtype=int)
+    target = np.arange(NUM_LAYERS - 1).reshape(1, 1, NUM_LAYERS - 1) + np.zeros(
+        (len(MODELS), len(MODELS), 1), dtype=int
+    )
     for measure in [ITDA, SVCCA, CKA]:
         sims = similarities[measure].argmax(axis=-1)
         print(f"Accuracy for {measure}", (target == sims).sum() / target.size)
+
+
+# %%
+
+# if __name__ == "__main__":
+#     measures = [SVCCA, CKA, ITDA]
+#     measure_titles = {ITDA: "ITDA", SVCCA: "SVCCA", CKA: "Linear CKA"}
+
+#     # Create a 2x2 grid
+#     size = 8 if USE_GPT2 else 6
+#     wspace = 0.35 if USE_GPT2 else 0.5
+#     fig, axes = plt.subplots(2, 2, figsize=(size, size), gridspec_kw={"wspace": wspace, "hspace": 0.2})
+
+#     # Flatten the axes for easy iteration
+#     axes = axes.flatten()
+
+#     for ax, measure in zip(axes[:3], measures):  # Iterate over the first 3 axes
+#         # Compute the mean heatmap and normalize it
+#         heatmap = similarities[measure].mean(axis=(0, 1))
+
+#         # Plot the heatmap
+#         im = ax.imshow(heatmap, cmap="viridis")
+
+#         # Add values to the heatmap with dynamic text color
+#         # for i in range(heatmap.shape[0]):
+#         #     for j in range(heatmap.shape[1]):
+#         #         value = heatmap[i, j]
+#         #         text_color = "white" if value < 0.5 else "black"
+#         #         ax.text(
+#         #             j, i, f"{value:.2f}", ha="center", va="center", color=text_color
+#         #         )
+
+#         # Add a colorbar to each subplot
+#         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+#         # Set titles and labels
+#         ax.set_title(measure_titles[measure])
+#         ax.set_xlabel("Layer")
+#         ax.set_ylabel("Layer")
+
+#         # Update ticks to start from 1
+#         ax.set_xticks(np.arange(heatmap.shape[1]))
+#         ax.set_yticks(np.arange(heatmap.shape[0]))
+#         ax.set_xticklabels(np.arange(1, heatmap.shape[1] + 1))
+#         ax.set_yticklabels(np.arange(1, heatmap.shape[0] + 1))
+    
+#     fig.tight_layout()
+
+#     # Hide the last (unused) subplot
+#     axes[3].axis("off")
+
+#     # Adjust layout to prevent overlap
+#     plt.tight_layout()
+#     plt.show()
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+if __name__ == "__main__":
+    measures = [SVCCA, CKA, ITDA]
+    measure_titles = {ITDA: "ITDA", SVCCA: "SVCCA", CKA: "Linear CKA"}
+
+    for measure in measures:
+        heatmap = similarities[measure].mean(axis=(0, 1))
+
+        plt.figure(figsize=(4, 4))
+        im = plt.imshow(heatmap, cmap="viridis")
+
+        cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+
+        plt.xlabel("Layer")
+        plt.ylabel("Layer")
+
+        plt.xticks(np.arange(heatmap.shape[1]), np.arange(1, heatmap.shape[1] + 1))
+        plt.yticks(np.arange(heatmap.shape[0]), np.arange(1, heatmap.shape[0] + 1))
+
+        plt.tight_layout()
+        plt.show()
