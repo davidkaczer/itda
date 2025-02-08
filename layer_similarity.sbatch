@@ -11,5 +11,4 @@
 module load cuda/11.3
 source /home3/wclv88/venv/bin/activate
 
-# Example usage: run the "medium" model group
-python train.py --model_group medium
+python layer_similarity.py --model_group medium
