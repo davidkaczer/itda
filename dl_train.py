@@ -1,33 +1,67 @@
-import os
 import argparse
-import yaml
-from typing import Optional, Dict, List
-import torch
-import torch.nn as nn
-import torch.multiprocessing as mp
+import random
+import string
+import os
+import uuid
 from queue import Empty
+from typing import Dict, List, Optional
+
+import torch
+import torch.multiprocessing as mp
+import torch.nn as nn
+import yaml
 from datasets import load_dataset
+from tqdm import tqdm
 from transformer_lens import HookedTransformer
 from transformers import AutoTokenizer
-from tqdm import tqdm
+
 import wandb
 
 
-def new_wandb_process(config, log_queue, entity, project, tags=None):
+def new_wandb_process(id, config, log_queue, entity, project, tags=None):
     """
-    Spawns a new wandb run for a given layer.
-    Continuously pulls logs from log_queue until it sees 'DONE'.
+    Spawns a W&B run for a single layer.
+    Continuously pulls logs from `log_queue` until it sees 'DONE'.
+    Handles 'artifact' messages to upload atoms/atom_indices/metadata.
     """
-    wandb.init(entity=entity, project=project, config=config, name=config["wandb_name"], tags=tags)
+    wandb.init(
+        id=id,
+        entity=entity,
+        project=project,
+        config=config,
+        name=config["wandb_name"],
+        tags=tags,
+    )
     while True:
         try:
             log = log_queue.get(timeout=1)
-            if log == "DONE":
-                break
-            # You may want to ensure each log dict has a 'step' key, or do wandb.log(log, step=log["step"])
-            wandb.log(log)
         except Empty:
             continue
+
+        # Check sentinel
+        if log == "DONE":
+            break
+
+        # Check if the message is an artifact or normal metric
+        if isinstance(log, dict):
+            if log.get("type") == "artifact":
+                # Create artifact with the relevant files
+                artifact_name = f"{config['wandb_name']}_layer_{config['layer']}_final"
+                artifact = wandb.Artifact(name=artifact_name, type="model")
+
+                if "atoms_file" in log and os.path.exists(log["atoms_file"]):
+                    artifact.add_file(log["atoms_file"], name="atoms.pt")
+                if "atom_indices_file" in log and os.path.exists(log["atom_indices_file"]):
+                    artifact.add_file(log["atom_indices_file"], name="atom_indices.pt")
+                if "metadata_file" in log and os.path.exists(log["metadata_file"]):
+                    artifact.add_file(log["metadata_file"], name="metadata.yaml")
+
+                wandb.log_artifact(artifact)
+            else:
+                # Treat as normal W&B metrics
+                wandb.log(log)
+        # else: handle other message types if needed...
+
     wandb.finish()
 
 
@@ -94,10 +128,45 @@ class ITDA(nn.Module):
     def dtype(self):
         return self.atoms.dtype
 
+    @classmethod
+    def from_pretrained(cls, path: str, device: Optional[str] = None) -> "ITDA":
+        """
+        Load a pre-trained ITDA instance (atoms, atom_indices, and metadata)
+        from a directory produced by this training script.
+        """
+        metadata_path = os.path.join(path, "metadata.yaml")
+        atoms_path = os.path.join(path, "atoms.pt")
+        atom_indices_path = os.path.join(path, "atom_indices.pt")
+
+        # Load metadata
+        with open(metadata_path, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        # Load atoms and atom_indices
+        atoms = torch.load(atoms_path, map_location=device)
+        atom_indices = torch.load(atom_indices_path, map_location=device)
+
+        # Pull 'k' from config
+        k = cfg.get("k", 40)
+
+        itda = cls(
+            atoms=atoms,
+            atom_indices=atom_indices,
+            k=k,
+            cfg=cfg,
+        )
+
+        # Move internal tensors to device if requested
+        if device is not None:
+            itda.atoms = itda.atoms.to(device)
+            itda.atom_indices = itda.atom_indices.to(device)
+
+        return itda
+
 
 class MultiLayerITDATrainer:
     """
-    Manages multiple ITDAs (one per layer). Each layer is updated from its activations.
+    Manages multiple ITDAs (one per layer). Each layer is updated from its own activations.
     """
 
     def __init__(
@@ -129,7 +198,6 @@ class MultiLayerITDATrainer:
         self.seed = seed
 
         # Maintain a separate ITDA per layer
-        # Initialize them with empty (0, D) atoms
         self.itdas = {}
         for layer_idx in layers:
             itda = ITDA(
@@ -150,10 +218,9 @@ class MultiLayerITDATrainer:
         for layer_idx, x in activations_dict.items():
             itda = self.itdas[layer_idx]
             B, S, D = x.shape
-            # Flatten
             flatten_x = x.reshape(-1, D).to(itda.dtype)
 
-            # If dictionary is empty (atoms size (0, D)), fix shape
+            # If dictionary is empty, fix shape
             if itda.atoms.size(0) == 0:
                 itda.atoms = torch.empty((0, D), device=self.device)
                 itda.activation_dim = D
@@ -172,9 +239,7 @@ class MultiLayerITDATrainer:
 
                 new_atom_indices = []
                 for row_idx in sorted_idx[:n_to_take]:
-                    match_positions = torch.nonzero(inv_idx == row_idx, as_tuple=True)[
-                        0
-                    ]
+                    match_positions = torch.nonzero(inv_idx == row_idx, as_tuple=True)[0]
                     if len(match_positions) > 0:
                         mp_idx = match_positions[0].item()
                         batch_i = mp_idx // S
@@ -189,9 +254,7 @@ class MultiLayerITDATrainer:
                 )
                 # Concat
                 updated_atoms = torch.cat([itda.atoms, new_rows], dim=0)
-                updated_indices = torch.cat(
-                    [itda.atom_indices, new_atom_indices], dim=0
-                )
+                updated_indices = torch.cat([itda.atom_indices, new_atom_indices], dim=0)
 
                 itda.atoms = updated_atoms
                 itda.atom_indices = updated_indices
@@ -210,7 +273,7 @@ class MultiLayerITDATrainer:
             normalized_recon = recon / norm_recon
             errors = (normalized_x - normalized_recon).pow(2).mean(dim=1)
 
-            # Add new atoms for those above threshold
+            # Add new atoms for items above threshold
             to_add = torch.nonzero(errors > self.loss_threshold, as_tuple=True)[0]
             new_atoms_list = []
             new_indices_list = []
@@ -244,12 +307,12 @@ class MultiLayerITDATrainer:
                 itda.activation_dim = itda.atoms.size(1)
                 itda.normalize_decoder()
 
-            # Reconstruct the ITDA object (to refresh internal state)
+            # Reinitialize the ITDA object to refresh any internal state
             self.itdas[layer_idx] = ITDA(
                 atoms=itda.atoms, atom_indices=itda.atom_indices, k=itda.k
             ).to(device=self.device, dtype=itda.dtype)
 
-            # Save the mean error for logging
+            # Mean error for logging
             all_losses[layer_idx] = errors.mean().item()
 
         return all_losses
@@ -287,34 +350,44 @@ def run_training_loop(
 ):
     """
     Main training loop:
-      - Spawns a separate wandb process+queue per layer
-      - Single forward pass for each step
-      - Logs each layer to its own wandb run
+      - Spawns a separate W&B process+queue per layer (separate run for each).
+      - Each layer logs to its own W&B run.
+      - Saves final artifacts to 'artifacts/runs/{run_id}' for each layer.
     """
 
-    # 1. Prepare separate wandb processes & queues
+    # 1. Prepare W&B processes & local artifact dirs for each layer
     layer_log_queues = {}
     wandb_processes = {}
+    layer_run_dirs = {}
+
     for layer_idx in trainer.layers:
+        # Generate a unique run_id for this layer
+        run_id =  ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        run_dir = os.path.join("artifacts", "runs", run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        layer_run_dirs[layer_idx] = run_dir
+
         # Make a config just for that layer's run
         layer_config = dict(trainer.config)
         layer_config["layer"] = layer_idx
+        # Give each layer a unique run name
         layer_config["wandb_name"] = f"{trainer.wandb_name}_layer_{layer_idx}"
 
-        # Create queue & start process
+        # Create queue & start W&B process
         log_queue = mp.Queue()
         process = mp.Process(
             target=new_wandb_process,
-            args=(layer_config, log_queue, wandb_entity, wandb_project, wandb_tags),
+            args=(run_id, layer_config, log_queue, wandb_entity, wandb_project, wandb_tags),
         )
         process.start()
 
         layer_log_queues[layer_idx] = log_queue
         wandb_processes[layer_idx] = process
 
-    # 2. Build a list of hooks for all layers
+    # 2. Build a list of hook names for the chosen layers
     hook_names = [f"blocks.{layer}.hook_resid_post" for layer in trainer.layers]
 
+    # 3. Run training steps
     progress = tqdm(range(max_steps), desc="Training", unit="step")
     for step in progress:
         batch = []
@@ -336,62 +409,70 @@ def run_training_loop(
             return_tensors="pt",
         ).to(device)
 
-        # 3. One forward pass with caching
         with torch.no_grad():
+            # Forward pass with caching up to the max layer we need
             _, cache = model.run_with_cache(
                 tokens["input_ids"],
                 stop_at_layer=max(trainer.layers) + 1,
                 names_filter=hook_names,
             )
 
-        # 4. Gather all activations in a dict
-        activations_dict = {}
-        for layer_idx in trainer.layers:
-            activations_dict[layer_idx] = cache[f"blocks.{layer_idx}.hook_resid_post"]
+        # Gather each layer’s activation from the cache
+        activations_dict = {
+            layer_idx: cache[f"blocks.{layer_idx}.hook_resid_post"]
+            for layer_idx in trainer.layers
+        }
 
-        # 5. Update all layers at once
+        # Update ITDA for each layer
         layer_losses = trainer.update(step=step, activations_dict=activations_dict)
 
-        # 6. Log each layer's results to its queue
+        # Log metrics to each layer's W&B queue
         for layer_idx in trainer.layers:
-            log = {
+            log_data = {
                 "step": step,
                 "loss": layer_losses[layer_idx],
                 "dict_size": trainer.itdas[layer_idx].atoms.size(0),
             }
-            # You can add more metrics if desired
-            layer_log_queues[layer_idx].put(log)
+            layer_log_queues[layer_idx].put(log_data)
 
-    # 7. Finish: Save final artifacts and signal W&B processes to stop
-    artifacts_dir = "artifacts"
-    os.makedirs(artifacts_dir, exist_ok=True)
-
+    # 4. Finalize: save artifacts for each layer and signal W&B runs to close
     for layer_idx in trainer.layers:
-        # Save each layer's dictionary
-        layer_dir = os.path.join(artifacts_dir, f"layer_{layer_idx}")
-        os.makedirs(layer_dir, exist_ok=True)
+        run_dir = layer_run_dirs[layer_idx]
+        atoms_path = os.path.join(run_dir, "atoms.pt")
+        atom_indices_path = os.path.join(run_dir, "atom_indices.pt")
+        metadata_path = os.path.join(run_dir, "metadata.yaml")
 
-        torch.save(trainer.itdas[layer_idx].atoms, os.path.join(layer_dir, "atoms.pt"))
-        torch.save(
-            trainer.itdas[layer_idx].atom_indices,
-            os.path.join(layer_dir, "atom_indices.pt"),
-        )
+        # Save final dictionary data
+        torch.save(trainer.itdas[layer_idx].atoms, atoms_path)
+        torch.save(trainer.itdas[layer_idx].atom_indices, atom_indices_path)
 
         # Save metadata
         layer_cfg = dict(trainer.config)
         layer_cfg["layer"] = layer_idx
-        with open(os.path.join(layer_dir, "metadata.yaml"), "w") as f:
+        with open(metadata_path, "w") as f:
             yaml.dump(layer_cfg, f)
 
-        # Signal the wandb process to end
+        # Notify W&B process of these artifacts
+        layer_log_queues[layer_idx].put({
+            "type": "artifact",
+            "atoms_file": atoms_path,
+            "atom_indices_file": atom_indices_path,
+            "metadata_file": metadata_path,
+        })
+
+        # Signal that we're done
         layer_log_queues[layer_idx].put("DONE")
-        wandb_processes[layer_idx].join()  # Wait for that process to finish
+        wandb_processes[layer_idx].join()
+
+    print("Training complete.")
+    for lidx, rdir in layer_run_dirs.items():
+        print(f" Layer {lidx} artifacts: {rdir}")
 
 
 def parse_args():
     """
     Example usage:
-    python dl_train.py \
+      python dl_train.py \
         --model_name EleutherAI/pythia-70m-deduped \
         --layers 0,1,2 \
         --dataset_name monology/pile-uncopyrighted \
@@ -406,7 +487,7 @@ def parse_args():
         --device cuda
     """
     parser = argparse.ArgumentParser(
-        description="Multi-layer ITDA Trainer with separate W&B runs"
+        description="Multi-layer ITDA Trainer with separate W&B runs per layer."
     )
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument(
@@ -423,8 +504,8 @@ def parse_args():
     parser.add_argument("--loss_threshold", type=float, required=True)
     parser.add_argument("--k", type=int, default=40)
     parser.add_argument("--max_steps", type=int, default=1000)
-    parser.add_argument("--wandb_project", type=str, default="itda_separate_runs")
-    parser.add_argument("--wandb_entity", type=str, default="")
+    parser.add_argument("--wandb_project", type=str, default="itda")
+    parser.add_argument("--wandb_entity", type=str, default="patrickaaleask")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--submodule_name", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
@@ -432,33 +513,35 @@ def parse_args():
         "--wandb_tags",
         type=str,
         default=None,
-        help="Comma-separated tags for the W&B runs, e.g. 'tag1,tag2'",
+        help="Comma-separated tags, e.g. 'tag1,tag2'.",
     )
     return parser.parse_args()
 
 
-# Hard-coded example of known model dims. Adjust or remove as needed.
+# Example known model dimension dict
 activation_dims = {
     "EleutherAI/pythia-70m-deduped": 512,
     "EleutherAI/pythia-160m-deduped": 768,
-    "google/gemma-2-2b": 2304,
+    # Add your model name -> dimension here
 }
 
+
 if __name__ == "__main__":
-    # If you get pickling errors on some platforms, you may need:
+    # If needed to avoid pickling errors on some platforms:
     # mp.set_start_method("spawn", force=True)
     args = parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Prepare data stream
+    # Prepare data stream from huggingface
     dataset = load_dataset(args.dataset_name, split="train", streaming=True)
     data_stream = (item["text"] for item in dataset)
 
-    # Load model and tokenizer
+    # Load model & tokenizer
     if args.model_name not in activation_dims:
         raise ValueError(
-            f"Unknown activation_dim for model {args.model_name}. Please update `activation_dims` dict."
+            f"Unknown activation_dim for {args.model_name}. "
+            "Please update the 'activation_dims' dictionary."
         )
     activation_dim = activation_dims[args.model_name]
 
@@ -469,7 +552,7 @@ if __name__ == "__main__":
 
     layers_list = [int(x.strip()) for x in args.layers.split(",")]
 
-    # Build the trainer
+    # Build trainer
     trainer = MultiLayerITDATrainer(
         steps=args.max_steps,
         layers=layers_list,
@@ -484,12 +567,12 @@ if __name__ == "__main__":
         seed=args.seed,
     )
 
-    # Parse wandb_tags into a list (if provided)
+    # Optional W&B tags
     wandb_tags = None
-    if args.wandb_tags is not None:
-        wandb_tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+    if args.wandb_tags:
+        wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
 
-    # Run the multi-process training loop
+    # Run training
     run_training_loop(
         trainer=trainer,
         data_stream=data_stream,

@@ -55,10 +55,16 @@ GPT2_MODELS = {
 }
 
 
-def get_layered_runs_for_models(model_names, layer_indices, entity="your-entity", project="example_saes"):
+def get_layered_runs_for_models(
+    model_names,
+    layer_indices,
+    entity="your-entity",
+    project="example_saes",
+    tag="layer_similarity",
+):
     """Fetch finished W&B runs for each (model, layer) combination."""
     api = wandb.Api()
-    runs = api.runs(f"{entity}/{project}", filters={"tags": "layer_similarity"})
+    runs = api.runs(f"{entity}/{project}", filters={"tags": tag})
 
     runs_dict = {
         model_name: {layer: None for layer in layer_indices}
@@ -70,7 +76,7 @@ def get_layered_runs_for_models(model_names, layer_indices, entity="your-entity"
             continue
 
         layer = run.config.get("layer")
-        run_model_name = run.config.get("model", "")
+        run_model_name = run.config.get("lm_name", "")
 
         if layer not in layer_indices:
             continue
@@ -94,7 +100,17 @@ def get_similarity_measure(ai1, ai2):
     return len(ai1s.intersection(ai2s)) / len(ai1s.union(ai2s))
 
 
-def load_activation_dataset(model, layer, activations_base_path, dataset_name, seq_len, batch_size, device, num_examples, num_layers):
+def load_activation_dataset(
+    model,
+    layer,
+    activations_base_path,
+    dataset_name,
+    seq_len,
+    batch_size,
+    device,
+    num_examples,
+    num_layers,
+):
     """
     Load or generate the activation dataset from disk. If it doesn't exist,
     generate using `get_activations_tl()`.
@@ -191,8 +207,8 @@ def linear_regression_r2_torch(X, Y, eps=1e-12):
 
     # Solve least squares: W = pinv(X) * Y
     X_pinv = torch.linalg.pinv(X)  # shape (d_X, N)
-    W = X_pinv @ Y                 # shape (d_X, d_Y)
-    Y_pred = X @ W                 # shape (N, d_Y)
+    W = X_pinv @ Y  # shape (d_X, d_Y)
+    Y_pred = X @ W  # shape (N, d_Y)
 
     # SSE = sum of squared errors
     SSE = (Y - Y_pred).pow(2).sum()
@@ -218,7 +234,9 @@ def main():
     4. Compute CKA, SVCCA, and linear regression R^2 similarities if needed.
     5. Print and plot results.
     """
-    parser = argparse.ArgumentParser(description="Run the ITDA and similarity measurements.")
+    parser = argparse.ArgumentParser(
+        description="Run the ITDA and similarity measurements."
+    )
     parser.add_argument(
         "--model_group",
         type=str,
@@ -347,7 +365,9 @@ def main():
                 artifact = api.artifact(artifact_ref, type="model")
                 artifact_dir = artifact.download()
                 atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
-                loaded_indices = torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
+                loaded_indices = (
+                    torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
+                )
                 atom_indices[-1].append(loaded_indices)
 
         itda_sims = np.zeros((len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1))
@@ -395,7 +415,8 @@ def main():
             model_i_activations = []
             for li in range(1, NUM_LAYERS):
                 ai_cpu = load_activation_dataset(
-                    model_i, li,
+                    model_i,
+                    li,
                     activations_base_path=args.activations_base_path,
                     dataset_name=DATASET,
                     seq_len=SEQ_LEN,
@@ -410,7 +431,8 @@ def main():
                 # For each layer in j, load on the fly
                 for lj in range(1, NUM_LAYERS):
                     aj_cpu = load_activation_dataset(
-                        model_j, lj,
+                        model_j,
+                        lj,
                         activations_base_path=args.activations_base_path,
                         dataset_name=DATASET,
                         seq_len=SEQ_LEN,
