@@ -1,99 +1,77 @@
-# %%
+#!/usr/bin/env python3
+
 import argparse
 import os
 from itertools import product
-from multiprocessing import Pool, cpu_count
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import yaml
 import zarr
+from datasets import load_dataset
+from dictionary_learning.dictionary import Dictionary
+from dl_train import MultiLayerITDATrainer, run_training_loop
+from get_model_activations_transformerlens import get_activations_tl
 from get_model_activations import get_activations_hf
 from tqdm import tqdm
-from train import train_ito_saes
+from transformer_lens import HookedTransformer
+from transformers import AutoModel, AutoTokenizer
 
 import wandb
 
-PYTHIA_MODELS = [
-    "pleask/pythia-14mish-seed_1234",
-    "pleask/pythia-14mish-seed_1337",
-    "pleask/pythia-14mish-seed_2023",
-    "pleask/pythia-14mish-seed_42",
-    "pleask/pythia-14mish-seed_9999",
-]
-PYTHIA_LAYERS = 6
-PYTHIA_TARGET_LOSS = 0.006
 
-GPT2_MODELS = [
-    "stanford-crfm/alias-gpt2-small-x21",
-    "stanford-crfm/battlestar-gpt2-small-x49",
-    "stanford-crfm/caprica-gpt2-small-x81",
-    "stanford-crfm/darkmatter-gpt2-small-x343",
-    "stanford-crfm/expanse-gpt2-small-x777",
-]
-GPT2_LAYERS = 12
-GPT2_TARGET_LOSS = 0.0005
-
-USE_GPT2 = True
-if USE_GPT2:
-    MODELS = GPT2_MODELS
-    NUM_LAYERS = GPT2_LAYERS
-    TARGET_LOSS = GPT2_TARGET_LOSS
-else:
-    MODELS = PYTHIA_MODELS
-    NUM_LAYERS = PYTHIA_LAYERS
-    TARGET_LOSS = PYTHIA_TARGET_LOSS
-
-DATASET = "NeelNanda/pile-10k"
-
-# %%
+# Define GPT-2 model configurations
+GPT2_MODELS = {
+    "small": {
+        "models": [
+            "stanford-crfm/alias-gpt2-small-x21",
+            "stanford-crfm/battlestar-gpt2-small-x49",
+            "stanford-crfm/caprica-gpt2-small-x81",
+            "stanford-crfm/darkmatter-gpt2-small-x343",
+            "stanford-crfm/expanse-gpt2-small-x777",
+        ],
+        "layers": 12,
+        "target_loss": 0.0004,
+        "activation_dim": 768,
+        "batch_size": 128,
+    },
+    "medium": {
+        "models": [
+            "stanford-crfm/arwen-gpt2-medium-x21",
+            "stanford-crfm/beren-gpt2-medium-x49",
+            "stanford-crfm/celebrimbor-gpt2-medium-x81",
+            "stanford-crfm/durin-gpt2-medium-x343",
+            "stanford-crfm/eowyn-gpt2-medium-x777",
+        ],
+        "layers": 24,
+        "target_loss": 0.0004,
+        "activation_dim": 1024,
+        "batch_size": 64,
+    },
+}
 
 
-def get_layered_runs_for_models(
-    model_names, layer_indices, entity="your-entity", project="example_saes"
-):
-    """
-    Query W&B for runs that have the tag 'layer_convergence' in the specified
-    entity/project. Return a dictionary:
-        model_name -> layer -> run
-    containing the latest (highest-step) finished run for each model-layer pair.
-
-    Args:
-        model_names (list of str): List of model name strings to match.
-        layer_indices (list of int): List of layer indices to match.
-        entity (str): The W&B entity (team/user).
-        project (str): The W&B project name.
-
-    Returns:
-        dict: A nested dictionary of the form:
-              {
-                  model_name: {
-                      layer_index: run,
-                      ...
-                  },
-                  ...
-              }
-    """
+def get_layered_runs_for_models(model_names, layer_indices, entity="your-entity", project="example_saes"):
+    """Fetch finished W&B runs for each (model, layer) combination."""
     api = wandb.Api()
-
     runs = api.runs(f"{entity}/{project}", filters={"tags": "layer_similarity"})
 
-    # Initialize a structure to store the best (highest-step) run for each (model_name, layer)
     runs_dict = {
         model_name: {layer: None for layer in layer_indices}
         for model_name in model_names
     }
 
     for run in runs:
-        # Only consider runs that finished successfully
         if run.state != "finished":
             continue
 
-        # Extract layer and model name from run.config
         layer = run.config.get("layer")
         run_model_name = run.config.get("model", "")
 
-        # We only care about the specified layer_indices and model_names
         if layer not in layer_indices:
             continue
         if run_model_name not in model_names:
@@ -104,325 +82,85 @@ def get_layered_runs_for_models(
     return runs_dict
 
 
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    existing_itdas = get_layered_runs_for_models(
-        MODELS,
-        list(range(1, NUM_LAYERS)),
-        entity="patrickaaleask",
-        project="example_saes",
-    )
-
-    for model in MODELS:
-        if not os.path.exists(f"artifacts/data/{model}"):
-            get_activations_hf(
-                model_name=model,
-                dataset_name="NeelNanda/pile-10k",
-                activations_path=f"artifacts/data",
-                seq_len=128,
-                batch_size=256,
-                device=device,
-                num_examples=10_000,
-                revision=None,
-                tokenizer_name="openai-community/gpt2",
-            )
-
-        for layer in range(1, NUM_LAYERS):
-            if (model in existing_itdas) and existing_itdas[model][layer]:
-                print(f"Skipping layer {layer} for model {model}.")
-                continue
-
-            args_dict = {
-                "method": "ito",
-                "model": model,
-                "dataset": "NeelNanda/pile-10k",
-                "layer": layer,
-                "batch_size": 32,
-                "target_loss": TARGET_LOSS,
-                "max_sequences": None,
-                "load_run_id": None,
-                "l0": 40,
-                "seq_len": 128,
-                "skip_validation": True,
-                "max_atoms": 200_000,
-            }
-            args = argparse.Namespace(**args_dict)
-
-            wandb.init(
-                project="example_saes", config=vars(args), tags=["layer_similarity"]
-            )
-            train_ito_saes(args, device)
-            wandb.finish()
-
-# %%
-
-
 def get_similarity_measure(ai1, ai2):
+    """
+    A simplistic measure that treats each row as a "tuple"
+    and computes intersection/union of them. Not a typical
+    measure, but included as in the original code.
+    """
     ai1s = set([tuple(r) for r in ai1.tolist()])
     ai2s = set([tuple(r) for r in ai2.tolist()])
 
     return len(ai1s.intersection(ai2s)) / len(ai1s.union(ai2s))
 
 
-ITDA = "itda"
-
-if __name__ == "__main__":
-    if os.path.exists(
-        f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{ITDA}.npy"
-    ):
-        itda_similarities = np.load(
-            f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{ITDA}.npy"
+def load_activation_dataset(model, layer, activations_base_path, dataset_name, seq_len, batch_size, device, num_examples, num_layers):
+    """
+    Load or generate the activation dataset from disk. If it doesn't exist,
+    generate using `get_activations_tl()`.
+    """
+    activations_path = f"{activations_base_path}/{model}/{dataset_name}"
+    if not os.path.exists(activations_path):
+        os.makedirs(activations_path, exist_ok=True)
+        get_activations_tl(
+            model_name=model,
+            dataset_name=dataset_name,
+            activations_path=activations_path,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            device=device,
+            num_examples=num_examples,
+            layers_str=list(range(num_layers)),
+            tokenizer_name=model,
         )
-    else:
-        api = wandb.Api()
-        atom_indices = []
-        for model in MODELS:
-            atom_indices.append([])
-            for layer in range(1, NUM_LAYERS):
-                run = existing_itdas[model][layer]
-                if not run:
-                    continue
-
-                # Fetch the artifact using the API
-                artifact_ref = f"example_saes/ito_dictionary_{run.id}:latest"
-                artifact = api.artifact(artifact_ref, type="model")
-
-                # Download the artifact (returns the local directory containing artifact files)
-                artifact_dir = artifact.download()
-
-                # Load the file from the downloaded directory
-                atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
-                loaded_indices = (
-                    torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
-                )
-
-                atom_indices[-1].append(loaded_indices)
-        itda_similarities = np.zeros(
-            (len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)
-        )
-
-        for mi, mj, li, lj in tqdm(
-            product(
-                range(len(MODELS)),
-                range(len(MODELS)),
-                range(NUM_LAYERS - 1),
-                range(NUM_LAYERS - 1),
-            ),
-            desc="Calculating ITDA similarities",
-            total=len(MODELS) ** 2 * (NUM_LAYERS - 1) ** 2,
-        ):
-            itda_similarities[mi, mj, li, lj] = get_similarity_measure(
-                atom_indices[mi][li], atom_indices[mj][lj]
-            )
-        os.makedirs("artifacts/similarities", exist_ok=True)
-        np.save(
-            f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{ITDA}.npy",
-            itda_similarities,
-        )
-
-
-# %%
-
-
-def load_activation_dataset(model, layer):
-    activations_path = f"artifacts/data/{model}/{DATASET}"
 
     store = zarr.DirectoryStore(activations_path)
     zarr_group = zarr.group(store=store)
     zarr_activations = zarr_group[f"layer_{layer}"]
 
+    # Flatten to (N, D) shape
     return torch.from_numpy(zarr_activations[:].reshape(-1, zarr_activations.shape[-1]))
-
-
-def linear_cka(X, Y, center_data=True):
-    """
-    Compute the linear CKA (Centered Kernel Alignment) between two sets of activations.
-
-    Parameters
-    ----------
-    X : np.ndarray, shape (n_samples, d_x)
-        Activations for one layer.
-    Y : np.ndarray, shape (n_samples, d_y)
-        Activations for another layer.
-    center_data : bool
-        If True, subtract the mean from each feature in X and Y before computing CKA.
-
-    Returns
-    -------
-    cka_value : float
-        The scalar CKA similarity between X and Y, typically in [0, 1].
-    """
-    # Check that the first dimension (number of samples) matches
-    assert X.shape[0] == Y.shape[0], "X and Y must have the same number of samples."
-
-    # Optionally mean-center each feature
-    if center_data:
-        X = X - X.mean(axis=0, keepdims=True)
-        Y = Y - Y.mean(axis=0, keepdims=True)
-
-    # Numerator: || X^T Y ||_F^2
-    numerator = np.linalg.norm(X.T @ Y, ord="fro") ** 2
-
-    # Denominator: || X^T X ||_F * || Y^T Y ||_F
-    denom_x = np.linalg.norm(X.T @ X, ord="fro")
-    denom_y = np.linalg.norm(Y.T @ Y, ord="fro")
-
-    # To avoid divide-by-zero in degenerate cases, add a small epsilon if needed
-    eps = 1e-12
-    denominator = max(denom_x * denom_y, eps)
-
-    cka_value = numerator / denominator
-    return cka_value
 
 
 def linear_cka_torch(X, Y, center_data=True, eps=1e-12):
     """
-    Compute Linear CKA between two sets of activations, using PyTorch.
-    This version will run on the GPU if X and Y are already on a CUDA device.
-
-    Parameters
-    ----------
-    X : torch.Tensor, shape (n_samples, d_x)
-        Activations for one layer.
-    Y : torch.Tensor, shape (n_samples, d_y)
-        Activations for another layer.
-    center_data : bool
-        If True, subtract the mean from each feature in X and Y before computing CKA.
-    eps : float
-        Small constant added to denominator to avoid divide-by-zero.
-
-    Returns
-    -------
-    cka_value : float
-        The scalar CKA similarity between X and Y, typically in [0, 1].
+    Compute the linear CKA similarity between two sets of activations X and Y.
     """
     assert X.shape[0] == Y.shape[0], "X and Y must have the same number of samples."
-
     if center_data:
         X = X - X.mean(dim=0, keepdim=True)
         Y = Y - Y.mean(dim=0, keepdim=True)
-        X = X / X.norm(dim=0, keepdim=True)
-        Y = Y / Y.norm(dim=0, keepdim=True)
+        X = X / (X.norm(dim=0, keepdim=True) + eps)
+        Y = Y / (Y.norm(dim=0, keepdim=True) + eps)
 
-    # Numerator: || X^T Y ||_F^2
     numerator = (X.T @ Y).norm(p="fro").pow(2)
-
-    # Denominator: || X^T X ||_F * || Y^T Y ||_F
     denom_x = (X.T @ X).norm(p="fro")
     denom_y = (Y.T @ Y).norm(p="fro")
     denominator = torch.maximum(denom_x * denom_y, torch.tensor(eps, device=X.device))
 
     cka_value = numerator / denominator
-    return cka_value.item()  # return as a Python float
-
-
-def svcca(X, Y, num_components=20):
-    """
-    Compute SVCCA similarity between two sets of activations X and Y.
-    1) Reduce dimensionality via SVD to 'num_components'.
-    2) Perform canonical correlation analysis.
-    3) Return the mean of the canonical correlations.
-
-    Parameters
-    ----------
-    X : np.ndarray, shape (n_samples, d_x)
-        Activations for one layer.
-    Y : np.ndarray, shape (n_samples, d_y)
-        Activations for another layer.
-    num_components : int
-        Number of principal components to keep before CCA.
-
-    Returns
-    -------
-    svcca_value : float
-        The mean canonical correlation across the 'num_components' directions.
-        Typically in [0, 1].
-    """
-    # 1. Mean-center
-    X = X - X.mean(axis=0, keepdims=True)
-    Y = Y - Y.mean(axis=0, keepdims=True)
-
-    # Normalize
-    X = X / X.norm(dim=0, keepdim=True)
-    Y = Y / Y.norm(dim=0, keepdim=True)
-
-    # 2. Truncate to top principal components with SVD
-    #    We'll do a truncated SVD by taking the top 'num_components' from the full SVD.
-    Ux, Sx, Vx = np.linalg.svd(X, full_matrices=False)  # X = Ux * diag(Sx) * Vx
-    Uy, Sy, Vy = np.linalg.svd(Y, full_matrices=False)  # Y = Uy * diag(Sy) * Vy
-
-    # Keep top 'num_components'
-    Ux_k = Ux[:, :num_components] * Sx[:num_components]
-    Uy_k = Uy[:, :num_components] * Sy[:num_components]
-
-    # Now X_reduced and Y_reduced are shape (n_samples, num_components)
-    X_reduced = Ux_k
-    Y_reduced = Uy_k
-
-    # 3. Perform classical CCA on the reduced data.
-    #    We'll compute the canonical correlations from the covariance matrices.
-    #    The typical formula for the squared canonical correlations is the eigenvalues of:
-    #         (X^T X)^-1 (X^T Y) (Y^T Y)^-1 (Y^T X)
-
-    # Covariance-like matrices (note: these are "uncentered" because X_reduced, Y_reduced
-    # are already centered).
-    Cxx = X_reduced.T @ X_reduced
-    Cyy = Y_reduced.T @ Y_reduced
-    Cxy = X_reduced.T @ Y_reduced
-
-    # Invert Cxx and Cyy (add small ridge if necessary to avoid singularities)
-    eps = 1e-12
-    Cxx_inv = np.linalg.pinv(Cxx + eps * np.eye(Cxx.shape[0]))
-    Cyy_inv = np.linalg.pinv(Cyy + eps * np.eye(Cyy.shape[0]))
-
-    # Matrix whose eigenvalues give us the squared canonical correlations
-    M = Cxx_inv @ Cxy @ Cyy_inv @ Cxy.T
-
-    # Compute eigenvalues
-    eigvals, _ = np.linalg.eigh(M)
-    # Sort eigenvalues in descending order (largest first)
-    eigvals = np.sort(eigvals)[::-1]
-
-    # Canonical correlations are the sqrt of eigenvalues
-    # (clip to avoid small negative numerical errors)
-    canonical_corrs = np.sqrt(np.clip(eigvals, a_min=0.0, a_max=None))
-
-    # The "number of canonical correlations" is limited by the smaller subspace dimension
-    # We might only consider the top 'num_components' or the number that fits both subspaces.
-    # Typically min(num_components, X_reduced.shape[1], Y_reduced.shape[1])
-    # but X_reduced.shape[1] = num_components by construction, so:
-    k = min(num_components, len(canonical_corrs))
-    top_corrs = canonical_corrs[:k]
-
-    # 4. Average the canonical correlations to get the SVCCA score
-    svcca_value = np.mean(top_corrs)
-    return svcca_value
+    return cka_value.item()
 
 
 def svcca_torch(X, Y, num_components=20, eps=1e-12):
+    """
+    Compute an SVCCA similarity between two sets of activations X and Y.
+    """
     # 1. Mean-center
     X = X - X.mean(dim=0, keepdim=True)
     Y = Y - Y.mean(dim=0, keepdim=True)
 
-    # normalize 
-    X = X / X.norm(dim=0, keepdim=True)
-    Y = Y / Y.norm(dim=0, keepdim=True)
-
-    # 2. Partial SVD (low-rank SVD)
+    # 2. Low-rank SVD to reduce dimensionality
     Ux, Sx, Vx = torch.svd_lowrank(X, q=num_components)
     Uy, Sy, Vy = torch.svd_lowrank(Y, q=num_components)
 
-    # Construct the reduced data
-    # Ux: (n_samples, q), Sx: (q), Vx: (d_x, q)
-    # X ≈ Ux @ diag(Sx) @ Vx.T
-    X_reduced = Ux * Sx  # shape (n_samples, q)
-    Y_reduced = Uy * Sy  # shape (n_samples, q)
+    X_red = Ux * Sx
+    Y_red = Uy * Sy
 
-    # 3. CCA on the reduced data
-    Cxx = X_reduced.T @ X_reduced
-    Cyy = Y_reduced.T @ Y_reduced
-    Cxy = X_reduced.T @ Y_reduced
+    # 3. CCA on reduced data
+    Cxx = X_red.T @ X_red
+    Cyy = Y_red.T @ Y_red
+    Cxy = X_red.T @ Y_red
 
     I_x = eps * torch.eye(Cxx.shape[0], device=X.device)
     I_y = eps * torch.eye(Cyy.shape[0], device=Y.device)
@@ -431,178 +169,331 @@ def svcca_torch(X, Y, num_components=20, eps=1e-12):
     Cyy_inv = torch.linalg.pinv(Cyy + I_y)
 
     M = Cxx_inv @ Cxy @ Cyy_inv @ Cxy.T
-
-    # Eigenvalues => squared canonical correlations
     eigvals, _ = torch.linalg.eigh(M)
     eigvals = eigvals.relu()
 
-    # Sort descending, take square roots
     eigvals_sorted, _ = torch.sort(eigvals, descending=True)
     canonical_corrs = torch.sqrt(eigvals_sorted)
 
     k = min(num_components, canonical_corrs.shape[0])
     svcca_value = canonical_corrs[:k].mean()
-
     return svcca_value.item()
 
 
-CKA = "cka"
-SVCCA = "svcca"
+def linear_regression_r2_torch(X, Y, eps=1e-12):
+    """
+    Compute how well Y can be linearly predicted from X (single global R^2).
+    X: (N, d_X) tensor
+    Y: (N, d_Y) tensor
+    Returns: scalar float R^2 in [0, 1].
+    """
+    assert X.shape[0] == Y.shape[0], "X and Y must have same number of samples."
 
-if __name__ == "__main__":
-    similarities = {
-        ITDA: itda_similarities,
-        CKA: np.zeros((len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)),
-        SVCCA: np.zeros((len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)),
-    }
+    # Solve least squares: W = pinv(X) * Y
+    X_pinv = torch.linalg.pinv(X)  # shape (d_X, N)
+    W = X_pinv @ Y                 # shape (d_X, d_Y)
+    Y_pred = X @ W                 # shape (N, d_Y)
 
-    measures = [CKA, SVCCA]
+    # SSE = sum of squared errors
+    SSE = (Y - Y_pred).pow(2).sum()
 
-    # Calculate the total number of comparisons for the progress bar
-    total_comparisons = (
-        len(measures) * len(MODELS) * len(MODELS) * (NUM_LAYERS - 1) * (NUM_LAYERS - 1)
+    # TSS = total sum of squares around mean(Y)
+    Y_mean = Y.mean(dim=0, keepdim=True)
+    TSS = (Y - Y_mean).pow(2).sum()
+
+    if TSS < eps:
+        # If Y is constant (or near-constant), define R^2 = 1 if SSE is also near 0, else 0
+        return 1.0 if SSE < eps else 0.0
+
+    R2 = 1.0 - (SSE / TSS)
+    return R2.item()
+
+
+def main():
+    """
+    Main entry point for the script. This will:
+    1. Parse command-line arguments.
+    2. Potentially train new ITDA dictionaries for each layer if not found.
+    3. Compute ITDA-based similarities if needed.
+    4. Compute CKA, SVCCA, and linear regression R^2 similarities if needed.
+    5. Print and plot results.
+    """
+    parser = argparse.ArgumentParser(description="Run the ITDA and similarity measurements.")
+    parser.add_argument(
+        "--model_group",
+        type=str,
+        choices=["small", "medium"],
+        default="small",
+        help="Choose which GPT-2 model group to use ('small' or 'medium').",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default="patrickaaleask",
+        help="Entity (user or team) under which the W&B project lives.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="itda",
+        help="Name of the W&B project for logging or fetching runs.",
+    )
+    parser.add_argument(
+        "--activations_base_path",
+        type=str,
+        default="artifacts/data",
+        help="Base path for storing/loading activation data (zarr).",
+    )
+    args = parser.parse_args()
+
+    # Select model config based on the chosen group
+    config = GPT2_MODELS[args.model_group]
+
+    MODELS = config["models"]
+    NUM_LAYERS = config["layers"]
+    TARGET_LOSS = config["target_loss"]
+    ACTIVATION_DIM = config["activation_dim"]
+    BATCH_SIZE = config["batch_size"]
+
+    # Hard-coded dataset and other hyperparams (from original notebook)
+    DATASET = "NeelNanda/pile-10k"
+    SEQ_LEN = 128
+    NUM_EXAMPLES = 10_000
+    WANDB_PROJECT = args.wandb_project  # e.g. "itda"
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 1) Check existing runs (ITDA) on W&B
+    existing_itdas = get_layered_runs_for_models(
+        MODELS,
+        list(range(1, NUM_LAYERS)),
+        entity=args.wandb_entity,
+        project=WANDB_PROJECT,
     )
 
-    # This is optimised for the setting where system memory is only enough for
-    # loading a single model's activations into memory.
-    pbar = tqdm(total=total_comparisons, desc="Calculating similarities")
-    for measure in measures:
-        if os.path.exists(
-            f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{measure}.npy"
-        ):
-            similarities[measure] = np.load(
-                f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{measure}.npy"
-            )
-            pbar.update(total_comparisons // 2)
-            continue
+    # 2) Train new ITDA dictionaries if needed
+    print("==== Checking existing ITDA runs and training if needed... ====")
+    for model_name in MODELS:
+        for layer in range(1, NUM_LAYERS):
+            if (model_name in existing_itdas) and existing_itdas[model_name][layer]:
+                print(f"Skipping layer {layer} for model {model_name} (already done).")
+                continue
 
-        for mi, model_i_name in enumerate(MODELS):
+            print(f"Training ITDA for model={model_name}, layer={layer} ...")
+            trainer_cfg = {
+                "activation_dim": ACTIVATION_DIM,
+                "k": 40,
+                "loss_threshold": TARGET_LOSS,
+                "layers": list(range(1, NUM_LAYERS)),
+                "lm_name": model_name,
+                "device": device,
+                "steps": NUM_EXAMPLES // BATCH_SIZE,
+                "dataset": DATASET,
+                "seq_len": SEQ_LEN,
+                "seed": 0,
+            }
+            trainer = MultiLayerITDATrainer(**trainer_cfg)
+
+            dataset = load_dataset(DATASET, split="train", streaming=True)
+            data_stream = (item["text"] for item in dataset)
+
+            model = HookedTransformer.from_pretrained(model_name, device=device)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            run_training_loop(
+                trainer=trainer,
+                data_stream=data_stream,
+                tokenizer=tokenizer,
+                model=model,
+                max_steps=trainer_cfg["steps"],
+                batch_size=BATCH_SIZE,
+                seq_len=trainer_cfg["seq_len"],
+                device=device,
+                wandb_project=WANDB_PROJECT,
+                wandb_entity=args.wandb_entity,
+                wandb_tags=["layer_similarity"],
+            )
+
+    print("==== Finished (or skipped) all needed ITDA training. ====")
+
+    # 3) Compute ITDA-based similarities if needed
+    ITDA = "itda"
+    similarities = {}
+
+    def load_itda_similarities():
+        """
+        Either load from disk if present or compute from W&B artifacts.
+        """
+        itda_path = f"artifacts/similarities/{args.model_group}_{ITDA}.npy"
+        if os.path.exists(itda_path):
+            print(f"Loading ITDA similarities from {itda_path}...")
+            return np.load(itda_path)
+
+        # If not found, compute from artifacts
+        print("Computing ITDA similarities from W&B artifacts...")
+        api = wandb.Api()
+        atom_indices = []
+        for model in MODELS:
+            atom_indices.append([])
+            for layer in range(1, NUM_LAYERS):
+                run = existing_itdas[model][layer]
+                if not run:
+                    atom_indices[-1].append(None)
+                    continue
+
+                artifact_ref = f"{WANDB_PROJECT}/ito_dictionary_{run.id}:latest"
+                artifact = api.artifact(artifact_ref, type="model")
+                artifact_dir = artifact.download()
+                atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
+                loaded_indices = torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
+                atom_indices[-1].append(loaded_indices)
+
+        itda_sims = np.zeros((len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1))
+        for mi, mj, li, lj in product(
+            range(len(MODELS)),
+            range(len(MODELS)),
+            range(NUM_LAYERS - 1),
+            range(NUM_LAYERS - 1),
+        ):
+            # If either is None, similarity is 0 or unknown
+            if (atom_indices[mi][li] is None) or (atom_indices[mj][lj] is None):
+                itda_sims[mi, mj, li, lj] = 0.0
+            else:
+                itda_sims[mi, mj, li, lj] = get_similarity_measure(
+                    atom_indices[mi][li],
+                    atom_indices[mj][lj],
+                )
+        os.makedirs("artifacts/similarities", exist_ok=True)
+        np.save(itda_path, itda_sims)
+        return itda_sims
+
+    similarities[ITDA] = load_itda_similarities()
+
+    # 4) Compute CKA, SVCCA, and linear reg R^2 similarities if needed
+    CKA = "cka"
+    SVCCA = "svcca"
+    LINREG = "linreg_r2"
+
+    # Initialize holders
+    for measure in [CKA, SVCCA, LINREG]:
+        shape = (len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)
+        similarities[measure] = np.zeros(shape)
+
+    # We'll check if each measure is already saved. If so, load it; otherwise compute.
+    def compute_or_load_measure(measure):
+        out_path = f"artifacts/similarities/{args.model_group}_{measure}.npy"
+        if os.path.exists(out_path):
+            print(f"Loading {measure.upper()} from {out_path}...")
+            return np.load(out_path)
+
+        print(f"Computing {measure.upper()} similarities...")
+        # Pre-load activations for model_i to avoid repeated disk access
+        for mi, model_i in enumerate(MODELS):
+            # Load all layers' activations once for model_i
             model_i_activations = []
             for li in range(1, NUM_LAYERS):
-                ai_cpu = load_activation_dataset(model_i_name, li)
+                ai_cpu = load_activation_dataset(
+                    model_i, li,
+                    activations_base_path=args.activations_base_path,
+                    dataset_name=DATASET,
+                    seq_len=SEQ_LEN,
+                    batch_size=BATCH_SIZE,
+                    device=device,
+                    num_examples=NUM_EXAMPLES,
+                    num_layers=NUM_LAYERS,
+                )
                 model_i_activations.append(ai_cpu)
 
-            for mj, model_j_name in enumerate(MODELS):
+            for mj, model_j in enumerate(MODELS):
+                # For each layer in j, load on the fly
                 for lj in range(1, NUM_LAYERS):
-                    aj_cpu = load_activation_dataset(model_j_name, lj)
+                    aj_cpu = load_activation_dataset(
+                        model_j, lj,
+                        activations_base_path=args.activations_base_path,
+                        dataset_name=DATASET,
+                        seq_len=SEQ_LEN,
+                        batch_size=BATCH_SIZE,
+                        device=device,
+                        num_examples=NUM_EXAMPLES,
+                        num_layers=NUM_LAYERS,
+                    )
+                    aj_gpu = aj_cpu.to(device)
 
                     for li in range(1, NUM_LAYERS):
                         ai_cpu = model_i_activations[li - 1]
-
                         ai_gpu = ai_cpu.to(device)
-                        aj_gpu = aj_cpu.to(device)
 
                         if measure == SVCCA:
-                            similarity = svcca_torch(ai_gpu, aj_gpu)
+                            sim = svcca_torch(ai_gpu, aj_gpu)
                         elif measure == CKA:
-                            similarity = linear_cka_torch(ai_gpu, aj_gpu)
+                            sim = linear_cka_torch(ai_gpu, aj_gpu)
+                        elif measure == LINREG:
+                            sim = linear_regression_r2_torch(ai_gpu, aj_gpu)
                         else:
                             raise ValueError(f"Unknown measure: {measure}")
 
-                        similarities[measure][mi, mj, li - 1, lj - 1] = similarity
-
-                        pbar.update(1)
+                        similarities[measure][mi, mj, li - 1, lj - 1] = sim
 
                         del ai_gpu
-                        del aj_gpu
                         torch.cuda.empty_cache()
+
+                    del aj_gpu
+                    torch.cuda.empty_cache()
 
             del model_i_activations
             torch.cuda.empty_cache()
 
+            # Save partial results after finishing each model_i
             os.makedirs("artifacts/similarities", exist_ok=True)
-            np.save(
-                f"artifacts/similarities/{'gpt2' if USE_GPT2 else 'pythia'}_{measure}.npy",
-                similarities[measure],
-            )
-    pbar.close()
+            np.save(out_path, similarities[measure])
 
+        return similarities[measure]
 
-# %%
+    # Actually run the computations for each measure
+    for measure in [CKA, SVCCA, LINREG]:
+        similarities[measure] = compute_or_load_measure(measure)
 
-if __name__ == "__main__":
-    target = np.arange(NUM_LAYERS - 1).reshape(1, 1, NUM_LAYERS - 1) + np.zeros(
-        (len(MODELS), len(MODELS), 1), dtype=int
-    )
-    for measure in [ITDA, SVCCA, CKA]:
+    # 5) Simple evaluation of alignment across diagonal layers
+    print("\n==== Accuracy of layer alignment by argmax similarity ====")
+    target = np.arange(NUM_LAYERS - 1).reshape(1, 1, NUM_LAYERS - 1)
+    target = target + np.zeros((len(MODELS), len(MODELS), 1), dtype=int)
+
+    for measure in [ITDA, SVCCA, CKA, LINREG]:
         sims = similarities[measure].argmax(axis=-1)
-        print(f"Accuracy for {measure}", (target == sims).sum() / target.size)
+        accuracy = (target == sims).sum() / target.size
+        print(f"{measure.upper()} accuracy: {accuracy:.4f}")
 
+    # 6) Plot the average similarity across (model_i, model_j)
+    print("\n==== Plotting average similarity maps ====")
+    measure_titles = {
+        ITDA: "ITDA",
+        SVCCA: "SVCCA",
+        CKA: "Linear CKA",
+        LINREG: "Linear Regression R²",
+    }
 
-# %%
-
-# if __name__ == "__main__":
-#     measures = [SVCCA, CKA, ITDA]
-#     measure_titles = {ITDA: "ITDA", SVCCA: "SVCCA", CKA: "Linear CKA"}
-
-#     # Create a 2x2 grid
-#     size = 8 if USE_GPT2 else 6
-#     wspace = 0.35 if USE_GPT2 else 0.5
-#     fig, axes = plt.subplots(2, 2, figsize=(size, size), gridspec_kw={"wspace": wspace, "hspace": 0.2})
-
-#     # Flatten the axes for easy iteration
-#     axes = axes.flatten()
-
-#     for ax, measure in zip(axes[:3], measures):  # Iterate over the first 3 axes
-#         # Compute the mean heatmap and normalize it
-#         heatmap = similarities[measure].mean(axis=(0, 1))
-
-#         # Plot the heatmap
-#         im = ax.imshow(heatmap, cmap="viridis")
-
-#         # Add values to the heatmap with dynamic text color
-#         # for i in range(heatmap.shape[0]):
-#         #     for j in range(heatmap.shape[1]):
-#         #         value = heatmap[i, j]
-#         #         text_color = "white" if value < 0.5 else "black"
-#         #         ax.text(
-#         #             j, i, f"{value:.2f}", ha="center", va="center", color=text_color
-#         #         )
-
-#         # Add a colorbar to each subplot
-#         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-#         # Set titles and labels
-#         ax.set_title(measure_titles[measure])
-#         ax.set_xlabel("Layer")
-#         ax.set_ylabel("Layer")
-
-#         # Update ticks to start from 1
-#         ax.set_xticks(np.arange(heatmap.shape[1]))
-#         ax.set_yticks(np.arange(heatmap.shape[0]))
-#         ax.set_xticklabels(np.arange(1, heatmap.shape[1] + 1))
-#         ax.set_yticklabels(np.arange(1, heatmap.shape[0] + 1))
-    
-#     fig.tight_layout()
-
-#     # Hide the last (unused) subplot
-#     axes[3].axis("off")
-
-#     # Adjust layout to prevent overlap
-#     plt.tight_layout()
-#     plt.show()
-
-
-import matplotlib.pyplot as plt
-import numpy as np
-
-if __name__ == "__main__":
-    measures = [SVCCA, CKA, ITDA]
-    measure_titles = {ITDA: "ITDA", SVCCA: "SVCCA", CKA: "Linear CKA"}
-
-    for measure in measures:
+    for measure in [SVCCA, CKA, ITDA, LINREG]:
         heatmap = similarities[measure].mean(axis=(0, 1))
-
         plt.figure(figsize=(4, 4))
         im = plt.imshow(heatmap, cmap="viridis")
-
+        plt.title(measure_titles[measure])
         cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+        cbar.set_label("Similarity", rotation=270, labelpad=15)
 
         plt.xlabel("Layer")
         plt.ylabel("Layer")
 
-        plt.xticks(np.arange(heatmap.shape[1]), np.arange(1, heatmap.shape[1] + 1))
-        plt.yticks(np.arange(heatmap.shape[0]), np.arange(1, heatmap.shape[0] + 1))
+        ticks = np.arange(heatmap.shape[0])
+        plt.xticks(ticks, ticks + 1)
+        plt.yticks(ticks, ticks + 1)
 
         plt.tight_layout()
+        # If you want to save instead of show, do:
+        # plt.savefig(f"artifacts/similarities/{measure}_{args.model_group}.png")
         plt.show()
+
+
+if __name__ == "__main__":
+    main()
