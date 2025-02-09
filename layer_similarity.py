@@ -292,47 +292,49 @@ def main():
     # 2) Train new ITDA dictionaries if needed
     print("==== Checking existing ITDA runs and training if needed... ====")
     for model_name in MODELS:
-        for layer in range(1, NUM_LAYERS):
-            if (model_name in existing_itdas) and existing_itdas[model_name][layer]:
-                print(f"Skipping layer {layer} for model {model_name} (already done).")
-                continue
+        if model_name not in existing_itdas:
+            train_layers = list(range(1, NUM_LAYERS))
+        else:
+            train_layers = [
+                layer for layer in range(1, NUM_LAYERS) if not existing_itdas[model_name][layer]
+            ]
 
-            print(f"Training ITDA for model={model_name}, layer={layer} ...")
-            trainer_cfg = {
-                "activation_dim": ACTIVATION_DIM,
-                "k": 40,
-                "loss_threshold": TARGET_LOSS,
-                "layers": list(range(1, NUM_LAYERS)),
-                "lm_name": model_name,
-                "device": device,
-                "steps": NUM_EXAMPLES // BATCH_SIZE,
-                "dataset": DATASET,
-                "seq_len": SEQ_LEN,
-                "seed": 0,
-            }
-            trainer = MultiLayerITDATrainer(**trainer_cfg)
+        print(f"Training ITDA for model={model_name}, layers={train_layers} ...")
+        trainer_cfg = {
+            "activation_dim": ACTIVATION_DIM,
+            "k": 40,
+            "loss_threshold": TARGET_LOSS,
+            "layers": train_layers,
+            "lm_name": model_name,
+            "device": device,
+            "steps": NUM_EXAMPLES // BATCH_SIZE,
+            "dataset": DATASET,
+            "seq_len": SEQ_LEN,
+            "seed": 0,
+        }
+        trainer = MultiLayerITDATrainer(**trainer_cfg)
 
-            dataset = load_dataset(DATASET, split="train", streaming=True)
-            data_stream = (item["text"] for item in dataset)
+        dataset = load_dataset(DATASET, split="train", streaming=True)
+        data_stream = (item["text"] for item in dataset)
 
-            model = HookedTransformer.from_pretrained(model_name, device=device)
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+        model = HookedTransformer.from_pretrained(model_name, device=device)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-            run_training_loop(
-                trainer=trainer,
-                data_stream=data_stream,
-                tokenizer=tokenizer,
-                model=model,
-                max_steps=trainer_cfg["steps"],
-                batch_size=BATCH_SIZE,
-                seq_len=trainer_cfg["seq_len"],
-                device=device,
-                wandb_project=WANDB_PROJECT,
-                wandb_entity=args.wandb_entity,
-                wandb_tags=["layer_similarity"],
-            )
+        run_training_loop(
+            trainer=trainer,
+            data_stream=data_stream,
+            tokenizer=tokenizer,
+            model=model,
+            max_steps=trainer_cfg["steps"],
+            batch_size=BATCH_SIZE,
+            seq_len=trainer_cfg["seq_len"],
+            device=device,
+            wandb_project=WANDB_PROJECT,
+            wandb_entity=args.wandb_entity,
+            wandb_tags=["layer_similarity"],
+        )
 
     print("==== Finished (or skipped) all needed ITDA training. ====")
 
