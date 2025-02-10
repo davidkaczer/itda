@@ -64,8 +64,6 @@ def get_layered_runs_for_models(
 ):
     """Fetch finished W&B runs for each (model, layer) combination."""
     api = wandb.Api()
-    # Need created_at as a workaround for missing runs
-    # https://github.com/wandb/wandb/issues/7666
     runs = api.runs(f"{entity}/{project}", order="+created_at")
 
     runs_dict = {
@@ -77,7 +75,6 @@ def get_layered_runs_for_models(
         layer = run.config.get("layer")
         run_model_name = run.config.get("lm_name", "")
 
-        # For some reason passing the tags into api.runs skips some of the runs
         if tag not in run.tags:
             continue
         if run.state != "finished":
@@ -229,15 +226,178 @@ def linear_regression_r2_torch(X, Y, eps=1e-12):
     return R2.item()
 
 
-def main():
+def get_atom_indices_from_wandb_run(run, wandb_project):
+    api = wandb.Api()
+    artifact_ref = [a.name for a in run.logged_artifacts()]
+    if len(artifact_ref) != 1:
+        raise ValueError("Expected exactly one artifact in the run.")
+    artifact_ref = f"{wandb_project}/{artifact_ref[0]}"
+    artifact = api.artifact(artifact_ref, type="model")
+    artifact_dir = artifact.download()
+    atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
+    loaded_indices = torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
+    return loaded_indices
+
+
+def load_itda_similarities(
+    models,
+    existing_itdas,
+    wandb_project,
+    model_group,
+    num_layers,
+    itda_label="itda",
+):
     """
-    Main entry point for the script. This will:
-    1. Parse command-line arguments.
-    2. Potentially train new ITDA dictionaries for each layer if not found.
-    3. Compute ITDA-based similarities if needed.
-    4. Compute CKA, SVCCA, and linear regression R^2 similarities if needed.
-    5. Print and plot results.
+    Load or compute ITDA-based similarities (intersection-over-union of learned atom indices).
+    If the .npy file is found, load it; otherwise compute from W&B artifacts.
     """
+    import wandb
+
+    itda_path = f"artifacts/similarities/{model_group}_{itda_label}.npy"
+    if os.path.exists(itda_path):
+        print(f"Loading ITDA similarities from {itda_path}...")
+        return np.load(itda_path)
+
+    # Not found; compute from W&B artifacts
+    print("Computing ITDA similarities from W&B artifacts...")
+
+    atom_indices = []
+    for model in models:
+        atom_indices.append([])
+        for layer in range(1, num_layers):
+            run = existing_itdas[model][layer]
+            if not run:
+                atom_indices[-1].append(None)
+                continue
+
+            try:
+                loaded_indices = get_atom_indices_from_wandb_run(run, wandb_project)
+            except ValueError as e:
+                raise ValueError(e, f"Error loading atom indices for {model} layer {layer}")
+            atom_indices[-1].append(loaded_indices)
+
+    # Shape: (len(models), len(models), num_layers-1, num_layers-1)
+    itda_sims = np.zeros((len(models), len(models), num_layers - 1, num_layers - 1))
+    for mi, mj, li, lj in product(
+        range(len(models)),
+        range(len(models)),
+        range(num_layers - 1),
+        range(num_layers - 1),
+    ):
+        # If either is None, similarity is 0 or unknown
+        if (atom_indices[mi][li] is None) or (atom_indices[mj][lj] is None):
+            itda_sims[mi, mj, li, lj] = 0.0
+        else:
+            itda_sims[mi, mj, li, lj] = get_similarity_measure(
+                atom_indices[mi][li],
+                atom_indices[mj][lj],
+            )
+
+    os.makedirs("artifacts/similarities", exist_ok=True)
+    np.save(itda_path, itda_sims)
+    return itda_sims
+
+
+def compute_or_load_measure(
+    measure,
+    models,
+    num_layers,
+    dataset,
+    device,
+    batch_size,
+    seq_len,
+    num_examples,
+    model_group,
+    activations_base_path,
+):
+    """
+    Compute or load the similarity measure (CKA, SVCCA, or linreg R^2) for each
+    (model_i, model_j, layer_i, layer_j). Returns a 4D numpy array of shape:
+    (len(models), len(models), num_layers-1, num_layers-1).
+
+    If a cached .npy file is found, loads it. Otherwise, computes from scratch
+    using the activation datasets on disk (or generating them if missing).
+    """
+    measure_path = f"artifacts/similarities/{model_group}_{measure}.npy"
+    if os.path.exists(measure_path):
+        print(f"Loading {measure.upper()} from {measure_path}...")
+        return np.load(measure_path)
+
+    print(f"Computing {measure.upper()} similarities...")
+
+    # Prepare an empty array for this measure
+    measure_array = np.zeros((len(models), len(models), num_layers - 1, num_layers - 1))
+
+    # Pre-load activations for model_i to avoid repeated disk access
+    for mi, model_i in enumerate(models):
+        # Load all layers' activations once for model_i
+        model_i_activations = []
+        for li in range(1, num_layers):
+            ai_cpu = load_activation_dataset(
+                model_i,
+                li,
+                activations_base_path=activations_base_path,
+                dataset_name=dataset,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device,
+                num_examples=num_examples,
+                num_layers=num_layers,
+            )
+            model_i_activations.append(ai_cpu)
+
+        for mj, model_j in enumerate(models):
+            for lj in range(1, num_layers):
+                aj_cpu = load_activation_dataset(
+                    model_j,
+                    lj,
+                    activations_base_path=activations_base_path,
+                    dataset_name=dataset,
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    device=device,
+                    num_examples=num_examples,
+                    num_layers=num_layers,
+                )
+                aj_gpu = aj_cpu.to(device)
+
+                for li in range(1, num_layers):
+                    ai_cpu = model_i_activations[li - 1]
+                    ai_gpu = ai_cpu.to(device)
+
+                    if measure == "svcca":
+                        sim = svcca_torch(ai_gpu, aj_gpu)
+                    elif measure == "cka":
+                        sim = linear_cka_torch(ai_gpu, aj_gpu)
+                    elif measure == "linreg_r2":
+                        sim = linear_regression_r2_torch(ai_gpu, aj_gpu)
+                    else:
+                        raise ValueError(f"Unknown measure: {measure}")
+
+                    measure_array[mi, mj, li - 1, lj - 1] = sim
+
+                    del ai_gpu
+                    torch.cuda.empty_cache()
+
+                del aj_gpu
+                torch.cuda.empty_cache()
+
+        del model_i_activations
+        torch.cuda.empty_cache()
+
+        # Save partial results after finishing each model_i
+        os.makedirs("artifacts/similarities", exist_ok=True)
+        np.save(measure_path, measure_array)
+
+    return measure_array
+
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.set_grad_enabled(False)
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+
     parser = argparse.ArgumentParser(
         description="Run the ITDA and similarity measurements."
     )
@@ -350,145 +510,34 @@ def main():
     ITDA = "itda"
     similarities = {}
 
-    def load_itda_similarities():
-        """
-        Either load from disk if present or compute from W&B artifacts.
-        """
-        itda_path = f"artifacts/similarities/{args.model_group}_{ITDA}.npy"
-        if os.path.exists(itda_path):
-            print(f"Loading ITDA similarities from {itda_path}...")
-            return np.load(itda_path)
-
-        # If not found, compute from artifacts
-        print("Computing ITDA similarities from W&B artifacts...")
-        api = wandb.Api()
-        atom_indices = []
-        for model in MODELS:
-            atom_indices.append([])
-            for layer in range(1, NUM_LAYERS):
-                run = existing_itdas[model][layer]
-                if not run:
-                    atom_indices[-1].append(None)
-                    continue
-
-                artifact_ref = [a.name for a in run.logged_artifacts()]
-                if len(artifact_ref) != 1:
-                    raise ValueError(f"Multiple artifacts found for {model}, layer {layer}")
-                artifact_ref = f"{WANDB_PROJECT}/{artifact_ref[0]}"
-                artifact = api.artifact(artifact_ref, type="model")
-                artifact_dir = artifact.download()
-                atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
-                loaded_indices = (
-                    torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
-                )
-                atom_indices[-1].append(loaded_indices)
-
-        itda_sims = np.zeros((len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1))
-        for mi, mj, li, lj in product(
-            range(len(MODELS)),
-            range(len(MODELS)),
-            range(NUM_LAYERS - 1),
-            range(NUM_LAYERS - 1),
-        ):
-            # If either is None, similarity is 0 or unknown
-            if (atom_indices[mi][li] is None) or (atom_indices[mj][lj] is None):
-                itda_sims[mi, mj, li, lj] = 0.0
-            else:
-                itda_sims[mi, mj, li, lj] = get_similarity_measure(
-                    atom_indices[mi][li],
-                    atom_indices[mj][lj],
-                )
-        os.makedirs("artifacts/similarities", exist_ok=True)
-        np.save(itda_path, itda_sims)
-        return itda_sims
-
-    similarities[ITDA] = load_itda_similarities()
+    similarities[ITDA] = load_itda_similarities(
+        models=MODELS,
+        existing_itdas=existing_itdas,
+        wandb_project=WANDB_PROJECT,
+        model_group=args.model_group,
+        num_layers=NUM_LAYERS,
+        itda_label=ITDA,
+    )
 
     # 4) Compute CKA, SVCCA, and linear reg R^2 similarities if needed
     CKA = "cka"
     SVCCA = "svcca"
     LINREG = "linreg_r2"
 
-    # Initialize holders
+    # Prepare placeholders in a dictionary for each measure
     for measure in [CKA, SVCCA, LINREG]:
-        shape = (len(MODELS), len(MODELS), NUM_LAYERS - 1, NUM_LAYERS - 1)
-        similarities[measure] = np.zeros(shape)
-
-    # We'll check if each measure is already saved. If so, load it; otherwise compute.
-    def compute_or_load_measure(measure):
-        out_path = f"artifacts/similarities/{args.model_group}_{measure}.npy"
-        if os.path.exists(out_path):
-            print(f"Loading {measure.upper()} from {out_path}...")
-            return np.load(out_path)
-
-        print(f"Computing {measure.upper()} similarities...")
-        # Pre-load activations for model_i to avoid repeated disk access
-        for mi, model_i in enumerate(MODELS):
-            # Load all layers' activations once for model_i
-            model_i_activations = []
-            for li in range(1, NUM_LAYERS):
-                ai_cpu = load_activation_dataset(
-                    model_i,
-                    li,
-                    activations_base_path=args.activations_base_path,
-                    dataset_name=DATASET,
-                    seq_len=SEQ_LEN,
-                    batch_size=BATCH_SIZE,
-                    device=device,
-                    num_examples=NUM_EXAMPLES,
-                    num_layers=NUM_LAYERS,
-                )
-                model_i_activations.append(ai_cpu)
-
-            for mj, model_j in enumerate(MODELS):
-                # For each layer in j, load on the fly
-                for lj in range(1, NUM_LAYERS):
-                    aj_cpu = load_activation_dataset(
-                        model_j,
-                        lj,
-                        activations_base_path=args.activations_base_path,
-                        dataset_name=DATASET,
-                        seq_len=SEQ_LEN,
-                        batch_size=BATCH_SIZE,
-                        device=device,
-                        num_examples=NUM_EXAMPLES,
-                        num_layers=NUM_LAYERS,
-                    )
-                    aj_gpu = aj_cpu.to(device)
-
-                    for li in range(1, NUM_LAYERS):
-                        ai_cpu = model_i_activations[li - 1]
-                        ai_gpu = ai_cpu.to(device)
-
-                        if measure == SVCCA:
-                            sim = svcca_torch(ai_gpu, aj_gpu)
-                        elif measure == CKA:
-                            sim = linear_cka_torch(ai_gpu, aj_gpu)
-                        elif measure == LINREG:
-                            sim = linear_regression_r2_torch(ai_gpu, aj_gpu)
-                        else:
-                            raise ValueError(f"Unknown measure: {measure}")
-
-                        similarities[measure][mi, mj, li - 1, lj - 1] = sim
-
-                        del ai_gpu
-                        torch.cuda.empty_cache()
-
-                    del aj_gpu
-                    torch.cuda.empty_cache()
-
-            del model_i_activations
-            torch.cuda.empty_cache()
-
-            # Save partial results after finishing each model_i
-            os.makedirs("artifacts/similarities", exist_ok=True)
-            np.save(out_path, similarities[measure])
-
-        return similarities[measure]
-
-    # Actually run the computations for each measure
-    for measure in [CKA, SVCCA, LINREG]:
-        similarities[measure] = compute_or_load_measure(measure)
+        similarities[measure] = compute_or_load_measure(
+            measure=measure,
+            models=MODELS,
+            num_layers=NUM_LAYERS,
+            dataset=DATASET,
+            device=device,
+            batch_size=BATCH_SIZE,
+            seq_len=SEQ_LEN,
+            num_examples=NUM_EXAMPLES,
+            model_group=args.model_group,
+            activations_base_path=args.activations_base_path,
+        )
 
     # 5) Simple evaluation of alignment across diagonal layers
     print("\n==== Accuracy of layer alignment by argmax similarity ====")
@@ -526,7 +575,3 @@ def main():
 
         plt.tight_layout()
         plt.savefig(f"artifacts/similarities/{measure}_{args.model_group}.png")
-
-
-if __name__ == "__main__":
-    main()
