@@ -51,7 +51,9 @@ def new_wandb_process(id, config, log_queue, entity, project, tags=None):
 
                 if "atoms_file" in log and os.path.exists(log["atoms_file"]):
                     artifact.add_file(log["atoms_file"], name="atoms.pt")
-                if "atom_indices_file" in log and os.path.exists(log["atom_indices_file"]):
+                if "atom_indices_file" in log and os.path.exists(
+                    log["atom_indices_file"]
+                ):
                     artifact.add_file(log["atom_indices_file"], name="atom_indices.pt")
                 if "metadata_file" in log and os.path.exists(log["metadata_file"]):
                     artifact.add_file(log["metadata_file"], name="metadata.yaml")
@@ -143,8 +145,10 @@ class ITDA(nn.Module):
             cfg = yaml.safe_load(f)
 
         # Load atoms and atom_indices
-        atoms = torch.load(atoms_path, map_location=device)
-        atom_indices = torch.load(atom_indices_path, map_location=device)
+        atoms = torch.load(atoms_path, map_location=device, weights_only=True)
+        atom_indices = torch.load(
+            atom_indices_path, map_location=device, weights_only=True
+        )
 
         # Pull 'k' from config
         k = cfg.get("k", 40)
@@ -162,6 +166,41 @@ class ITDA(nn.Module):
             itda.atom_indices = itda.atom_indices.to(device)
 
         return itda
+
+    @property
+    def W_dec(self):
+        return self.atoms
+
+    def __call__(self, x):
+        acts = self.encode(x)
+        return self.decode(acts)
+
+    @property
+    def W_enc(self):
+        # necessary for running core evals with sae bench
+        return torch.zeros(
+            (self.atoms.size(1), self.atoms.size(0)), device=self.atoms.device
+        )
+
+    @property
+    def device(self):
+        return self.atoms.device
+
+    @property
+    def dtype(self):
+        return self.atoms.dtype
+
+    def to(self, device=None, dtype=None):
+        if device:
+            self.atoms = self.atoms.to(device)
+        if dtype:
+            self.atoms = self.atoms.to(dtype)
+        return self
+
+    def normalize_decoder(self):
+        norms = torch.norm(self.atoms, dim=1)
+        self.atoms /= norms[:, None]
+        return self
 
 
 class MultiLayerITDATrainer:
@@ -239,7 +278,9 @@ class MultiLayerITDATrainer:
 
                 new_atom_indices = []
                 for row_idx in sorted_idx[:n_to_take]:
-                    match_positions = torch.nonzero(inv_idx == row_idx, as_tuple=True)[0]
+                    match_positions = torch.nonzero(inv_idx == row_idx, as_tuple=True)[
+                        0
+                    ]
                     if len(match_positions) > 0:
                         mp_idx = match_positions[0].item()
                         batch_i = mp_idx // S
@@ -254,7 +295,9 @@ class MultiLayerITDATrainer:
                 )
                 # Concat
                 updated_atoms = torch.cat([itda.atoms, new_rows], dim=0)
-                updated_indices = torch.cat([itda.atom_indices, new_atom_indices], dim=0)
+                updated_indices = torch.cat(
+                    [itda.atom_indices, new_atom_indices], dim=0
+                )
 
                 itda.atoms = updated_atoms
                 itda.atom_indices = updated_indices
@@ -362,7 +405,7 @@ def run_training_loop(
 
     for layer_idx in trainer.layers:
         # Generate a unique run_id for this layer
-        run_id =  ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        run_id = "".join(random.choices(string.ascii_letters + string.digits, k=8))
         run_dir = os.path.join("artifacts", "runs", run_id)
         os.makedirs(run_dir, exist_ok=True)
         layer_run_dirs[layer_idx] = run_dir
@@ -377,7 +420,14 @@ def run_training_loop(
         log_queue = mp.Queue()
         process = mp.Process(
             target=new_wandb_process,
-            args=(run_id, layer_config, log_queue, wandb_entity, wandb_project, wandb_tags),
+            args=(
+                run_id,
+                layer_config,
+                log_queue,
+                wandb_entity,
+                wandb_project,
+                wandb_tags,
+            ),
         )
         process.start()
 
@@ -453,12 +503,14 @@ def run_training_loop(
             yaml.dump(layer_cfg, f)
 
         # Notify W&B process of these artifacts
-        layer_log_queues[layer_idx].put({
-            "type": "artifact",
-            "atoms_file": atoms_path,
-            "atom_indices_file": atom_indices_path,
-            "metadata_file": metadata_path,
-        })
+        layer_log_queues[layer_idx].put(
+            {
+                "type": "artifact",
+                "atoms_file": atoms_path,
+                "atom_indices_file": atom_indices_path,
+                "metadata_file": metadata_path,
+            }
+        )
 
         # Signal that we're done
         layer_log_queues[layer_idx].put("DONE")
@@ -527,11 +579,12 @@ activation_dims = {
 
 
 if __name__ == "__main__":
-    # If needed to avoid pickling errors on some platforms:
-    # mp.set_start_method("spawn", force=True)
     args = parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_grad_enabled(False)
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     # Prepare data stream from huggingface
     dataset = load_dataset(args.dataset_name, split="train", streaming=True)

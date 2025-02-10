@@ -141,8 +141,7 @@ def get_activations_tl(
     # -------------------------------------------------------------------------
     # 4. Prepare Zarr directory
     # -------------------------------------------------------------------------
-    output_model_name = model_name.replace("/", "_")
-    save_dir = os.path.join(activations_path, output_model_name, dataset_name)
+    save_dir = os.path.join(activations_path, model_name, dataset_name)
     if os.path.exists(save_dir):
         print(f"Activations already exist at {save_dir}, skipping.")
         return

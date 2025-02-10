@@ -64,7 +64,9 @@ def get_layered_runs_for_models(
 ):
     """Fetch finished W&B runs for each (model, layer) combination."""
     api = wandb.Api()
-    runs = api.runs(f"{entity}/{project}", filters={"tags": tag})
+    # Need created_at as a workaround for missing runs
+    # https://github.com/wandb/wandb/issues/7666
+    runs = api.runs(f"{entity}/{project}", order="+created_at")
 
     runs_dict = {
         model_name: {layer: None for layer in layer_indices}
@@ -72,12 +74,14 @@ def get_layered_runs_for_models(
     }
 
     for run in runs:
-        if run.state != "finished":
-            continue
-
         layer = run.config.get("layer")
         run_model_name = run.config.get("lm_name", "")
 
+        # For some reason passing the tags into api.runs skips some of the runs
+        if tag not in run.tags:
+            continue
+        if run.state != "finished":
+            continue
         if layer not in layer_indices:
             continue
         if run_model_name not in model_names:
@@ -116,17 +120,17 @@ def load_activation_dataset(
     generate using `get_activations_tl()`.
     """
     activations_path = f"{activations_base_path}/{model}/{dataset_name}"
+    layers = [str(l) for l in range(num_layers)]
     if not os.path.exists(activations_path):
-        os.makedirs(activations_path, exist_ok=True)
         get_activations_tl(
             model_name=model,
             dataset_name=dataset_name,
-            activations_path=activations_path,
+            activations_path=activations_base_path,
             seq_len=seq_len,
             batch_size=batch_size,
             device=device,
             num_examples=num_examples,
-            layers_str=list(range(num_layers)),
+            layers_str=", ".join(layers),
             tokenizer_name=model,
         )
 
@@ -296,8 +300,12 @@ def main():
             train_layers = list(range(1, NUM_LAYERS))
         else:
             train_layers = [
-                layer for layer in range(1, NUM_LAYERS) if not existing_itdas[model_name][layer]
+                layer
+                for layer in range(1, NUM_LAYERS)
+                if not existing_itdas[model_name][layer]
             ]
+            if len(train_layers) == 0:
+                continue
 
         print(f"Training ITDA for model={model_name}, layers={train_layers} ...")
         trainer_cfg = {
@@ -363,7 +371,10 @@ def main():
                     atom_indices[-1].append(None)
                     continue
 
-                artifact_ref = f"{WANDB_PROJECT}/ito_dictionary_{run.id}:latest"
+                artifact_ref = [a.name for a in run.logged_artifacts()]
+                if len(artifact_ref) != 1:
+                    raise ValueError(f"Multiple artifacts found for {model}, layer {layer}")
+                artifact_ref = f"{WANDB_PROJECT}/{artifact_ref[0]}"
                 artifact = api.artifact(artifact_ref, type="model")
                 artifact_dir = artifact.download()
                 atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
@@ -514,9 +525,7 @@ def main():
         plt.yticks(ticks, ticks + 1)
 
         plt.tight_layout()
-        # If you want to save instead of show, do:
-        # plt.savefig(f"artifacts/similarities/{measure}_{args.model_group}.png")
-        plt.show()
+        plt.savefig(f"artifacts/similarities/{measure}_{args.model_group}.png")
 
 
 if __name__ == "__main__":
