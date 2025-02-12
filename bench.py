@@ -15,6 +15,7 @@ from dictionary_learning.dictionary import AutoEncoder
 import torch
 import yaml
 from ito_sae import ITO_SAE, ITO_SAEConfig
+from dl_train import ITDA
 from tqdm import tqdm
 
 import wandb
@@ -23,9 +24,15 @@ RANDOM_SEED = 42
 
 MODEL_CONFIGS = {
     "EleutherAI/pythia-70m-deduped": {
-        "batch_size": 512,
+        "batch_size": 32,
         "dtype": "float32",
         "layers": [3, 4],
+        "d_model": 512,
+    },
+    "EleutherAI/pythia-160m-deduped": {
+        "batch_size": 32,
+        "dtype": "float32",
+        "layers": [8],
         "d_model": 512,
     },
     "google/gemma-2-2b": {
@@ -258,55 +265,42 @@ if __name__ == "__main__":
     with open(meta_path, "r") as f:
         sae_metadata = yaml.safe_load(f)
 
-    model_config = MODEL_CONFIGS[sae_metadata["model"]]
+    model_config = MODEL_CONFIGS[sae_metadata["lm_name"]]
     d_model = model_config["d_model"]
     llm_batch_size = model_config["batch_size"]
     llm_dtype = model_config["dtype"]
     hook_layer = model_config["layers"][0]
 
-    if ("method" not in sae_metadata) or (sae_metadata["method"] != "dictlearn"):
-        atoms_path = os.path.join(run_dir, "atoms.pt")
-        if not os.path.exists(atoms_path):
-            raise FileNotFoundError("No atoms.pt found for the specified ITO run")
+    atoms_path = os.path.join(run_dir, "atoms.pt")
+    if not os.path.exists(atoms_path):
+        raise FileNotFoundError("No atoms.pt found for the specified ITO run")
+    atoms = torch.load(atoms_path).to(device)
 
-        atoms = torch.load(atoms_path).to(device)
-        ito_sae = ITO_SAE(
-            atoms,
-            l0=sae_metadata["l0"],
-            cfg=ITO_SAEConfig(
-                model_name=sae_metadata["model"],
-                dtype=llm_dtype,
-                d_in=d_model,
-                d_sae=atoms.size(0),
-                hook_layer=sae_metadata["layer"],
-                hook_name=f"blocks.{hook_layer}.hook_resid_post",  # Assuming same hook name as GPT-2 SAEs
-                prepend_bos=True,
-                normalize_activations="none",
-                dataset_trust_remote_code=True,
-                seqpos_slice=(None,),
-                device=device,
-            ),
-        )
-        ito_sae.normalize_decoder()
-        selected_saes.append((args.run_id, ito_sae))
-    else:
-        # load pickle of ae from run_dir, "ae.pt"
-        with open(os.path.join(run_dir, "ae.pt"), "rb") as f:
-            ae = pickle.load(f)
-        ae.cfg = ITO_SAEConfig(
-            model_name=sae_metadata["model"],
+    atom_indices_path = os.path.join(run_dir, "atom_indices.pt")
+    if not os.path.exists(atom_indices_path):
+        raise FileNotFoundError("No atom_indices.pt found for the specified ITO run")
+    atom_indices = torch.load(atom_indices_path).to(device)
+
+    ito_sae = ITDA(
+        atoms,
+        atom_indices,
+        k=sae_metadata["k"], # XXX: for some reason drops about 15% of the l0
+        cfg=ITO_SAEConfig(
+            model_name=sae_metadata["lm_name"],
             dtype=llm_dtype,
             d_in=d_model,
-            d_sae=ae.W_dec.size(0),
+            d_sae=atoms.size(0),
             hook_layer=sae_metadata["layer"],
-            hook_name=f"blocks.{hook_layer}.hook_resid_post",  # Assuming same hook name as GPT-2 SAEs
+            hook_name=f"blocks.{hook_layer}.hook_resid_post",
             prepend_bos=True,
             normalize_activations="none",
             dataset_trust_remote_code=True,
             seqpos_slice=(None,),
             device=device,
-        )
-        selected_saes.append((args.run_id, ae))
+        ),
+    )
+    ito_sae.normalize_decoder()
+    selected_saes.append((args.run_id, ito_sae))
 
     if not selected_saes:
         raise ValueError(
@@ -314,7 +308,7 @@ if __name__ == "__main__":
         )
 
     run_evals(
-        sae_metadata["model"],
+        sae_metadata["lm_name"],
         selected_saes,
         llm_batch_size // 32,
         llm_dtype,
@@ -322,11 +316,12 @@ if __name__ == "__main__":
         eval_types=eval_types,
         api_key=api_key,
         force_rerun=args.force_rerun,
+        save_activations=True,
     )
 
     # Upload the evaluation results to the wandb run of the ITO_SAE
     wandb.init(
-        project="example_saes",
+        project="itda",
         id=args.run_id,
         resume="allow",
     )

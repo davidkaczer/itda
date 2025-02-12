@@ -218,6 +218,7 @@ class MultiLayerITDATrainer:
         lm_name: str,
         dataset: str,
         seq_len: int,
+        batch_size: int,
         device: Optional[str] = None,
         wandb_name: str = "MultiLayerITDA",
         submodule_name: Optional[str] = None,
@@ -231,6 +232,7 @@ class MultiLayerITDATrainer:
         self.lm_name = lm_name
         self.dataset = dataset
         self.seq_len = seq_len
+        self.batch_size = batch_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.wandb_name = wandb_name
         self.submodule_name = submodule_name
@@ -338,12 +340,6 @@ class MultiLayerITDATrainer:
                     [itda.atom_indices, new_atom_indices], dim=0
                 )
 
-                # De-duplicate
-                updated_atoms, unique_idx = torch.unique(
-                    updated_atoms, return_inverse=True, dim=0
-                )
-                updated_indices = updated_indices[unique_idx]
-
                 itda.atoms = updated_atoms
                 itda.atom_indices = updated_indices
                 itda.dict_size = itda.atoms.size(0)
@@ -374,6 +370,7 @@ class MultiLayerITDATrainer:
             "loss_threshold": self.loss_threshold,
             "dataset": self.dataset,
             "seq_len": self.seq_len,
+            "batch_size": self.batch_size,
             "seed": self.seed,
         }
 
@@ -611,6 +608,7 @@ if __name__ == "__main__":
         layers=layers_list,
         activation_dim=activation_dim,
         k=args.k,
+        batch_size=args.batch_size,
         loss_threshold=args.loss_threshold,
         lm_name=args.model_name,
         dataset=args.dataset_name,

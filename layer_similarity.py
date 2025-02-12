@@ -226,17 +226,22 @@ def linear_regression_r2_torch(X, Y, eps=1e-12):
     return R2.item()
 
 
-def get_atom_indices_from_wandb_run(run, wandb_project):
+def get_atoms_from_wandb_run(run, wandb_project):
     api = wandb.Api()
-    artifact_ref = [a.name for a in run.logged_artifacts()]
-    if len(artifact_ref) != 1:
+    artifact_refs = [a.name for a in run.logged_artifacts()]
+    if len(artifact_refs) != 1:
         raise ValueError("Expected exactly one artifact in the run.")
-    artifact_ref = f"{wandb_project}/{artifact_ref[0]}"
-    artifact = api.artifact(artifact_ref, type="model")
+    artifact_refs = f"{wandb_project}/{artifact_refs[0]}"
+    artifact = api.artifact(artifact_refs, type="model")
     artifact_dir = artifact.download()
+
     atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
-    loaded_indices = torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
-    return loaded_indices
+    indices = torch.load(atom_indices_path, weights_only=True).to("cpu").numpy()
+
+    atoms_path = os.path.join(artifact_dir, "atoms.pt")
+    atoms = torch.load(atoms_path, weights_only=True).to("cpu").numpy()
+
+    return atoms, indices
 
 
 def load_itda_similarities(
@@ -271,9 +276,11 @@ def load_itda_similarities(
                 continue
 
             try:
-                loaded_indices = get_atom_indices_from_wandb_run(run, wandb_project)
+                loaded_indices = get_atoms_from_wandb_run(run, wandb_project)[1]
             except ValueError as e:
-                raise ValueError(e, f"Error loading atom indices for {model} layer {layer}")
+                raise ValueError(
+                    e, f"Error loading atom indices for {model} layer {layer}"
+                )
             atom_indices[-1].append(loaded_indices)
 
     # Shape: (len(models), len(models), num_layers-1, num_layers-1)
@@ -328,29 +335,17 @@ def compute_or_load_measure(
     # Prepare an empty array for this measure
     measure_array = np.zeros((len(models), len(models), num_layers - 1, num_layers - 1))
 
-    # Pre-load activations for model_i to avoid repeated disk access
-    for mi, model_i in enumerate(models):
-        # Load all layers' activations once for model_i
-        model_i_activations = []
-        for li in range(1, num_layers):
-            ai_cpu = load_activation_dataset(
-                model_i,
-                li,
-                activations_base_path=activations_base_path,
-                dataset_name=dataset,
-                seq_len=seq_len,
-                batch_size=batch_size,
-                device=device,
-                num_examples=num_examples,
-                num_layers=num_layers,
-            )
-            model_i_activations.append(ai_cpu)
+    # Calculate total iterations for tqdm (mi, mj, li, lj)
+    total_iterations = len(models) * len(models) * (num_layers - 1) * (num_layers - 1)
 
-        for mj, model_j in enumerate(models):
-            for lj in range(1, num_layers):
-                aj_cpu = load_activation_dataset(
-                    model_j,
-                    lj,
+    with tqdm(total=total_iterations, desc=f"Computing {measure.upper()}") as pbar:
+        # Pre-load activations for model_i to avoid repeated disk access
+        for mi, model_i in enumerate(models):
+            model_i_activations = []
+            for li in range(1, num_layers):
+                ai_cpu = load_activation_dataset(
+                    model_i,
+                    li,
                     activations_base_path=activations_base_path,
                     dataset_name=dataset,
                     seq_len=seq_len,
@@ -359,35 +354,53 @@ def compute_or_load_measure(
                     num_examples=num_examples,
                     num_layers=num_layers,
                 )
-                aj_gpu = aj_cpu.to(device)
+                model_i_activations.append(ai_cpu)
 
-                for li in range(1, num_layers):
-                    ai_cpu = model_i_activations[li - 1]
-                    ai_gpu = ai_cpu.to(device)
+            for mj, model_j in enumerate(models):
+                for lj in range(1, num_layers):
+                    aj_cpu = load_activation_dataset(
+                        model_j,
+                        lj,
+                        activations_base_path=activations_base_path,
+                        dataset_name=dataset,
+                        seq_len=seq_len,
+                        batch_size=batch_size,
+                        device=device,
+                        num_examples=num_examples,
+                        num_layers=num_layers,
+                    )
+                    aj_gpu = aj_cpu.to(device)
 
-                    if measure == "svcca":
-                        sim = svcca_torch(ai_gpu, aj_gpu)
-                    elif measure == "cka":
-                        sim = linear_cka_torch(ai_gpu, aj_gpu)
-                    elif measure == "linreg_r2":
-                        sim = linear_regression_r2_torch(ai_gpu, aj_gpu)
-                    else:
-                        raise ValueError(f"Unknown measure: {measure}")
+                    for li in range(1, num_layers):
+                        ai_cpu = model_i_activations[li - 1]
+                        ai_gpu = ai_cpu.to(device)
 
-                    measure_array[mi, mj, li - 1, lj - 1] = sim
+                        if measure == "svcca":
+                            sim = svcca_torch(ai_gpu, aj_gpu)
+                        elif measure == "cka":
+                            sim = linear_cka_torch(ai_gpu, aj_gpu)
+                        elif measure == "linreg_r2":
+                            sim = linear_regression_r2_torch(ai_gpu, aj_gpu)
+                        else:
+                            raise ValueError(f"Unknown measure: {measure}")
 
-                    del ai_gpu
+                        measure_array[mi, mj, li - 1, lj - 1] = sim
+
+                        del ai_gpu
+                        torch.cuda.empty_cache()
+
+                        # Update the tqdm progress bar once per inner loop iteration
+                        pbar.update(1)
+
+                    del aj_gpu
                     torch.cuda.empty_cache()
 
-                del aj_gpu
-                torch.cuda.empty_cache()
+            del model_i_activations
+            torch.cuda.empty_cache()
 
-        del model_i_activations
-        torch.cuda.empty_cache()
-
-        # Save partial results after finishing each model_i
-        os.makedirs("artifacts/similarities", exist_ok=True)
-        np.save(measure_path, measure_array)
+            # Save partial results after finishing each model_i
+            os.makedirs("artifacts/similarities", exist_ok=True)
+            np.save(measure_path, measure_array)
 
     return measure_array
 

@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from layer_similarity import (
-    get_atom_indices_from_wandb_run,
+    get_atoms_from_wandb_run,
     get_layered_runs_for_models,
     get_similarity_measure,
 )
@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
         all_atom_indices = []
         for run in existing_itdas.values():
-            atom_indices = get_atom_indices_from_wandb_run(run, args.wandb_project)
+            atom_indices = get_atoms_from_wandb_run(run, args.wandb_project)[1]
             all_atom_indices.append(atom_indices)
         all_atom_indices = np.concatenate(all_atom_indices, axis=0)
 
