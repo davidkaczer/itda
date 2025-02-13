@@ -567,12 +567,9 @@ def parse_args():
     return parser.parse_args()
 
 
-# Example known model dimension dict
-activation_dims = {
-    "EleutherAI/pythia-70m-deduped": 512,
-    "EleutherAI/pythia-160m-deduped": 768,
-    # Add your model name -> dimension here
-}
+def get_activation_dim(model_name):
+    model = HookedTransformer.from_pretrained(model_name, device="cpu")
+    return model.cfg.d_model
 
 
 if __name__ == "__main__":
@@ -586,14 +583,7 @@ if __name__ == "__main__":
     # Prepare data stream from huggingface
     dataset = load_dataset(args.dataset_name, split="train", streaming=True)
     data_stream = (item["text"] for item in dataset)
-
-    # Load model & tokenizer
-    if args.model_name not in activation_dims:
-        raise ValueError(
-            f"Unknown activation_dim for {args.model_name}. "
-            "Please update the 'activation_dims' dictionary."
-        )
-    activation_dim = activation_dims[args.model_name]
+    activation_dim = get_activation_dim(args.model_name)
 
     model = HookedTransformer.from_pretrained(args.model_name, device=device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
