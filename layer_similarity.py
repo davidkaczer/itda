@@ -5,6 +5,7 @@ import os
 from itertools import product
 from typing import Optional
 
+from dl_train import get_activation_dim
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -491,6 +492,7 @@ if __name__ == "__main__":
             "steps": NUM_EXAMPLES // BATCH_SIZE,
             "dataset": DATASET,
             "seq_len": SEQ_LEN,
+            "batch_size": BATCH_SIZE,
             "seed": 0,
         }
         trainer = MultiLayerITDATrainer(**trainer_cfg)
