@@ -102,7 +102,7 @@ class ITDA(nn.Module):
         self.cfg = cfg
 
         self.dict_size = self.atoms.size(0)
-        self.activation_dim = self.atoms.size(1)
+        self.activation_dim = self.atoms.size(1) if self.atoms.size(0) > 0 else 0
 
     def encode(self, x: torch.Tensor):
         x = x.to(dtype=self.atoms.dtype)
@@ -122,14 +122,6 @@ class ITDA(nn.Module):
         norms = torch.norm(self.atoms, dim=1).clamp_min(1e-9)
         self.atoms = self.atoms / norms.unsqueeze(1)
 
-    @property
-    def device(self):
-        return self.atoms.device
-
-    @property
-    def dtype(self):
-        return self.atoms.dtype
-
     @classmethod
     def from_pretrained(cls, path: str, device: Optional[str] = None) -> "ITDA":
         """
@@ -145,10 +137,8 @@ class ITDA(nn.Module):
             cfg = yaml.safe_load(f)
 
         # Load atoms and atom_indices
-        atoms = torch.load(atoms_path, map_location=device, weights_only=True)
-        atom_indices = torch.load(
-            atom_indices_path, map_location=device, weights_only=True
-        )
+        atoms = torch.load(atoms_path, map_location=device)
+        atom_indices = torch.load(atom_indices_path, map_location=device)
 
         # Pull 'k' from config
         k = cfg.get("k", 40)
@@ -193,13 +183,14 @@ class ITDA(nn.Module):
     def to(self, device=None, dtype=None):
         if device:
             self.atoms = self.atoms.to(device)
+            self.atom_indices = self.atom_indices.to(device)
         if dtype:
             self.atoms = self.atoms.to(dtype)
         return self
 
     def normalize_decoder(self):
-        norms = torch.norm(self.atoms, dim=1)
-        self.atoms /= norms[:, None]
+        norms = torch.norm(self.atoms, dim=1).clamp_min(1e-9)
+        self.atoms = self.atoms / norms.unsqueeze(1)
         return self
 
 
@@ -387,12 +378,14 @@ def run_training_loop(
     wandb_project: str,
     wandb_entity: str = "",
     wandb_tags: Optional[List[str]] = None,
+    crop_dict_size: int = 0,
 ):
     """
     Main training loop:
       - Spawns a separate W&B process+queue per layer (separate run for each).
       - Each layer logs to its own W&B run.
       - Saves final artifacts to 'artifacts/runs/{run_id}' for each layer.
+      - Optionally crops the final dictionary size if `crop_dict_size` > 0.
     """
 
     # 1. Prepare W&B processes & local artifact dirs for each layer
@@ -482,7 +475,25 @@ def run_training_loop(
             }
             layer_log_queues[layer_idx].put(log_data)
 
-    # 4. Finalize: save artifacts for each layer and signal W&B runs to close
+    # 4. (Optional) Crop dictionary size if crop_dict_size > 0
+    if crop_dict_size > 0:
+        for layer_idx in trainer.layers:
+            itda = trainer.itdas[layer_idx]
+            current_size = itda.atoms.size(0)
+            if current_size > crop_dict_size:
+                # Crop the atoms and indices
+                itda.atoms = itda.atoms[:crop_dict_size].clone()
+                itda.atom_indices = itda.atom_indices[:crop_dict_size].clone()
+                itda.dict_size = itda.atoms.size(0)
+                itda.activation_dim = itda.atoms.size(1)
+                # Re-initialize
+                trainer.itdas[layer_idx] = ITDA(
+                    atoms=itda.atoms,
+                    atom_indices=itda.atom_indices,
+                    k=itda.k,
+                ).to(device=itda.device, dtype=itda.dtype)
+
+    # 5. Finalize: save artifacts for each layer and signal W&B runs to close
     for layer_idx in trainer.layers:
         run_dir = layer_run_dirs[layer_idx]
         atoms_path = os.path.join(run_dir, "atoms.pt")
@@ -498,6 +509,10 @@ def run_training_loop(
         layer_cfg["layer"] = layer_idx
         with open(metadata_path, "w") as f:
             yaml.dump(layer_cfg, f)
+
+        # Log the final cropped dict_size if needed
+        final_dict_size = trainer.itdas[layer_idx].atoms.size(0)
+        layer_log_queues[layer_idx].put({"dict_size": final_dict_size})
 
         # Notify W&B process of these artifacts
         layer_log_queues[layer_idx].put(
@@ -529,11 +544,12 @@ def parse_args():
         --batch_size 4 \
         --loss_threshold 0.1 \
         --k 40 \
-        --max_steps 100 \
+        --total_sequences 400 \
         --wandb_project "itda_separate_runs" \
         --wandb_entity "my_entity" \
         --wandb_tags tag1,tag2 \
-        --device cuda
+        --device cuda \
+        --crop_dict_size 100
     """
     parser = argparse.ArgumentParser(
         description="Multi-layer ITDA Trainer with separate W&B runs per layer."
@@ -552,7 +568,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--loss_threshold", type=float, required=True)
     parser.add_argument("--k", type=int, default=40)
-    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument(
+        "--total_sequences",
+        type=int,
+        required=True,
+        help="Total number of training sequences (will be divided by batch_size to get total steps).",
+    )
     parser.add_argument("--wandb_project", type=str, default="itda")
     parser.add_argument("--wandb_entity", type=str, default="patrickaaleask")
     parser.add_argument("--seed", type=int, default=None)
@@ -563,6 +584,12 @@ def parse_args():
         type=str,
         default=None,
         help="Comma-separated tags, e.g. 'tag1,tag2'.",
+    )
+    parser.add_argument(
+        "--crop_dict_size",
+        type=int,
+        default=0,
+        help="If > 0, crop the final dictionary to this number of atoms.",
     )
     return parser.parse_args()
 
@@ -580,6 +607,13 @@ if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    # Compute the number of steps from total_sequences
+    max_steps = args.total_sequences // args.batch_size
+    if max_steps <= 0:
+        raise ValueError(
+            "The computed number of steps is 0 or negative. Check total_sequences and batch_size."
+        )
+
     # Prepare data stream from huggingface
     dataset = load_dataset(args.dataset_name, split="train", streaming=True)
     data_stream = (item["text"] for item in dataset)
@@ -594,7 +628,7 @@ if __name__ == "__main__":
 
     # Build trainer
     trainer = MultiLayerITDATrainer(
-        steps=args.max_steps,
+        steps=max_steps,
         layers=layers_list,
         activation_dim=activation_dim,
         k=args.k,
@@ -613,17 +647,18 @@ if __name__ == "__main__":
     if args.wandb_tags:
         wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
 
-    # Run training
+    # Run training (with optional cropping)
     run_training_loop(
         trainer=trainer,
         data_stream=data_stream,
         tokenizer=tokenizer,
         model=model,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         device=device,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_tags=wandb_tags,
+        crop_dict_size=args.crop_dict_size,
     )

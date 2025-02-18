@@ -1,4 +1,26 @@
 # %%
+import json
+import pandas as pd
+
+if __name__ == "__main__":
+    with open("sae_bench_data.json") as f:
+        sae_bench_data = json.load(f)
+
+    sae_bench_df = pd.DataFrame(sae_bench_data)
+    filtered_df = sae_bench_df[(sae_bench_df["core||sparsity||l0"] > 35) & (sae_bench_df["core||sparsity||l0"] < 45)]
+    filtered_df = filtered_df[filtered_df["modelId"] != "gemma-2-9b"]
+    result_df = (
+        filtered_df
+        .groupby(["modelId", "layer", "dSae"])["core||model_performance_preservation||ce_loss_score"]
+        .max()
+        .reset_index()
+    )
+    result_df = result_df.sort_values(by=["modelId", "dSae"], ascending=[True, False])
+    result_df["saeType"] = "SAE"
+    
+
+
+# %%
 import wandb
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -7,13 +29,14 @@ import pandas as pd
 api = wandb.Api()
 
 # Fetch runs from the project 'example_saes'
-project_name = "example_saes"
-filter_tags = "efficiency"
-runs = api.runs(project_name, filters={"tags": filter_tags})
+project_name = "itda"
+runs = api.runs(project_name, filters={"tags": []})
 
 # Extract relevant data into a DataFrame
 data = []
 for run in runs:
+    print(run)
+    continue
     # Extract run data
     method = run.config.get("method", "unknown")
     target_loss = run.config.get("target_loss", "unknown")
