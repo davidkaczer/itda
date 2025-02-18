@@ -389,25 +389,20 @@ def run_training_loop(
       - Still does a final cropping pass at the end (in case some overshoot).
     """
 
-    # 1. Prepare W&B processes & local artifact dirs for each layer
     layer_log_queues = {}
     wandb_processes = {}
     layer_run_dirs = {}
 
     for layer_idx in trainer.layers:
-        # Generate a unique run_id for this layer
         run_id = "".join(random.choices(string.ascii_letters + string.digits, k=8))
         run_dir = os.path.join("artifacts", "runs", run_id)
         os.makedirs(run_dir, exist_ok=True)
         layer_run_dirs[layer_idx] = run_dir
 
-        # Make a config just for that layer's run
         layer_config = dict(trainer.config)
         layer_config["layer"] = layer_idx
-        # Give each layer a unique run name
         layer_config["wandb_name"] = f"{trainer.wandb_name}_layer_{layer_idx}"
 
-        # Create queue & start W&B process
         log_queue = mp.Queue()
         process = mp.Process(
             target=new_wandb_process,
@@ -425,10 +420,8 @@ def run_training_loop(
         layer_log_queues[layer_idx] = log_queue
         wandb_processes[layer_idx] = process
 
-    # 2. Build a list of hook names for the chosen layers
     hook_names = [f"blocks.{layer}.hook_resid_post" for layer in trainer.layers]
 
-    # 3. Run training steps
     progress = tqdm(range(max_steps), desc="Training", unit="step")
     for step in progress:
         batch = []
@@ -480,7 +473,6 @@ def run_training_loop(
         # trained - o1 pro being a bit brain dead here. Add in proper early
         # stopping for each layer being trained.
         if crop_dict_size > 0:
-            # For any layer that exceeded crop_dict_size, crop now
             for layer_idx in trainer.layers:
                 itda = trainer.itdas[layer_idx]
                 if itda.atoms.size(0) > crop_dict_size:
@@ -488,14 +480,12 @@ def run_training_loop(
                     itda.atom_indices = itda.atom_indices[:crop_dict_size].clone()
                     itda.dict_size = itda.atoms.size(0)
                     itda.activation_dim = itda.atoms.size(1)
-                    # Re-initialize the ITDA
                     trainer.itdas[layer_idx] = ITDA(
                         atoms=itda.atoms,
                         atom_indices=itda.atom_indices,
                         k=itda.k,
                     ).to(device=itda.device, dtype=itda.dtype)
 
-            # If all layers are at capacity, stop early
             all_full = all(
                 trainer.itdas[layer_idx].atoms.size(0) >= crop_dict_size
                 for layer_idx in trainer.layers
@@ -504,8 +494,6 @@ def run_training_loop(
                 print("All layers reached the desired dictionary size. Early stopping.")
                 break
 
-    # 4. (Optional) Crop dictionary size again if crop_dict_size > 0
-    #    (Catches any final overshoot if training ended normally.)
     if crop_dict_size > 0:
         for layer_idx in trainer.layers:
             itda = trainer.itdas[layer_idx]
@@ -521,7 +509,6 @@ def run_training_loop(
                     k=itda.k,
                 ).to(device=itda.device, dtype=itda.dtype)
 
-    # 5. Finalize: save artifacts for each layer and signal W&B runs to close
     for layer_idx in trainer.layers:
         run_dir = layer_run_dirs[layer_idx]
         atoms_path = os.path.join(run_dir, "atoms.pt")
