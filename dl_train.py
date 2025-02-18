@@ -385,7 +385,8 @@ def run_training_loop(
       - Spawns a separate W&B process+queue per layer (separate run for each).
       - Each layer logs to its own W&B run.
       - Saves final artifacts to 'artifacts/runs/{run_id}' for each layer.
-      - Optionally crops the final dictionary size if `crop_dict_size` > 0.
+      - Early-stops if ALL layers reach crop_dict_size (if crop_dict_size > 0).
+      - Still does a final cropping pass at the end (in case some overshoot).
     """
 
     # 1. Prepare W&B processes & local artifact dirs for each layer
@@ -475,18 +476,45 @@ def run_training_loop(
             }
             layer_log_queues[layer_idx].put(log_data)
 
-    # 4. (Optional) Crop dictionary size if crop_dict_size > 0
+        # TODO: This doesn't really work when there's multiple layers being
+        # trained - o1 pro being a bit brain dead here. Add in proper early
+        # stopping for each layer being trained.
+        if crop_dict_size > 0:
+            # For any layer that exceeded crop_dict_size, crop now
+            for layer_idx in trainer.layers:
+                itda = trainer.itdas[layer_idx]
+                if itda.atoms.size(0) > crop_dict_size:
+                    itda.atoms = itda.atoms[:crop_dict_size].clone()
+                    itda.atom_indices = itda.atom_indices[:crop_dict_size].clone()
+                    itda.dict_size = itda.atoms.size(0)
+                    itda.activation_dim = itda.atoms.size(1)
+                    # Re-initialize the ITDA
+                    trainer.itdas[layer_idx] = ITDA(
+                        atoms=itda.atoms,
+                        atom_indices=itda.atom_indices,
+                        k=itda.k,
+                    ).to(device=itda.device, dtype=itda.dtype)
+
+            # If all layers are at capacity, stop early
+            all_full = all(
+                trainer.itdas[layer_idx].atoms.size(0) >= crop_dict_size
+                for layer_idx in trainer.layers
+            )
+            if all_full:
+                print("All layers reached the desired dictionary size. Early stopping.")
+                break
+
+    # 4. (Optional) Crop dictionary size again if crop_dict_size > 0
+    #    (Catches any final overshoot if training ended normally.)
     if crop_dict_size > 0:
         for layer_idx in trainer.layers:
             itda = trainer.itdas[layer_idx]
             current_size = itda.atoms.size(0)
             if current_size > crop_dict_size:
-                # Crop the atoms and indices
                 itda.atoms = itda.atoms[:crop_dict_size].clone()
                 itda.atom_indices = itda.atom_indices[:crop_dict_size].clone()
                 itda.dict_size = itda.atoms.size(0)
                 itda.activation_dim = itda.atoms.size(1)
-                # Re-initialize
                 trainer.itdas[layer_idx] = ITDA(
                     atoms=itda.atoms,
                     atom_indices=itda.atom_indices,
@@ -510,7 +538,7 @@ def run_training_loop(
         with open(metadata_path, "w") as f:
             yaml.dump(layer_cfg, f)
 
-        # Log the final cropped dict_size if needed
+        # Log the final dict_size
         final_dict_size = trainer.itdas[layer_idx].atoms.size(0)
         layer_log_queues[layer_idx].put({"dict_size": final_dict_size})
 
@@ -589,7 +617,7 @@ def parse_args():
         "--crop_dict_size",
         type=int,
         default=0,
-        help="If > 0, crop the final dictionary to this number of atoms.",
+        help="If > 0, stop early once dictionary reaches this size (per layer).",
     )
     return parser.parse_args()
 
@@ -647,7 +675,7 @@ if __name__ == "__main__":
     if args.wandb_tags:
         wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
 
-    # Run training (with optional cropping)
+    # Run training loop (with early stop if crop_dict_size > 0)
     run_training_loop(
         trainer=trainer,
         data_stream=data_stream,
