@@ -306,6 +306,11 @@ def load_itda_similarities(
     return itda_sims
 
 
+import os
+import numpy as np
+import torch
+from tqdm import tqdm
+
 def compute_or_load_measure(
     measure,
     models,
@@ -340,28 +345,13 @@ def compute_or_load_measure(
     total_iterations = len(models) * len(models) * (num_layers - 1) * (num_layers - 1)
 
     with tqdm(total=total_iterations, desc=f"Computing {measure.upper()}") as pbar:
-        # Pre-load activations for model_i to avoid repeated disk access
         for mi, model_i in enumerate(models):
-            model_i_activations = []
-            for li in range(1, num_layers):
-                ai_cpu = load_activation_dataset(
-                    model_i,
-                    li,
-                    activations_base_path=activations_base_path,
-                    dataset_name=dataset,
-                    seq_len=seq_len,
-                    batch_size=batch_size,
-                    device=device,
-                    num_examples=num_examples,
-                    num_layers=num_layers,
-                )
-                model_i_activations.append(ai_cpu)
-
             for mj, model_j in enumerate(models):
-                for lj in range(1, num_layers):
-                    aj_cpu = load_activation_dataset(
-                        model_j,
-                        lj,
+                for li in range(1, num_layers):
+                    # Load only the current layer li for model_i
+                    ai_cpu = load_activation_dataset(
+                        model_i,
+                        li,
                         activations_base_path=activations_base_path,
                         dataset_name=dataset,
                         seq_len=seq_len,
@@ -370,12 +360,24 @@ def compute_or_load_measure(
                         num_examples=num_examples,
                         num_layers=num_layers,
                     )
-                    aj_gpu = aj_cpu.to(device)
+                    ai_gpu = ai_cpu.to(device)
 
-                    for li in range(1, num_layers):
-                        ai_cpu = model_i_activations[li - 1]
-                        ai_gpu = ai_cpu.to(device)
+                    for lj in range(1, num_layers):
+                        # Load only the current layer lj for model_j
+                        aj_cpu = load_activation_dataset(
+                            model_j,
+                            lj,
+                            activations_base_path=activations_base_path,
+                            dataset_name=dataset,
+                            seq_len=seq_len,
+                            batch_size=batch_size,
+                            device=device,
+                            num_examples=num_examples,
+                            num_layers=num_layers,
+                        )
+                        aj_gpu = aj_cpu.to(device)
 
+                        # Compute the requested similarity measure
                         if measure == "svcca":
                             sim = svcca_torch(ai_gpu, aj_gpu)
                         elif measure == "cka":
@@ -385,23 +387,24 @@ def compute_or_load_measure(
                         else:
                             raise ValueError(f"Unknown measure: {measure}")
 
+                        # Store the result
                         measure_array[mi, mj, li - 1, lj - 1] = sim
 
-                        del ai_gpu
+                        # Free memory for this layer comparison
+                        del aj_gpu, aj_cpu
                         torch.cuda.empty_cache()
 
-                        # Update the tqdm progress bar once per inner loop iteration
+                        # Update the progress bar
                         pbar.update(1)
 
-                    del aj_gpu
+                    # Free model_i's layer li activation
+                    del ai_gpu, ai_cpu
                     torch.cuda.empty_cache()
 
-            del model_i_activations
-            torch.cuda.empty_cache()
-
-            # Save partial results after finishing each model_i
-            os.makedirs("artifacts/similarities", exist_ok=True)
-            np.save(measure_path, measure_array)
+                # (Optional) Save partial results after finishing model_j
+                # in case the run is long and you want to checkpoint
+                os.makedirs("artifacts/similarities", exist_ok=True)
+                np.save(measure_path, measure_array)
 
     return measure_array
 
