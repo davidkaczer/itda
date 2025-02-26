@@ -38,11 +38,10 @@ def new_wandb_process(id, config, log_queue, entity, project, tags=None):
         except Empty:
             continue
 
-        # Check sentinel
+        # Sentinel to terminate
         if log == "DONE":
             break
 
-        # Check if the message is an artifact or normal metric
         if isinstance(log, dict):
             if log.get("type") == "artifact":
                 # Create artifact with the relevant files
@@ -60,16 +59,20 @@ def new_wandb_process(id, config, log_queue, entity, project, tags=None):
 
                 wandb.log_artifact(artifact)
             else:
-                # Treat as normal W&B metrics
+                # Normal W&B metrics
                 wandb.log(log)
-        # else: handle other message types if needed...
-
     wandb.finish()
 
 
 def mp_encode(D, x, n_nonzero_coefs):
     """
     Simple Orthogonal Matching Pursuit-like procedure (aka Matching Pursuit).
+    Args:
+        D: Dictionary of shape [num_atoms, activation_dim].
+        x: Activations of shape [batch_size, activation_dim].
+        n_nonzero_coefs: int, how many nonzero coefficients to keep in OMP.
+    Returns:
+        coefficients: [batch_size, num_atoms].
     """
     batch_size = x.size(0)
     num_dict_atoms = D.size(0)
@@ -89,7 +92,7 @@ def mp_encode(D, x, n_nonzero_coefs):
 
 class ITDA(nn.Module):
     """
-    Iterative Dictionary Adder (ITDA) with OMP-like encoding.
+    Core Iterative Dictionary Adder (ITDA) with an OMP-like encoding step.
     """
 
     def __init__(
@@ -149,8 +152,6 @@ class ITDA(nn.Module):
             k=k,
             cfg=cfg,
         )
-
-        # Move internal tensors to device if requested
         if device is not None:
             itda.atoms = itda.atoms.to(device)
             itda.atom_indices = itda.atom_indices.to(device)
@@ -167,7 +168,10 @@ class ITDA(nn.Module):
 
     @property
     def W_enc(self):
-        # necessary for running core evals with sae bench
+        """
+        Required for certain external APIs (like SAE-bench).
+        This is not used for OMP in practice, so we just return zeros.
+        """
         return torch.zeros(
             (self.atoms.size(1), self.atoms.size(0)), device=self.atoms.device
         )
@@ -194,15 +198,16 @@ class ITDA(nn.Module):
         return self
 
 
-class MultiLayerITDATrainer:
+class ITDATrainer:
     """
-    Manages multiple ITDAs (one per layer). Each layer is updated from its own activations.
+    Single-layer trainer that internally manages one ITDA instance.
+    Handles the dictionary-building logic for 'layer' of a model.
     """
 
     def __init__(
         self,
+        layer: int,
         steps: int,
-        layers: List[int],
         activation_dim: int,
         k: int,
         loss_threshold: float,
@@ -211,12 +216,13 @@ class MultiLayerITDATrainer:
         seq_len: int,
         batch_size: int,
         device: Optional[str] = None,
-        wandb_name: str = "MultiLayerITDA",
+        wandb_name: str = "ITDA",
         submodule_name: Optional[str] = None,
         seed: Optional[int] = None,
+        max_dict_size: int = 0,  # <--- New parameter
     ):
+        self.layer = layer
         self.steps = steps
-        self.layers = layers
         self.activation_dim = activation_dim
         self.k = k
         self.loss_threshold = loss_threshold
@@ -229,129 +235,24 @@ class MultiLayerITDATrainer:
         self.submodule_name = submodule_name
         self.seed = seed
 
-        # Maintain a separate ITDA per layer
-        self.itdas = {}
-        for layer_idx in layers:
-            itda = ITDA(
-                atoms=torch.empty((0, activation_dim), device=self.device),
-                atom_indices=torch.empty((0, 2), dtype=torch.long, device=self.device),
-                k=self.k,
-            )
-            self.itdas[layer_idx] = itda
+        # New: max dictionary size we allow
+        self.max_dict_size = max_dict_size
 
-    def update(
-        self, step: int, activations_dict: Dict[int, torch.Tensor]
-    ) -> Dict[int, float]:
-        """
-        Updates each layer's ITDA using the corresponding activations.
-        Returns a dict of {layer_idx -> scalar loss}.
-        """
-        all_losses = {}
-        for layer_idx, x in activations_dict.items():
-            itda = self.itdas[layer_idx]
-            B, S, D = x.shape
-            flatten_x = x.reshape(-1, D).to(itda.dtype)
-
-            # If dictionary is empty, fix shape
-            if itda.atoms.size(0) == 0:
-                itda.atoms = torch.empty((0, D), device=self.device)
-                itda.activation_dim = D
-
-            # Possibly expand dictionary if not full rank yet
-            current_num_atoms = itda.atoms.size(0)
-            dict_dim = itda.atoms.size(1) if current_num_atoms > 0 else D
-            if current_num_atoms < dict_dim:
-                n_missing = dict_dim - current_num_atoms
-                unique_vals, inv_idx, counts = torch.unique(
-                    flatten_x, dim=0, return_inverse=True, return_counts=True
-                )
-                sorted_counts, sorted_idx = torch.sort(counts, descending=True)
-                n_to_take = min(n_missing, unique_vals.size(0))
-                new_rows = unique_vals[sorted_idx[:n_to_take]]
-
-                new_atom_indices = []
-                for row_idx in sorted_idx[:n_to_take]:
-                    match_positions = torch.nonzero(inv_idx == row_idx, as_tuple=True)[
-                        0
-                    ]
-                    if len(match_positions) > 0:
-                        mp_idx = match_positions[0].item()
-                        batch_i = mp_idx // S
-                        token_i = mp_idx % S
-                        global_seq_idx = step * B + batch_i
-                        new_atom_indices.append([global_seq_idx, token_i])
-                    else:
-                        new_atom_indices.append([-1, -1])
-
-                new_atom_indices = torch.tensor(
-                    new_atom_indices, dtype=torch.long, device=self.device
-                )
-                # Concat
-                updated_atoms = torch.cat([itda.atoms, new_rows], dim=0)
-                updated_indices = torch.cat(
-                    [itda.atom_indices, new_atom_indices], dim=0
-                )
-
-                itda.atoms = updated_atoms
-                itda.atom_indices = updated_indices
-                itda.dict_size = itda.atoms.size(0)
-                itda.activation_dim = itda.atoms.size(1)
-                itda.normalize_decoder()
-
-            # OMP reconstruction
-            recon = itda(flatten_x)
-
-            # Normalized MSE
-            eps = 1e-9
-            norm_x = flatten_x.norm(dim=1, keepdim=True).clamp_min(eps)
-            norm_recon = recon.norm(dim=1, keepdim=True).clamp_min(eps)
-            normalized_x = flatten_x / norm_x
-            normalized_recon = recon / norm_recon
-            errors = (normalized_x - normalized_recon).pow(2).mean(dim=1)
-
-            # Add new atoms for items above threshold
-            to_add = torch.nonzero(errors > self.loss_threshold, as_tuple=True)[0]
-            new_atoms_list = []
-            new_indices_list = []
-            for idx_item in to_add.tolist():
-                v = flatten_x[idx_item].unsqueeze(0)
-                new_atoms_list.append(v)
-                batch_i = idx_item // S
-                token_i = idx_item % S
-                global_seq_idx = step * B + batch_i
-                new_indices_list.append([global_seq_idx, token_i])
-
-            if len(new_atoms_list) > 0:
-                new_atoms = torch.cat(new_atoms_list, dim=0).to(itda.dtype)
-                new_atom_indices = torch.tensor(
-                    new_indices_list, dtype=torch.long, device=self.device
-                )
-                updated_atoms = torch.cat([itda.atoms, new_atoms], dim=0)
-                updated_indices = torch.cat(
-                    [itda.atom_indices, new_atom_indices], dim=0
-                )
-
-                itda.atoms = updated_atoms
-                itda.atom_indices = updated_indices
-                itda.dict_size = itda.atoms.size(0)
-                itda.activation_dim = itda.atoms.size(1)
-                itda.normalize_decoder()
-
-            # Reinitialize the ITDA object to refresh any internal state
-            self.itdas[layer_idx] = ITDA(
-                atoms=itda.atoms, atom_indices=itda.atom_indices, k=itda.k
-            ).to(device=self.device, dtype=itda.dtype)
-
-            # Mean error for logging
-            all_losses[layer_idx] = errors.mean().item()
-
-        return all_losses
+        # ITDA instance for this layer
+        self.itda = ITDA(
+            atoms=torch.empty((0, activation_dim), device=self.device),
+            atom_indices=torch.empty((0, 2), dtype=torch.long, device=self.device),
+            k=self.k,
+        )
 
     @property
-    def config(self):
+    def config(self) -> dict:
+        """
+        Returns a dictionary suitable for logging/metadata.
+        """
         return {
             "wandb_name": self.wandb_name,
-            "layers": self.layers,
+            "layer": self.layer,
             "lm_name": self.lm_name,
             "device": self.device,
             "submodule_name": self.submodule_name,
@@ -363,11 +264,142 @@ class MultiLayerITDATrainer:
             "seq_len": self.seq_len,
             "batch_size": self.batch_size,
             "seed": self.seed,
+            "max_dict_size": self.max_dict_size,  # keep track of it for logging
         }
+
+    @property
+    def full(self) -> bool:
+        """
+        Returns True if we have a max_dict_size > 0 and the dictionary
+        has reached (or exceeded) that size. Once 'full' is True,
+        we skip further updates (i.e., no-op).
+        """
+        if self.max_dict_size <= 0:
+            return False
+        return self.itda.atoms.size(0) >= self.max_dict_size
+
+    def update(self, step: int, x: torch.Tensor) -> float:
+        """
+        Update the single-layer dictionary using the activations x (shape [B, S, D]).
+        Returns the mean error (float) for logging.
+
+        If we're already 'full', do a no-op and return 0.0 (or some sentinel).
+        """
+        # If trainer is already full, skip any further updates
+        if self.full:
+            return 0.0
+
+        B, S, D = x.shape
+        flatten_x = x.reshape(-1, D).to(self.itda.dtype)
+
+        # If dictionary is empty, fix shape
+        if self.itda.atoms.size(0) == 0:
+            self.itda.atoms = torch.empty((0, D), device=self.device)
+            self.itda.activation_dim = D
+
+        # Possibly expand dictionary if not full rank yet
+        current_num_atoms = self.itda.atoms.size(0)
+        dict_dim = D if current_num_atoms == 0 else self.itda.atoms.size(1)
+        if current_num_atoms < dict_dim:
+            n_missing = dict_dim - current_num_atoms
+
+            unique_vals, inv_idx, counts = torch.unique(
+                flatten_x, dim=0, return_inverse=True, return_counts=True
+            )
+            sorted_counts, sorted_idx = torch.sort(counts, descending=True)
+            n_to_take = min(n_missing, unique_vals.size(0))
+            new_rows = unique_vals[sorted_idx[:n_to_take]]
+
+            new_atom_indices = []
+            for row_idx in sorted_idx[:n_to_take]:
+                match_positions = torch.nonzero(inv_idx == row_idx, as_tuple=True)[0]
+                if len(match_positions) > 0:
+                    mp_idx = match_positions[0].item()
+                    batch_i = mp_idx // S
+                    token_i = mp_idx % S
+                    global_seq_idx = step * B + batch_i
+                    new_atom_indices.append([global_seq_idx, token_i])
+                else:
+                    new_atom_indices.append([-1, -1])
+
+            new_atom_indices = torch.tensor(
+                new_atom_indices, dtype=torch.long, device=self.device
+            )
+            # Concat
+            updated_atoms = torch.cat([self.itda.atoms, new_rows], dim=0)
+            updated_indices = torch.cat([self.itda.atom_indices, new_atom_indices], dim=0)
+
+            self.itda.atoms = updated_atoms
+            self.itda.atom_indices = updated_indices
+            self.itda.dict_size = self.itda.atoms.size(0)
+            self.itda.activation_dim = self.itda.atoms.size(1)
+            self.itda.normalize_decoder()
+
+        # OMP reconstruction
+        recon = self.itda(flatten_x)
+
+        # Normalized MSE
+        eps = 1e-9
+        norm_x = flatten_x.norm(dim=1, keepdim=True).clamp_min(eps)
+        norm_recon = recon.norm(dim=1, keepdim=True).clamp_min(eps)
+        normalized_x = flatten_x / norm_x
+        normalized_recon = recon / norm_recon
+        errors = (normalized_x - normalized_recon).pow(2).mean(dim=1)
+
+        # Add new atoms for items above threshold
+        to_add = torch.nonzero(errors > self.loss_threshold, as_tuple=True)[0]
+        new_atoms_list = []
+        new_indices_list = []
+        for idx_item in to_add.tolist():
+            v = flatten_x[idx_item].unsqueeze(0)
+            new_atoms_list.append(v)
+            batch_i = idx_item // S
+            token_i = idx_item % S
+            global_seq_idx = step * B + batch_i
+            new_indices_list.append([global_seq_idx, token_i])
+
+        if len(new_atoms_list) > 0:
+            new_atoms = torch.cat(new_atoms_list, dim=0).to(self.itda.dtype)
+            new_atom_indices = torch.tensor(
+                new_indices_list, dtype=torch.long, device=self.device
+            )
+            updated_atoms = torch.cat([self.itda.atoms, new_atoms], dim=0)
+            updated_indices = torch.cat(
+                [self.itda.atom_indices, new_atom_indices], dim=0
+            )
+
+            self.itda.atoms = updated_atoms
+            self.itda.atom_indices = updated_indices
+            self.itda.dict_size = self.itda.atoms.size(0)
+            self.itda.activation_dim = self.itda.atoms.size(1)
+            self.itda.normalize_decoder()
+
+        # If we've exceeded max_dict_size, crop immediately
+        if (self.max_dict_size > 0) and (self.itda.atoms.size(0) > self.max_dict_size):
+            self.itda.atoms = self.itda.atoms[: self.max_dict_size].clone()
+            self.itda.atom_indices = self.itda.atom_indices[: self.max_dict_size].clone()
+            self.itda.dict_size = self.itda.atoms.size(0)
+            self.itda.activation_dim = self.itda.atoms.size(1)
+            self.itda = ITDA(
+                atoms=self.itda.atoms,
+                atom_indices=self.itda.atom_indices,
+                k=self.itda.k,
+            ).to(device=self.device, dtype=self.itda.dtype)
+
+        # Reinitialize to refresh internal state if needed
+        else:
+            self.itda = ITDA(
+                atoms=self.itda.atoms,
+                atom_indices=self.itda.atom_indices,
+                k=self.itda.k,
+            ).to(device=self.device, dtype=self.itda.dtype)
+
+        # Mean error for logging
+        return errors.mean().item()
 
 
 def run_training_loop(
-    trainer: MultiLayerITDATrainer,
+    trainers: List[ITDATrainer],
     data_stream,
     tokenizer,
     model: HookedTransformer,
@@ -378,30 +410,29 @@ def run_training_loop(
     wandb_project: str,
     wandb_entity: str = "",
     wandb_tags: Optional[List[str]] = None,
-    crop_dict_size: int = 0,
 ):
     """
-    Main training loop:
-      - Spawns a separate W&B process+queue per layer (separate run for each).
-      - Each layer logs to its own W&B run.
-      - Saves final artifacts to 'artifacts/runs/{run_id}' for each layer.
-      - Early-stops if ALL layers reach crop_dict_size (if crop_dict_size > 0).
-      - Still does a final cropping pass at the end (in case some overshoot).
+    Main training loop for multiple single-layer trainers.
+      - Spawns a separate W&B process+queue for each trainer.
+      - Each trainer logs to its own W&B run.
+      - Saves final artifacts to 'artifacts/runs/{run_id}' for each trainer.
+      - Early-stops if all *capable* trainers (those with a .full property) are full.
     """
-
+    # Prepare W&B processes
     layer_log_queues = {}
     wandb_processes = {}
     layer_run_dirs = {}
 
-    for layer_idx in trainer.layers:
+    # One W&B process per trainer
+    for trainer in trainers:
+        layer = trainer.layer
         run_id = "".join(random.choices(string.ascii_letters + string.digits, k=8))
         run_dir = os.path.join("artifacts", "runs", run_id)
         os.makedirs(run_dir, exist_ok=True)
-        layer_run_dirs[layer_idx] = run_dir
+        layer_run_dirs[layer] = run_dir
 
         layer_config = dict(trainer.config)
-        layer_config["layer"] = layer_idx
-        layer_config["wandb_name"] = f"{trainer.wandb_name}_layer_{layer_idx}"
+        layer_config["wandb_name"] = f"{trainer.wandb_name}_layer_{layer}"
 
         log_queue = mp.Queue()
         process = mp.Process(
@@ -417,22 +448,25 @@ def run_training_loop(
         )
         process.start()
 
-        layer_log_queues[layer_idx] = log_queue
-        wandb_processes[layer_idx] = process
+        layer_log_queues[layer] = log_queue
+        wandb_processes[layer] = process
 
-    hook_names = [f"blocks.{layer}.hook_resid_post" for layer in trainer.layers]
+    # Prepare caching hooks for only the layers we need
+    layers_of_interest = [t.layer for t in trainers]
+    hook_names = [f"blocks.{l}.hook_resid_post" for l in layers_of_interest]
 
     progress = tqdm(range(max_steps), desc="Training", unit="step")
     for step in progress:
+        # Get a batch of text from the stream
         batch = []
         for _ in range(batch_size):
             try:
                 text = next(data_stream)
             except StopIteration:
+                print("Data stream exhausted.")
                 break
             batch.append(text)
         if not batch:
-            print("Data stream exhausted.")
             break
 
         tokens = tokenizer(
@@ -443,93 +477,61 @@ def run_training_loop(
             return_tensors="pt",
         ).to(device)
 
+        # Forward pass with caching
         with torch.no_grad():
-            # Forward pass with caching up to the max layer we need
             _, cache = model.run_with_cache(
                 tokens["input_ids"],
-                stop_at_layer=max(trainer.layers) + 1,
+                stop_at_layer=max(layers_of_interest) + 1,
                 names_filter=hook_names,
             )
 
-        # Gather each layer’s activation from the cache
-        activations_dict = {
-            layer_idx: cache[f"blocks.{layer_idx}.hook_resid_post"]
-            for layer_idx in trainer.layers
-        }
+        # Update each single-layer trainer unless it's already full
+        for trainer in trainers:
+            if hasattr(trainer, "full") and trainer.full:
+                # Already full => skip
+                continue
 
-        # Update ITDA for each layer
-        layer_losses = trainer.update(step=step, activations_dict=activations_dict)
+            layer_idx = trainer.layer
+            x = cache[f"blocks.{layer_idx}.hook_resid_post"]  # [B, S, D]
+            loss_val = trainer.update(step, x)
 
-        # Log metrics to each layer's W&B queue
-        for layer_idx in trainer.layers:
+            # Log metrics to W&B queue
             log_data = {
                 "step": step,
-                "loss": layer_losses[layer_idx],
-                "dict_size": trainer.itdas[layer_idx].atoms.size(0),
+                "loss": loss_val,
+                "dict_size": trainer.itda.atoms.size(0),
             }
             layer_log_queues[layer_idx].put(log_data)
 
-        # TODO: This doesn't really work when there's multiple layers being
-        # trained - o1 pro being a bit brain dead here. Add in proper early
-        # stopping for each layer being trained.
-        if crop_dict_size > 0:
-            for layer_idx in trainer.layers:
-                itda = trainer.itdas[layer_idx]
-                if itda.atoms.size(0) > crop_dict_size:
-                    itda.atoms = itda.atoms[:crop_dict_size].clone()
-                    itda.atom_indices = itda.atom_indices[:crop_dict_size].clone()
-                    itda.dict_size = itda.atoms.size(0)
-                    itda.activation_dim = itda.atoms.size(1)
-                    trainer.itdas[layer_idx] = ITDA(
-                        atoms=itda.atoms,
-                        atom_indices=itda.atom_indices,
-                        k=itda.k,
-                    ).to(device=itda.device, dtype=itda.dtype)
-
-            all_full = all(
-                trainer.itdas[layer_idx].atoms.size(0) >= crop_dict_size
-                for layer_idx in trainer.layers
-            )
-            if all_full:
-                print("All layers reached the desired dictionary size. Early stopping.")
+        # Check if all trainers that define 'full' are indeed full
+        trainers_with_full = [t for t in trainers if hasattr(t, "full")]
+        if len(trainers_with_full) > 0:
+            if all(t.full for t in trainers_with_full):
+                print("All 'full'-capable trainers reached max dict size. Early stopping.")
                 break
 
-    if crop_dict_size > 0:
-        for layer_idx in trainer.layers:
-            itda = trainer.itdas[layer_idx]
-            current_size = itda.atoms.size(0)
-            if current_size > crop_dict_size:
-                itda.atoms = itda.atoms[:crop_dict_size].clone()
-                itda.atom_indices = itda.atom_indices[:crop_dict_size].clone()
-                itda.dict_size = itda.atoms.size(0)
-                itda.activation_dim = itda.atoms.size(1)
-                trainer.itdas[layer_idx] = ITDA(
-                    atoms=itda.atoms,
-                    atom_indices=itda.atom_indices,
-                    k=itda.k,
-                ).to(device=itda.device, dtype=itda.dtype)
-
-    for layer_idx in trainer.layers:
+    # Save artifacts and finish W&B for each trainer
+    for trainer in trainers:
+        layer_idx = trainer.layer
         run_dir = layer_run_dirs[layer_idx]
         atoms_path = os.path.join(run_dir, "atoms.pt")
         atom_indices_path = os.path.join(run_dir, "atom_indices.pt")
         metadata_path = os.path.join(run_dir, "metadata.yaml")
 
         # Save final dictionary data
-        torch.save(trainer.itdas[layer_idx].atoms, atoms_path)
-        torch.save(trainer.itdas[layer_idx].atom_indices, atom_indices_path)
+        torch.save(trainer.itda.atoms, atoms_path)
+        torch.save(trainer.itda.atom_indices, atom_indices_path)
 
         # Save metadata
         layer_cfg = dict(trainer.config)
-        layer_cfg["layer"] = layer_idx
         with open(metadata_path, "w") as f:
             yaml.dump(layer_cfg, f)
 
-        # Log the final dict_size
-        final_dict_size = trainer.itdas[layer_idx].atoms.size(0)
+        # Log final dict_size
+        final_dict_size = trainer.itda.atoms.size(0)
         layer_log_queues[layer_idx].put({"dict_size": final_dict_size})
 
-        # Notify W&B process of these artifacts
+        # Notify W&B process of artifacts
         layer_log_queues[layer_idx].put(
             {
                 "type": "artifact",
@@ -539,13 +541,13 @@ def run_training_loop(
             }
         )
 
-        # Signal that we're done
+        # Done
         layer_log_queues[layer_idx].put("DONE")
         wandb_processes[layer_idx].join()
 
     print("Training complete.")
-    for lidx, rdir in layer_run_dirs.items():
-        print(f" Layer {lidx} artifacts: {rdir}")
+    for trainer in trainers:
+        print(f" Layer {trainer.layer} artifacts: {layer_run_dirs[trainer.layer]}")
 
 
 def parse_args():
@@ -566,8 +568,10 @@ def parse_args():
         --device cuda \
         --crop_dict_size 100
     """
+    import argparse
+
     parser = argparse.ArgumentParser(
-        description="Multi-layer ITDA Trainer with separate W&B runs per layer."
+        description="Single-layer ITDA Trainer (spawn multiple trainers for multiple layers)."
     )
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument(
@@ -600,71 +604,75 @@ def parse_args():
         default=None,
         help="Comma-separated tags, e.g. 'tag1,tag2'.",
     )
+    # Renamed or re-used argument. We'll store it as 'max_dict_size' inside the trainer.
     parser.add_argument(
         "--crop_dict_size",
         type=int,
         default=0,
-        help="If > 0, stop early once dictionary reaches this size (per layer).",
+        help="If > 0, trainer stops updating dictionary once this size is reached.",
     )
+
     return parser.parse_args()
 
 
-def get_activation_dim(model_name):
-    model = HookedTransformer.from_pretrained(model_name, device="cpu")
-    return model.cfg.d_model
-
-
 if __name__ == "__main__":
+    # 1. Parse arguments
     args = parse_args()
-
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_grad_enabled(False)
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Compute the number of steps from total_sequences
+    # 2. Compute number of steps
     max_steps = args.total_sequences // args.batch_size
     if max_steps <= 0:
         raise ValueError(
             "The computed number of steps is 0 or negative. Check total_sequences and batch_size."
         )
 
-    # Prepare data stream from huggingface
+    # 3. Prepare data stream from Hugging Face dataset
     dataset = load_dataset(args.dataset_name, split="train", streaming=True)
     data_stream = (item["text"] for item in dataset)
-    activation_dim = get_activation_dim(args.model_name)
 
+    # 4. Load model and tokenizer
     model = HookedTransformer.from_pretrained(args.model_name, device=device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # 5. Get activation dimension
+    activation_dim = model.cfg.d_model
+
+    # 6. Build single-layer ITDA trainers
     layers_list = [int(x.strip()) for x in args.layers.split(",")]
+    trainers = []
+    for layer_idx in layers_list:
+        trainer = ITDATrainer(
+            layer=layer_idx,
+            steps=max_steps,
+            activation_dim=activation_dim,
+            k=args.k,
+            loss_threshold=args.loss_threshold,
+            batch_size=args.batch_size,
+            lm_name=args.model_name,
+            dataset=args.dataset_name,
+            seq_len=args.seq_len,
+            device=device,
+            submodule_name=args.submodule_name,
+            seed=args.seed,
+            # Here's where we attach the desired max dict size
+            max_dict_size=args.crop_dict_size,  
+        )
+        trainers.append(trainer)
 
-    # Build trainer
-    trainer = MultiLayerITDATrainer(
-        steps=max_steps,
-        layers=layers_list,
-        activation_dim=activation_dim,
-        k=args.k,
-        batch_size=args.batch_size,
-        loss_threshold=args.loss_threshold,
-        lm_name=args.model_name,
-        dataset=args.dataset_name,
-        seq_len=args.seq_len,
-        device=device,
-        submodule_name=args.submodule_name,
-        seed=args.seed,
-    )
-
-    # Optional W&B tags
+    # 7. Optional W&B tags
     wandb_tags = None
     if args.wandb_tags:
         wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
 
-    # Run training loop (with early stop if crop_dict_size > 0)
+    # 8. Run the (updated) training loop
     run_training_loop(
-        trainer=trainer,
+        trainers=trainers,
         data_stream=data_stream,
         tokenizer=tokenizer,
         model=model,
@@ -675,5 +683,4 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_tags=wandb_tags,
-        crop_dict_size=args.crop_dict_size,
     )
