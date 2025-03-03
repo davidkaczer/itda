@@ -1,8 +1,12 @@
 import argparse
-import pickle
 import json
 import os
 from typing import Any, Optional
+
+import torch
+import yaml
+import wandb
+from tqdm import tqdm
 
 import sae_bench.evals.absorption.main as absorption
 import sae_bench.evals.autointerp.main as autointerp
@@ -11,14 +15,9 @@ import sae_bench.evals.scr_and_tpp.main as scr_and_tpp
 import sae_bench.evals.sparse_probing.main as sparse_probing
 import sae_bench.evals.unlearning.main as unlearning
 import sae_bench.sae_bench_utils.general_utils as general_utils
-from dictionary_learning.dictionary import AutoEncoder
-import torch
-import yaml
-from ito_sae import ITO_SAE, ITO_SAEConfig
-from dl_train import ITDA
-from tqdm import tqdm
 
-import wandb
+from ito_sae import ITO_SAEConfig
+from dl_train import ITDA
 
 RANDOM_SEED = 42
 
@@ -43,7 +42,6 @@ MODEL_CONFIGS = {
     },
 }
 
-
 output_folders = {
     "absorption": "eval_results/absorption",
     "autointerp": "eval_results/autointerp",
@@ -67,11 +65,9 @@ def run_evals(
     save_activations: bool = False,
 ):
     """Run selected evaluations for the given model and SAEs."""
-
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unsupported model: {model_name}")
 
-    # Mapping of eval types to their functions and output paths
     eval_runners = {
         "absorption": (
             lambda: absorption.run_eval(
@@ -83,7 +79,7 @@ def run_evals(
                 ),
                 selected_saes,
                 device,
-                "eval_results/absorption",
+                output_folders["absorption"],
                 force_rerun,
             )
         ),
@@ -98,11 +94,10 @@ def run_evals(
                 selected_saes,
                 device,
                 api_key,
-                "eval_results/autointerp",
+                output_folders["autointerp"],
                 force_rerun,
             )
         ),
-        # TODO: Do a better job of setting num_batches and batch size
         "core": (
             lambda: core.multiple_evals(
                 selected_saes=selected_saes,
@@ -114,7 +109,7 @@ def run_evals(
                 exclude_special_tokens_from_reconstruction=True,
                 dataset="Skylion007/openwebtext",
                 context_size=128,
-                output_folder="eval_results/core",
+                output_folder=output_folders["core"],
                 verbose=True,
                 dtype=llm_dtype,
                 device=device,
@@ -131,7 +126,7 @@ def run_evals(
                 ),
                 selected_saes,
                 device,
-                "eval_results",  # We add scr or tpp depending on perform_scr
+                "eval_results",  # subfolder scr
                 force_rerun,
                 clean_up_activations=True,
                 save_activations=save_activations,
@@ -148,7 +143,7 @@ def run_evals(
                 ),
                 selected_saes,
                 device,
-                "eval_results",  # We add scr or tpp depending on perform_scr
+                "eval_results",  # subfolder tpp
                 force_rerun,
                 clean_up_activations=True,
                 save_activations=save_activations,
@@ -164,7 +159,7 @@ def run_evals(
                 ),
                 selected_saes,
                 device,
-                "eval_results/sparse_probing",
+                output_folders["sparse_probing"],
                 force_rerun,
                 clean_up_activations=True,
                 save_activations=save_activations,
@@ -180,36 +175,28 @@ def run_evals(
                 ),
                 selected_saes,
                 device,
-                "eval_results/unlearning",
+                output_folders["unlearning"],
                 force_rerun,
             )
         ),
     }
 
-    # Run selected evaluations
     for eval_type in tqdm(eval_types, desc="Evaluations"):
         if eval_type == "autointerp" and api_key is None:
             print("Skipping autointerp evaluation due to missing API key")
             continue
         if eval_type == "unlearning":
-            if model_name != "gemma-2-2b":
-                print("Skipping unlearning evaluation for non-GEMMA model")
-                continue
-            print("Skipping, need to clean up unlearning interface")
-            continue  # TODO:
-            if not os.path.exists(
-                "./sae_bench/evals/unlearning/data/bio-forget-corpus.jsonl"
-            ):
-                print(
-                    "Skipping unlearning evaluation due to missing bio-forget-corpus.jsonl"
-                )
-                continue
+            print("Skipping (example) unlearning for now... remove or handle if needed.")
+            continue
 
-        print(f"\n\n\nRunning {eval_type} evaluation\n\n\n")
+        print(f"\nRunning {eval_type} evaluation...\n")
+        runner = eval_runners.get(eval_type)
+        if runner is None:
+            print(f"No runner for eval_type {eval_type}!")
+            continue
 
-        if eval_type in eval_runners:
-            os.makedirs(output_folders[eval_type], exist_ok=True)
-            eval_runners[eval_type]()
+        os.makedirs(output_folders[eval_type], exist_ok=True)
+        runner()
 
 
 def flatten_dict(d, parent_key="", sep="/"):
@@ -229,19 +216,20 @@ def flatten_dict(d, parent_key="", sep="/"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run_id", type=str, help="Run ID for ITO_SAE")
+    parser.add_argument("--run_id", type=str, help="W&B run ID (or artifact prefix).")
     parser.add_argument(
-        "--eval_types", nargs="+", default=["core"], help="List of eval types"
+        "--eval_types", nargs="+", default=["core"], help="List of evaluation types."
     )
     parser.add_argument(
-        "--force_rerun", action="store_true", help="Force re-running all evals"
+        "--force_rerun", action="store_true", help="Force re-running all evals."
     )
     args = parser.parse_args()
 
+    # Set up environment
     device = general_utils.setup_environment()
 
     eval_types = args.eval_types
-    # If autointerp is requested, load API key if present
+    # If autointerp is requested, try loading an API key
     if "autointerp" in eval_types:
         try:
             with open("openai_api_key.txt") as f:
@@ -251,46 +239,60 @@ if __name__ == "__main__":
     else:
         api_key = None
 
-    # Load model configs
+    api = wandb.Api()
+    run = api.run(f"patrickaaleask/itda/{args.run_id}")
+    artifact_name = [a.name for a in run.logged_artifacts() if "ITDA" in a.name][0]
 
-    selected_saes = []
+    wandb.init(
+        project="itda",
+        id=args.run_id,
+        resume="allow",
+    )
+    print(f"Downloading artifact '{artifact_name}' from W&B...")
+    artifact = wandb.use_artifact(artifact_name, type="model")
+    artifact_dir = artifact.download()
+    print(f"Artifact downloaded to: {artifact_dir}")
 
-    run_dir = os.path.join("artifacts", "runs", args.run_id)
-    meta_path = os.path.join(run_dir, "metadata.yaml")
-    if not os.path.exists(run_dir):
-        raise FileNotFoundError(f"No run found at {run_dir}")
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"No metadata.yaml found in {run_dir}")
+    meta_path = os.path.join(artifact_dir, "metadata.yaml")
+    atoms_path = os.path.join(artifact_dir, "atoms.pt")
+    atom_indices_path = os.path.join(artifact_dir, "atom_indices.pt")
+
+    if not (os.path.exists(meta_path) and os.path.exists(atoms_path) and os.path.exists(atom_indices_path)):
+        raise FileNotFoundError(
+            "Could not find one of [metadata.yaml, atoms.pt, atom_indices.pt] in the artifact."
+        )
 
     with open(meta_path, "r") as f:
         sae_metadata = yaml.safe_load(f)
+
+    if sae_metadata["lm_name"] not in MODEL_CONFIGS:
+        raise ValueError(f"Unsupported model: {sae_metadata['lm_name']}")
 
     model_config = MODEL_CONFIGS[sae_metadata["lm_name"]]
     d_model = model_config["d_model"]
     llm_batch_size = model_config["batch_size"]
     llm_dtype = model_config["dtype"]
-    hook_layer = model_config["layers"][0]
 
-    atoms_path = os.path.join(run_dir, "atoms.pt")
-    if not os.path.exists(atoms_path):
-        raise FileNotFoundError("No atoms.pt found for the specified ITO run")
-    atoms = torch.load(atoms_path).to(device)
+    # This is the actual layer used in training—must match what your training code produced
+    hook_layer = sae_metadata["layer"]
 
-    atom_indices_path = os.path.join(run_dir, "atom_indices.pt")
-    if not os.path.exists(atom_indices_path):
-        raise FileNotFoundError("No atom_indices.pt found for the specified ITO run")
-    atom_indices = torch.load(atom_indices_path).to(device)
+    # Load the actual ITDA dictionary
+    print("Loading atoms and atom_indices from artifact directory...")
+    atoms = torch.load(atoms_path, map_location=device)
+    atom_indices = torch.load(atom_indices_path, map_location=device)
 
-    ito_sae = ITDA(
-        atoms,
-        atom_indices,
-        k=sae_metadata["k"], # XXX: for some reason drops about 15% of the l0
+    # Construct the ITDA (or ITO_SAE) object
+    # If you are actually using ITO_SAE, be sure to instantiate that class the same way:
+    itda = ITDA(
+        atoms=atoms,
+        atom_indices=atom_indices,
+        k=sae_metadata["k"],  # or whatever is stored
         cfg=ITO_SAEConfig(
             model_name=sae_metadata["lm_name"],
             dtype=llm_dtype,
             d_in=d_model,
             d_sae=atoms.size(0),
-            hook_layer=sae_metadata["layer"],
+            hook_layer=hook_layer,
             hook_name=f"blocks.{hook_layer}.hook_resid_post",
             prepend_bos=True,
             normalize_activations="none",
@@ -299,50 +301,49 @@ if __name__ == "__main__":
             device=device,
         ),
     )
-    ito_sae.normalize_decoder()
-    selected_saes.append((args.run_id, ito_sae))
+    itda.normalize_decoder()
 
-    if not selected_saes:
-        raise ValueError(
-            "No SAEs selected. Provide either an ITO run ID or use --pretrained_saes."
-        )
+    # Put it into a list for SAE-Bench style calls
+    selected_saes = [(args.run_id, itda)]
+
+    ############################################################################
+    # 2. Run your evaluations
+    ############################################################################
 
     run_evals(
         sae_metadata["lm_name"],
         selected_saes,
-        llm_batch_size // 32,
+        llm_batch_size // 32,  # or use exactly llm_batch_size if desired
         llm_dtype,
         device,
-        eval_types=eval_types,
+        eval_types=args.eval_types,
         api_key=api_key,
         force_rerun=args.force_rerun,
         save_activations=True,
     )
 
-    # Upload the evaluation results to the wandb run of the ITO_SAE
-    wandb.init(
-        project="itda",
-        id=args.run_id,
-        resume="allow",
-    )
+    ############################################################################
+    # 3. Upload the evaluation results back to W&B
+    ############################################################################
 
-    for eval_type in eval_types:
+    for eval_type in args.eval_types:
         result_path = os.path.join(
             "eval_results", eval_type, f"{args.run_id}_custom_sae_eval_results.json"
         )
         if not os.path.isfile(result_path):
-            print(f"Could not find results for {eval_type} at {result_path}.")
+            print(f"No results found for {eval_type} at {result_path}")
             continue
 
+        # Optionally log results as artifacts
         artifact_name = f"eval_{eval_type}"
         artifact = wandb.Artifact(name=artifact_name, type="evaluation")
         artifact.add_file(result_path)
         wandb.log_artifact(artifact)
-        print(f"Uploaded {result_path} to wandb as artifact '{artifact_name}'.")
+        print(f"Uploaded {result_path} to W&B as artifact '{artifact_name}'.")
 
+        # If you have metrics to log directly:
         with open(result_path, "r") as f:
             results = json.load(f)
-
         eval_result_metrics = results.get("eval_result_metrics", {})
         if eval_result_metrics:
             flattened_metrics = flatten_dict(eval_result_metrics, parent_key=eval_type)
