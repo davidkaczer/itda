@@ -12,10 +12,27 @@ import torch.nn as nn
 import yaml
 from datasets import load_dataset
 from tqdm import tqdm
-from transformer_lens import HookedTransformer
-from transformers import AutoTokenizer
 
+# For W&B logging
 import wandb
+
+# Transformer Lens is optional; only import if we need it
+try:
+    from transformer_lens import HookedTransformer
+except ImportError:
+    HookedTransformer = None
+
+# Hugging Face
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+###############################################################################
+#                               WANDB PROCESS                                  #
+###############################################################################
+
+
+def get_activation_dim(model_name):
+    model = HookedTransformer.from_pretrained(model_name, device="cpu")
+    return model.cfg.d_model
 
 
 def new_wandb_process(id, config, log_queue, entity, project, tags=None):
@@ -64,6 +81,11 @@ def new_wandb_process(id, config, log_queue, entity, project, tags=None):
     wandb.finish()
 
 
+###############################################################################
+#                          MATCHING PURSUIT ENCODER                           #
+###############################################################################
+
+
 def mp_encode(D, x, n_nonzero_coefs):
     """
     Simple Orthogonal Matching Pursuit-like procedure (aka Matching Pursuit).
@@ -88,6 +110,11 @@ def mp_encode(D, x, n_nonzero_coefs):
         residuals -= coeff_vals.unsqueeze(1) * D[best_atoms]
 
     return coefficients
+
+
+###############################################################################
+#                         ITERATIVE DICTIONARY ADDER                          #
+###############################################################################
 
 
 class ITDA(nn.Module):
@@ -198,6 +225,11 @@ class ITDA(nn.Module):
         return self
 
 
+###############################################################################
+#                               SINGLE-LAYER TRAINER                          #
+###############################################################################
+
+
 class ITDATrainer:
     """
     Single-layer trainer that internally manages one ITDA instance.
@@ -264,7 +296,7 @@ class ITDATrainer:
             "seq_len": self.seq_len,
             "batch_size": self.batch_size,
             "seed": self.seed,
-            "max_dict_size": self.max_dict_size,  # keep track of it for logging
+            "max_dict_size": self.max_dict_size,
         }
 
     @property
@@ -285,7 +317,6 @@ class ITDATrainer:
 
         If we're already 'full', do a no-op and return 0.0 (or some sentinel).
         """
-        # If trainer is already full, skip any further updates
         if self.full:
             return 0.0
 
@@ -327,7 +358,9 @@ class ITDATrainer:
             )
             # Concat
             updated_atoms = torch.cat([self.itda.atoms, new_rows], dim=0)
-            updated_indices = torch.cat([self.itda.atom_indices, new_atom_indices], dim=0)
+            updated_indices = torch.cat(
+                [self.itda.atom_indices, new_atom_indices], dim=0
+            )
 
             self.itda.atoms = updated_atoms
             self.itda.atom_indices = updated_indices
@@ -377,7 +410,9 @@ class ITDATrainer:
         # If we've exceeded max_dict_size, crop immediately
         if (self.max_dict_size > 0) and (self.itda.atoms.size(0) > self.max_dict_size):
             self.itda.atoms = self.itda.atoms[: self.max_dict_size].clone()
-            self.itda.atom_indices = self.itda.atom_indices[: self.max_dict_size].clone()
+            self.itda.atom_indices = self.itda.atom_indices[
+                : self.max_dict_size
+            ].clone()
             self.itda.dict_size = self.itda.atoms.size(0)
             self.itda.activation_dim = self.itda.atoms.size(1)
             self.itda = ITDA(
@@ -385,9 +420,8 @@ class ITDATrainer:
                 atom_indices=self.itda.atom_indices,
                 k=self.itda.k,
             ).to(device=self.device, dtype=self.itda.dtype)
-
-        # Reinitialize to refresh internal state if needed
         else:
+            # Reinitialize to refresh internal state if needed
             self.itda = ITDA(
                 atoms=self.itda.atoms,
                 atom_indices=self.itda.atom_indices,
@@ -398,11 +432,16 @@ class ITDATrainer:
         return errors.mean().item()
 
 
+###############################################################################
+#                           MAIN TRAINING LOOP                                #
+###############################################################################
+
+
 def run_training_loop(
     trainers: List[ITDATrainer],
     data_stream,
     tokenizer,
-    model: HookedTransformer,
+    model,
     max_steps: int,
     batch_size: int,
     seq_len: int,
@@ -410,6 +449,7 @@ def run_training_loop(
     wandb_project: str,
     wandb_entity: str = "",
     wandb_tags: Optional[List[str]] = None,
+    use_huggingface: bool = False,
 ):
     """
     Main training loop for multiple single-layer trainers.
@@ -423,7 +463,6 @@ def run_training_loop(
     wandb_processes = {}
     layer_run_dirs = {}
 
-    # One W&B process per trainer
     for trainer in trainers:
         layer = trainer.layer
         run_id = "".join(random.choices(string.ascii_letters + string.digits, k=8))
@@ -451,13 +490,15 @@ def run_training_loop(
         layer_log_queues[layer] = log_queue
         wandb_processes[layer] = process
 
-    # Prepare caching hooks for only the layers we need
     layers_of_interest = [t.layer for t in trainers]
-    hook_names = [f"blocks.{l}.hook_resid_post" for l in layers_of_interest]
-
     progress = tqdm(range(max_steps), desc="Training", unit="step")
+
+    # If we are using Transformer Lens, define the hook names:
+    if not use_huggingface:
+        hook_names = [f"blocks.{l}.hook_resid_post" for l in layers_of_interest]
+
     for step in progress:
-        # Get a batch of text from the stream
+        # 1. Get a batch of text from the stream
         batch = []
         for _ in range(batch_size):
             try:
@@ -469,6 +510,7 @@ def run_training_loop(
         if not batch:
             break
 
+        # 2. Tokenize
         tokens = tokenizer(
             batch,
             padding="max_length",
@@ -477,22 +519,35 @@ def run_training_loop(
             return_tensors="pt",
         ).to(device)
 
-        # Forward pass with caching
-        with torch.no_grad():
-            _, cache = model.run_with_cache(
-                tokens["input_ids"],
-                stop_at_layer=max(layers_of_interest) + 1,
-                names_filter=hook_names,
-            )
+        # 3. Forward pass and collect hidden states
+        if use_huggingface:
+            # Hugging Face approach
+            with torch.no_grad():
+                outputs = model(**tokens, output_hidden_states=True)
+                all_hidden_states = outputs.hidden_states  # tuple of length #layers+1
+        else:
+            # Transformer Lens approach
+            with torch.no_grad():
+                # run_with_cache from Transformer Lens
+                _, cache = model.run_with_cache(
+                    tokens["input_ids"],
+                    stop_at_layer=max(layers_of_interest) + 1,
+                    names_filter=hook_names,
+                )
 
-        # Update each single-layer trainer unless it's already full
+        # 4. Update each trainer
         for trainer in trainers:
-            if hasattr(trainer, "full") and trainer.full:
+            if trainer.full:
                 # Already full => skip
                 continue
 
             layer_idx = trainer.layer
-            x = cache[f"blocks.{layer_idx}.hook_resid_post"]  # [B, S, D]
+            if use_huggingface:
+                # hidden_states[0] is embeddings => so layer=0 => hidden_states[1]
+                x = all_hidden_states[layer_idx + 1]  # [B, S, D]
+            else:
+                x = cache[f"blocks.{layer_idx}.hook_resid_post"]  # [B, S, D]
+
             loss_val = trainer.update(step, x)
 
             # Log metrics to W&B queue
@@ -503,14 +558,16 @@ def run_training_loop(
             }
             layer_log_queues[layer_idx].put(log_data)
 
-        # Check if all trainers that define 'full' are indeed full
+        # 5. Early stop if all trainers that have 'full' are full
         trainers_with_full = [t for t in trainers if hasattr(t, "full")]
         if len(trainers_with_full) > 0:
             if all(t.full for t in trainers_with_full):
-                print("All 'full'-capable trainers reached max dict size. Early stopping.")
+                print(
+                    "All 'full'-capable trainers reached max dict size. Early stopping."
+                )
                 break
 
-    # Save artifacts and finish W&B for each trainer
+    # 6. Save artifacts and finish W&B for each trainer
     for trainer in trainers:
         layer_idx = trainer.layer
         run_dir = layer_run_dirs[layer_idx]
@@ -550,6 +607,11 @@ def run_training_loop(
         print(f" Layer {trainer.layer} artifacts: {layer_run_dirs[trainer.layer]}")
 
 
+###############################################################################
+#                                ARG PARSING                                  #
+###############################################################################
+
+
 def parse_args():
     """
     Example usage:
@@ -566,10 +628,11 @@ def parse_args():
         --wandb_entity "my_entity" \
         --wandb_tags tag1,tag2 \
         --device cuda \
-        --crop_dict_size 100
+        --crop_dict_size 100 \
+        --use_huggingface \
+        --offload_to_disk \
+        --offload_folder ./offload_weights
     """
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="Single-layer ITDA Trainer (spawn multiple trainers for multiple layers)."
     )
@@ -604,24 +667,46 @@ def parse_args():
         default=None,
         help="Comma-separated tags, e.g. 'tag1,tag2'.",
     )
-    # Renamed or re-used argument. We'll store it as 'max_dict_size' inside the trainer.
     parser.add_argument(
         "--crop_dict_size",
         type=int,
         default=0,
         help="If > 0, trainer stops updating dictionary once this size is reached.",
     )
+    parser.add_argument(
+        "--use_huggingface",
+        action="store_true",
+        default=False,
+        help="Use a Hugging Face model instead of Transformer Lens.",
+    )
+    # -----------------------------
+    # NEW ARGUMENTS FOR OFFLOADING
+    # -----------------------------
+    parser.add_argument(
+        "--offload_to_disk",
+        action="store_true",
+        default=False,
+        help="If set, will offload model weights to disk (only valid with --use_huggingface).",
+    )
+    parser.add_argument(
+        "--offload_folder",
+        type=str,
+        default="offload",
+        help="Folder path for offloaded weights (only used if --offload_to_disk is set).",
+    )
 
     return parser.parse_args()
+
+
+###############################################################################
+#                                  MAIN                                       #
+###############################################################################
 
 
 if __name__ == "__main__":
     # 1. Parse arguments
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    torch.set_grad_enabled(False)
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_tf32 = True
 
     # 2. Compute number of steps
     max_steps = args.total_sequences // args.batch_size
@@ -635,13 +720,38 @@ if __name__ == "__main__":
     data_stream = (item["text"] for item in dataset)
 
     # 4. Load model and tokenizer
-    model = HookedTransformer.from_pretrained(args.model_name, device=device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 5. Get activation dimension
-    activation_dim = model.cfg.d_model
+    if args.use_huggingface:
+        print("Loading Hugging Face model...")
+        if args.offload_to_disk:
+            # Offload model weights to disk
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                device_map="auto",
+                offload_folder=args.offload_folder,
+                torch_dtype=torch.float16,
+            )
+        else:
+            # Normal loading
+            model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    else:
+        if HookedTransformer is None:
+            raise ImportError(
+                "transformer_lens is not installed, or failed to import. "
+                "Please install it or use --use_huggingface."
+            )
+        print("Loading Transformer Lens (HookedTransformer)...")
+        model = HookedTransformer.from_pretrained(args.model_name, device=device)
+
+    # 5. Determine the activation dimension
+    if args.use_huggingface:
+        # Typically in HF config
+        activation_dim = model.config.hidden_size
+    else:
+        activation_dim = model.cfg.d_model
 
     # 6. Build single-layer ITDA trainers
     layers_list = [int(x.strip()) for x in args.layers.split(",")]
@@ -660,8 +770,7 @@ if __name__ == "__main__":
             device=device,
             submodule_name=args.submodule_name,
             seed=args.seed,
-            # Here's where we attach the desired max dict size
-            max_dict_size=args.crop_dict_size,  
+            max_dict_size=args.crop_dict_size,
         )
         trainers.append(trainer)
 
@@ -670,7 +779,7 @@ if __name__ == "__main__":
     if args.wandb_tags:
         wandb_tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
 
-    # 8. Run the (updated) training loop
+    # 8. Run the training loop
     run_training_loop(
         trainers=trainers,
         data_stream=data_stream,
@@ -683,4 +792,5 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_tags=wandb_tags,
+        use_huggingface=args.use_huggingface,
     )

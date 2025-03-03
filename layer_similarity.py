@@ -360,7 +360,7 @@ def compute_or_load_measure(
                         num_examples=num_examples,
                         num_layers=num_layers,
                     )
-                    ai_gpu = ai_cpu.to(device)
+                    ai_gpu = ai_cpu.to(device)[:1000]
 
                     for lj in range(1, num_layers):
                         # Load only the current layer lj for model_j
@@ -375,7 +375,7 @@ def compute_or_load_measure(
                             num_examples=num_examples,
                             num_layers=num_layers,
                         )
-                        aj_gpu = aj_cpu.to(device)
+                        aj_gpu = aj_cpu.to(device)[:1000]
 
                         # Compute the requested similarity measure
                         if measure == "svcca":
