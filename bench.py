@@ -35,7 +35,7 @@ MODEL_CONFIGS = {
         "d_model": 512,
     },
     "google/gemma-2-2b": {
-        "batch_size": 16,
+        "batch_size": 32,
         "dtype": "bfloat16",
         "layers": [5, 12, 19],
         "d_model": 2304,

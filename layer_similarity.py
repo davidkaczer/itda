@@ -15,7 +15,7 @@ import yaml
 import zarr
 from datasets import load_dataset
 from dictionary_learning.dictionary import Dictionary
-from dl_train import MultiLayerITDATrainer, run_training_loop
+from dl_train import ITDATrainer, run_training_loop
 from get_model_activations_transformerlens import get_activations_tl
 from get_model_activations import get_activations_hf
 from tqdm import tqdm
@@ -230,6 +230,7 @@ def linear_regression_r2_torch(X, Y, eps=1e-12):
 def get_atoms_from_wandb_run(run, wandb_project):
     api = wandb.Api()
     artifact_refs = [a.name for a in run.logged_artifacts()]
+    artifact_refs = [a for a in artifact_refs if "ITDA" in a]
     if len(artifact_refs) != 1:
         raise ValueError("Expected exactly one artifact in the run.")
     artifact_refs = f"{wandb_project}/{artifact_refs[0]}"
@@ -280,7 +281,7 @@ def load_itda_similarities(
                 loaded_indices = get_atoms_from_wandb_run(run, wandb_project)[1]
             except ValueError as e:
                 raise ValueError(
-                    e, f"Error loading atom indices for {model} layer {layer}"
+                    f"Error loading atom indices for {model} layer {layer}: {str(e)}"
                 )
             atom_indices[-1].append(loaded_indices)
 
@@ -304,6 +305,35 @@ def load_itda_similarities(
     os.makedirs("artifacts/similarities", exist_ok=True)
     np.save(itda_path, itda_sims)
     return itda_sims
+
+
+def relative_similarity(X, Y, num_anchors=300, seed=42):
+    """
+    Compute latent space similarity using relative representations.
+
+    Args:
+        X (torch.Tensor): Embeddings from model X [num_samples, embedding_dim].
+        Y (torch.Tensor): Embeddings from model Y [num_samples, embedding_dim].
+        num_anchors (int): Number of anchors.
+        seed (int): Random seed for reproducibility.
+
+    Returns:
+        float: Mean cosine similarity between relative embeddings.
+    """
+    assert X.shape == Y.shape, "X and Y must have the same shape."
+
+    generator = torch.Generator(device=X.device).manual_seed(seed)
+    anchor_indices = torch.randperm(X.shape[0], generator=generator)[:num_anchors]
+
+    anchors_X = X[anchor_indices]
+    anchors_Y = Y[anchor_indices]
+
+    X_rel = F.cosine_similarity(X[:, None, :], anchors_X[None, :, :], dim=-1)
+    Y_rel = F.cosine_similarity(Y[:, None, :], anchors_Y[None, :, :], dim=-1)
+
+    similarity = F.cosine_similarity(X_rel, Y_rel, dim=-1).mean()
+
+    return similarity.item()
 
 
 import os
@@ -360,7 +390,7 @@ def compute_or_load_measure(
                         num_examples=num_examples,
                         num_layers=num_layers,
                     )
-                    ai_gpu = ai_cpu.to(device)[:1000]
+                    ai_gpu = ai_cpu.to(device)
 
                     for lj in range(1, num_layers):
                         # Load only the current layer lj for model_j
@@ -375,15 +405,17 @@ def compute_or_load_measure(
                             num_examples=num_examples,
                             num_layers=num_layers,
                         )
-                        aj_gpu = aj_cpu.to(device)[:1000]
+                        aj_gpu = aj_cpu.to(device)
 
                         # Compute the requested similarity measure
-                        if measure == "svcca":
+                        if measure == SVCCA:
                             sim = svcca_torch(ai_gpu, aj_gpu)
-                        elif measure == "cka":
+                        elif measure == CKA:
                             sim = linear_cka_torch(ai_gpu, aj_gpu)
-                        elif measure == "linreg_r2":
+                        elif measure == LINREG:
                             sim = linear_regression_r2_torch(ai_gpu, aj_gpu)
+                        elif measure == RELATIVE:
+                            sim = relative_similarity(ai_gpu, aj_gpu)
                         else:
                             raise ValueError(f"Unknown measure: {measure}")
 
@@ -485,20 +517,21 @@ if __name__ == "__main__":
                 continue
 
         print(f"Training ITDA for model={model_name}, layers={train_layers} ...")
-        trainer_cfg = {
-            "activation_dim": ACTIVATION_DIM,
-            "k": 40,
-            "loss_threshold": TARGET_LOSS,
-            "layers": train_layers,
-            "lm_name": model_name,
-            "device": device,
-            "steps": NUM_EXAMPLES // BATCH_SIZE,
-            "dataset": DATASET,
-            "seq_len": SEQ_LEN,
-            "batch_size": BATCH_SIZE,
-            "seed": 0,
-        }
-        trainer = MultiLayerITDATrainer(**trainer_cfg)
+        trainers = []
+        for layer_idx in train_layers:
+            trainer = ITDATrainer(
+                layer=layer_idx,
+                steps=NUM_EXAMPLES // BATCH_SIZE,
+                activation_dim=model.cfg.d_model,
+                k=40,
+                loss_threshold=TARGET_LOSS,
+                device=device,
+                dataset=DATASET,
+                seq_len=SEQ_LEN,
+                batch_size=BATCH_SIZE,
+                seed=0,
+            )
+            trainers.append(trainer)
 
         dataset = load_dataset(DATASET, split="train", streaming=True)
         data_stream = (item["text"] for item in dataset)
@@ -509,13 +542,13 @@ if __name__ == "__main__":
             tokenizer.pad_token = tokenizer.eos_token
 
         run_training_loop(
-            trainer=trainer,
+            trainers=trainers,
             data_stream=data_stream,
             tokenizer=tokenizer,
             model=model,
-            max_steps=trainer_cfg["steps"],
+            max_steps=NUM_EXAMPLES // BATCH_SIZE,
             batch_size=BATCH_SIZE,
-            seq_len=trainer_cfg["seq_len"],
+            seq_len=SEQ_LEN,
             device=device,
             wandb_project=WANDB_PROJECT,
             wandb_entity=args.wandb_entity,
@@ -541,9 +574,10 @@ if __name__ == "__main__":
     CKA = "cka"
     SVCCA = "svcca"
     LINREG = "linreg_r2"
+    RELATIVE = "relative"
 
     # Prepare placeholders in a dictionary for each measure
-    for measure in [CKA, SVCCA, LINREG]:
+    for measure in [CKA, SVCCA, LINREG, RELATIVE]:
         similarities[measure] = compute_or_load_measure(
             measure=measure,
             models=MODELS,
@@ -562,7 +596,7 @@ if __name__ == "__main__":
     target = np.arange(NUM_LAYERS - 1).reshape(1, 1, NUM_LAYERS - 1)
     target = target + np.zeros((len(MODELS), len(MODELS), 1), dtype=int)
 
-    for measure in [ITDA, SVCCA, CKA, LINREG]:
+    for measure in [ITDA, SVCCA, CKA, LINREG, RELATIVE]:
         sims = similarities[measure].argmax(axis=-1)
         accuracy = (target == sims).sum() / target.size
         print(f"{measure.upper()} accuracy: {accuracy:.4f}")
@@ -574,9 +608,10 @@ if __name__ == "__main__":
         SVCCA: "SVCCA",
         CKA: "Linear CKA",
         LINREG: "Linear Regression R²",
+        RELATIVE: "Relative Similarity",
     }
 
-    for measure in [SVCCA, CKA, ITDA, LINREG]:
+    for measure in [SVCCA, CKA, ITDA, LINREG, RELATIVE]:
         heatmap = similarities[measure].mean(axis=(0, 1))
         plt.figure(figsize=(4, 4))
         im = plt.imshow(heatmap, cmap="viridis")
