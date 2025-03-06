@@ -9,25 +9,8 @@ from huggingface_hub import snapshot_download
 import os
 
 if __name__ == "__main__":
-    # hf_repo_id = "adamkarvonen/sae_bench_results"
-    local_dir = "./sae_bench_results"
-    # os.makedirs(local_dir, exist_ok=true)
-
-    # snapshot_download(
-    #     repo_id=hf_repo_id,
-    #     local_dir=local_dir,
-    #     repo_type="dataset",
-    #     ignore_patterns=[
-    #         "*autointerp_with_generations*",
-    #         "*core_with_feature_statistics*",
-    #     ],
-    # )
-
-    print(os.listdir(local_dir))
-
-# %%
-
-    sae_bench_df = pd.DataFrame(sae_bench_data)
+    file_path = '/home/patrick/Documents/mats/example_saes/sae_bench_data_old.json'
+    sae_bench_df = pd.read_json(file_path)
     result_df = sae_bench_df[sae_bench_df["modelId"] != "gemma-2-9b"]
     result_df["saeType"] = "SAE"
 
@@ -40,9 +23,9 @@ if __name__ == "__main__":
     # New metrics from JSON
     # ------------------------------------------------
     result_df["autointerp_score"] = result_df["autointerp||autointerp||autointerp_score"]
-    result_df["sae_test_accuracy"] = result_df["sparse_probing||llm||llm_test_accuracy"]
-    result_df["sae_top_1_test_accuracy"] = result_df["sparse_probing||llm||llm_top_1_test_accuracy"]
-    result_df["sae_top_5_test_accuracy"] = result_df["sparse_probing||llm||llm_top_5_test_accuracy"]
+    result_df["sae_test_accuracy"] = result_df["sparse_probing||sae||sae_test_accuracy"]
+    result_df["sae_top_1_test_accuracy"] = result_df["sparse_probing||sae||sae_top_1_test_accuracy"]
+    result_df["sae_top_5_test_accuracy"] = result_df["sparse_probing||sae||sae_top_5_test_accuracy"]
 
     # ------------------------------------------------
     # Other columns used for filtering/plotting
@@ -67,7 +50,7 @@ if __name__ == "__main__":
     ################################################################
     # 2) Filter to targets for l0
     ################################################################
-    targets = np.array([8, 16, 40, 80])
+    targets = np.array([8, 16, 20, 40, 80])
 
     mask = np.any(
         (result_df["l0"].values[:, None] >= targets * 0.9)
@@ -160,6 +143,9 @@ if __name__ == "__main__":
         # 3) Loop over each (modelId, layer) pair and plot
         for ax, (model, layer) in zip(axes, unique_combos.values):
             subdf = df[(df["modelId"] == model) & (df["layer"] == layer)]
+            
+            if model == "gemma-2-2b":
+                subdf = subdf[subdf["l0"] > 16]
 
             # Separate out ITDA vs. SAE
             itda_part = subdf[subdf["saeType"] == "ITDA"].copy()
@@ -180,7 +166,7 @@ if __name__ == "__main__":
             # Group by l0 for standard 4k ReLU => use the aggregator for "worst"
             # (Was previously .max() for best; now we do .agg(WORST_AGG[metric_name]))
             sae_std_4096 = (
-                sae_part[(sae_part["saeClass"] == "standard") & (sae_part["dSae"] == 4096)]
+                sae_part[(sae_part["dSae"] == 4096)]
                 .groupby("l0")[metric_name]
                 .agg(WORST_AGG[metric_name])
                 .reset_index()
