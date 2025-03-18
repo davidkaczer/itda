@@ -26,21 +26,42 @@ except ImportError:
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 ###############################################################################
+#                         HOOK-BASED CAPTURE FOR HUGGING FACE                 #
+###############################################################################
+
+def capture_hidden_states_hf(model, tokens, layers_of_interest):
+    """
+    Currently only works for ~llama
+    """
+    hidden_states_dict = {}
+    hooks = []
+
+    def hook_factory(idx):
+        def hook(module, input, output):
+            # We'll store the post-layer hidden state in hidden_states_dict
+            if idx in layers_of_interest:
+                hidden_states_dict[idx] = output[0].detach()
+        return hook
+
+    # Register hooks only on the layers we care about
+    for i, layer_module in enumerate(model.model.layers):
+        hooks.append(layer_module.register_forward_hook(hook_factory(i)))
+
+    # Do a forward pass. We don't need output_hidden_states=True.
+    _ = model(**tokens)
+
+    # Remove hooks to avoid leaking references
+    for h in hooks:
+        h.remove()
+
+    return hidden_states_dict
+
+
+###############################################################################
 #                               WANDB PROCESS                                  #
 ###############################################################################
 
-
-def get_activation_dim(model_name):
-    model = HookedTransformer.from_pretrained(model_name, device="cpu")
-    return model.cfg.d_model
-
-
 def new_wandb_process(id, config, log_queue, entity, project, tags=None):
-    """
-    Spawns a W&B run for a single layer.
-    Continuously pulls logs from `log_queue` until it sees 'DONE'.
-    Handles 'artifact' messages to upload atoms/atom_indices/metadata.
-    """
     wandb.init(
         id=id,
         entity=entity,
@@ -80,22 +101,11 @@ def new_wandb_process(id, config, log_queue, entity, project, tags=None):
                 wandb.log(log)
     wandb.finish()
 
-
 ###############################################################################
 #                          MATCHING PURSUIT ENCODER                           #
 ###############################################################################
 
-
 def mp_encode(D, x, n_nonzero_coefs):
-    """
-    Simple Orthogonal Matching Pursuit-like procedure (aka Matching Pursuit).
-    Args:
-        D: Dictionary of shape [num_atoms, activation_dim].
-        x: Activations of shape [batch_size, activation_dim].
-        n_nonzero_coefs: int, how many nonzero coefficients to keep in OMP.
-    Returns:
-        coefficients: [batch_size, num_atoms].
-    """
     batch_size = x.size(0)
     num_dict_atoms = D.size(0)
 
@@ -111,17 +121,11 @@ def mp_encode(D, x, n_nonzero_coefs):
 
     return coefficients
 
-
 ###############################################################################
 #                         ITERATIVE DICTIONARY ADDER                          #
 ###############################################################################
 
-
 class ITDA(nn.Module):
-    """
-    Core Iterative Dictionary Adder (ITDA) with an OMP-like encoding step.
-    """
-
     def __init__(
         self, atoms: torch.Tensor, atom_indices: torch.Tensor, k: int, cfg=None
     ):
@@ -154,23 +158,15 @@ class ITDA(nn.Module):
 
     @classmethod
     def from_pretrained(cls, path: str, device: Optional[str] = None) -> "ITDA":
-        """
-        Load a pre-trained ITDA instance (atoms, atom_indices, and metadata)
-        from a directory produced by this training script.
-        """
         metadata_path = os.path.join(path, "metadata.yaml")
         atoms_path = os.path.join(path, "atoms.pt")
         atom_indices_path = os.path.join(path, "atom_indices.pt")
 
-        # Load metadata
         with open(metadata_path, "r") as f:
             cfg = yaml.safe_load(f)
 
-        # Load atoms and atom_indices
         atoms = torch.load(atoms_path, map_location=device)
         atom_indices = torch.load(atom_indices_path, map_location=device)
-
-        # Pull 'k' from config
         k = cfg.get("k", 40)
 
         itda = cls(
@@ -195,10 +191,6 @@ class ITDA(nn.Module):
 
     @property
     def W_enc(self):
-        """
-        Required for certain external APIs (like SAE-bench).
-        This is not used for OMP in practice, so we just return zeros.
-        """
         return torch.zeros(
             (self.atoms.size(1), self.atoms.size(0)), device=self.atoms.device
         )
@@ -224,18 +216,11 @@ class ITDA(nn.Module):
         self.atoms = self.atoms / norms.unsqueeze(1)
         return self
 
-
 ###############################################################################
 #                               SINGLE-LAYER TRAINER                          #
 ###############################################################################
 
-
 class ITDATrainer:
-    """
-    Single-layer trainer that internally manages one ITDA instance.
-    Handles the dictionary-building logic for 'layer' of a model.
-    """
-
     def __init__(
         self,
         layer: int,
@@ -251,7 +236,7 @@ class ITDATrainer:
         wandb_name: str = "ITDA",
         submodule_name: Optional[str] = None,
         seed: Optional[int] = None,
-        max_dict_size: int = 0,  # <--- New parameter
+        max_dict_size: int = 0,
     ):
         self.layer = layer
         self.steps = steps
@@ -266,11 +251,8 @@ class ITDATrainer:
         self.wandb_name = wandb_name
         self.submodule_name = submodule_name
         self.seed = seed
-
-        # New: max dictionary size we allow
         self.max_dict_size = max_dict_size
 
-        # ITDA instance for this layer
         self.itda = ITDA(
             atoms=torch.empty((0, activation_dim), device=self.device),
             atom_indices=torch.empty((0, 2), dtype=torch.long, device=self.device),
@@ -279,9 +261,6 @@ class ITDATrainer:
 
     @property
     def config(self) -> dict:
-        """
-        Returns a dictionary suitable for logging/metadata.
-        """
         return {
             "wandb_name": self.wandb_name,
             "layer": self.layer,
@@ -301,34 +280,21 @@ class ITDATrainer:
 
     @property
     def full(self) -> bool:
-        """
-        Returns True if we have a max_dict_size > 0 and the dictionary
-        has reached (or exceeded) that size. Once 'full' is True,
-        we skip further updates (i.e., no-op).
-        """
         if self.max_dict_size <= 0:
             return False
         return self.itda.atoms.size(0) >= self.max_dict_size
 
     def update(self, step: int, x: torch.Tensor) -> float:
-        """
-        Update the single-layer dictionary using the activations x (shape [B, S, D]).
-        Returns the mean error (float) for logging.
-
-        If we're already 'full', do a no-op and return 0.0 (or some sentinel).
-        """
         if self.full:
             return 0.0
 
         B, S, D = x.shape
         flatten_x = x.reshape(-1, D).to(self.itda.dtype)
 
-        # If dictionary is empty, fix shape
         if self.itda.atoms.size(0) == 0:
             self.itda.atoms = torch.empty((0, D), device=self.device)
             self.itda.activation_dim = D
 
-        # Possibly expand dictionary if not full rank yet
         current_num_atoms = self.itda.atoms.size(0)
         dict_dim = D if current_num_atoms == 0 else self.itda.atoms.size(1)
         if current_num_atoms < dict_dim:
@@ -356,7 +322,6 @@ class ITDATrainer:
             new_atom_indices = torch.tensor(
                 new_atom_indices, dtype=torch.long, device=self.device
             )
-            # Concat
             updated_atoms = torch.cat([self.itda.atoms, new_rows], dim=0)
             updated_indices = torch.cat(
                 [self.itda.atom_indices, new_atom_indices], dim=0
@@ -368,10 +333,8 @@ class ITDATrainer:
             self.itda.activation_dim = self.itda.atoms.size(1)
             self.itda.normalize_decoder()
 
-        # OMP reconstruction
         recon = self.itda(flatten_x)
 
-        # Normalized MSE
         eps = 1e-9
         norm_x = flatten_x.norm(dim=1, keepdim=True).clamp_min(eps)
         norm_recon = recon.norm(dim=1, keepdim=True).clamp_min(eps)
@@ -379,7 +342,6 @@ class ITDATrainer:
         normalized_recon = recon / norm_recon
         errors = (normalized_x - normalized_recon).pow(2).mean(dim=1)
 
-        # Add new atoms for items above threshold
         to_add = torch.nonzero(errors > self.loss_threshold, as_tuple=True)[0]
         new_atoms_list = []
         new_indices_list = []
@@ -407,12 +369,9 @@ class ITDATrainer:
             self.itda.activation_dim = self.itda.atoms.size(1)
             self.itda.normalize_decoder()
 
-        # If we've exceeded max_dict_size, crop immediately
         if (self.max_dict_size > 0) and (self.itda.atoms.size(0) > self.max_dict_size):
             self.itda.atoms = self.itda.atoms[: self.max_dict_size].clone()
-            self.itda.atom_indices = self.itda.atom_indices[
-                : self.max_dict_size
-            ].clone()
+            self.itda.atom_indices = self.itda.atom_indices[: self.max_dict_size].clone()
             self.itda.dict_size = self.itda.atoms.size(0)
             self.itda.activation_dim = self.itda.atoms.size(1)
             self.itda = ITDA(
@@ -421,21 +380,17 @@ class ITDATrainer:
                 k=self.itda.k,
             ).to(device=self.device, dtype=self.itda.dtype)
         else:
-            # Reinitialize to refresh internal state if needed
             self.itda = ITDA(
                 atoms=self.itda.atoms,
                 atom_indices=self.itda.atom_indices,
                 k=self.itda.k,
             ).to(device=self.device, dtype=self.itda.dtype)
 
-        # Mean error for logging
         return errors.mean().item()
-
 
 ###############################################################################
 #                           MAIN TRAINING LOOP                                #
 ###############################################################################
-
 
 def run_training_loop(
     trainers: List[ITDATrainer],
@@ -451,14 +406,6 @@ def run_training_loop(
     wandb_tags: Optional[List[str]] = None,
     use_huggingface: bool = False,
 ):
-    """
-    Main training loop for multiple single-layer trainers.
-      - Spawns a separate W&B process+queue for each trainer.
-      - Each trainer logs to its own W&B run.
-      - Saves final artifacts to 'artifacts/runs/{run_id}' for each trainer.
-      - Early-stops if all *capable* trainers (those with a .full property) are full.
-    """
-    # Prepare W&B processes
     layer_log_queues = {}
     wandb_processes = {}
     layer_run_dirs = {}
@@ -493,12 +440,11 @@ def run_training_loop(
     layers_of_interest = [t.layer for t in trainers]
     progress = tqdm(range(max_steps), desc="Training", unit="step")
 
-    # If we are using Transformer Lens, define the hook names:
+    # If we are using Transformer Lens, define the hook names
     if not use_huggingface:
         hook_names = [f"blocks.{l}.hook_resid_post" for l in layers_of_interest]
 
     for step in progress:
-        # 1. Get a batch of text from the stream
         batch = []
         for _ in range(batch_size):
             try:
@@ -510,7 +456,6 @@ def run_training_loop(
         if not batch:
             break
 
-        # 2. Tokenize
         tokens = tokenizer(
             batch,
             padding="max_length",
@@ -519,38 +464,31 @@ def run_training_loop(
             return_tensors="pt",
         ).to(device)
 
-        # 3. Forward pass and collect hidden states
         if use_huggingface:
-            # Hugging Face approach
+            # Capture only the layers we care about, using forward hooks
             with torch.no_grad():
-                outputs = model(**tokens, output_hidden_states=True)
-                all_hidden_states = outputs.hidden_states  # tuple of length #layers+1
+                hidden_states_dict = capture_hidden_states_hf(model, tokens, layers_of_interest)
         else:
             # Transformer Lens approach
             with torch.no_grad():
-                # run_with_cache from Transformer Lens
                 _, cache = model.run_with_cache(
                     tokens["input_ids"],
                     stop_at_layer=max(layers_of_interest) + 1,
                     names_filter=hook_names,
                 )
 
-        # 4. Update each trainer
         for trainer in trainers:
             if trainer.full:
-                # Already full => skip
                 continue
 
             layer_idx = trainer.layer
             if use_huggingface:
-                # hidden_states[0] is embeddings => so layer=0 => hidden_states[1]
-                x = all_hidden_states[layer_idx + 1]  # [B, S, D]
+                x = hidden_states_dict[layer_idx]  # [B, S, D]
             else:
                 x = cache[f"blocks.{layer_idx}.hook_resid_post"]  # [B, S, D]
 
             loss_val = trainer.update(step, x)
 
-            # Log metrics to W&B queue
             log_data = {
                 "step": step,
                 "loss": loss_val,
@@ -558,16 +496,14 @@ def run_training_loop(
             }
             layer_log_queues[layer_idx].put(log_data)
 
-        # 5. Early stop if all trainers that have 'full' are full
+        # Early stop if all trainers that have 'full' are full
         trainers_with_full = [t for t in trainers if hasattr(t, "full")]
         if len(trainers_with_full) > 0:
             if all(t.full for t in trainers_with_full):
-                print(
-                    "All 'full'-capable trainers reached max dict size. Early stopping."
-                )
+                print("All 'full'-capable trainers reached max dict size. Early stopping.")
                 break
 
-    # 6. Save artifacts and finish W&B for each trainer
+    # Save artifacts and finish W&B for each trainer
     for trainer in trainers:
         layer_idx = trainer.layer
         run_dir = layer_run_dirs[layer_idx]
@@ -575,20 +511,16 @@ def run_training_loop(
         atom_indices_path = os.path.join(run_dir, "atom_indices.pt")
         metadata_path = os.path.join(run_dir, "metadata.yaml")
 
-        # Save final dictionary data
         torch.save(trainer.itda.atoms, atoms_path)
         torch.save(trainer.itda.atom_indices, atom_indices_path)
 
-        # Save metadata
         layer_cfg = dict(trainer.config)
         with open(metadata_path, "w") as f:
             yaml.dump(layer_cfg, f)
 
-        # Log final dict_size
         final_dict_size = trainer.itda.atoms.size(0)
         layer_log_queues[layer_idx].put({"dict_size": final_dict_size})
 
-        # Notify W&B process of artifacts
         layer_log_queues[layer_idx].put(
             {
                 "type": "artifact",
@@ -598,7 +530,6 @@ def run_training_loop(
             }
         )
 
-        # Done
         layer_log_queues[layer_idx].put("DONE")
         wandb_processes[layer_idx].join()
 
@@ -606,18 +537,47 @@ def run_training_loop(
     for trainer in trainers:
         print(f" Layer {trainer.layer} artifacts: {layer_run_dirs[trainer.layer]}")
 
-
 ###############################################################################
 #                                ARG PARSING                                  #
 ###############################################################################
 
+def parse_layer_ranges(layers_str: str):
+    """
+    Parses a string like "0,1,2-4,10" into a list [0,1,2,3,4,10].
+    Raises ValueError if the format is invalid.
+    """
+    all_layers = []
+    chunks = [chunk.strip() for chunk in layers_str.split(",")]
+    for chunk in chunks:
+        if "-" in chunk:
+            # Range format like "2-5"
+            parts = chunk.split("-")
+            if len(parts) != 2:
+                raise ValueError(f"Invalid range chunk: '{chunk}'")
+            start_str, end_str = parts
+            try:
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError:
+                raise ValueError(f"Invalid range chunk: '{chunk}'")
+            if start > end:
+                raise ValueError(f"Range start must not exceed end: '{chunk}'")
+            all_layers.extend(range(start, end + 1))
+        else:
+            # Single index
+            try:
+                layer = int(chunk)
+            except ValueError:
+                raise ValueError(f"Invalid layer index: '{chunk}'")
+            all_layers.append(layer)
+    return list(sorted(set(all_layers)))  # Sort and deduplicate if you like
 
 def parse_args():
     """
     Example usage:
       python dl_train.py \
         --model_name EleutherAI/pythia-70m-deduped \
-        --layers 0,1,2 \
+        --layers 0,1,2-5 \
         --dataset_name monology/pile-uncopyrighted \
         --seq_len 128 \
         --batch_size 4 \
@@ -633,6 +593,8 @@ def parse_args():
         --offload_to_disk \
         --offload_folder ./offload_weights
     """
+    import argparse
+
     parser = argparse.ArgumentParser(
         description="Single-layer ITDA Trainer (spawn multiple trainers for multiple layers)."
     )
@@ -644,7 +606,7 @@ def parse_args():
         "--layers",
         type=str,
         required=True,
-        help="Comma-separated layer indices (e.g. '0,1,2')",
+        help="Comma-separated layer indices or ranges, e.g. '0,1,2-5'.",
     )
     parser.add_argument("--seq_len", type=int, required=True)
     parser.add_argument("--batch_size", type=int, required=True)
@@ -699,7 +661,6 @@ def parse_args():
 #                                  MAIN                                       #
 ###############################################################################
 
-
 if __name__ == "__main__":
     # 1. Parse arguments
     args = parse_args()
@@ -713,10 +674,12 @@ if __name__ == "__main__":
         )
 
     # 3. Prepare data stream from Hugging Face dataset
+    from datasets import load_dataset
     dataset = load_dataset(args.dataset_name, split="train", streaming=True)
     data_stream = (item["text"] for item in dataset)
 
     # 4. Load model and tokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -724,33 +687,26 @@ if __name__ == "__main__":
     if args.use_huggingface:
         print("Loading Hugging Face model...")
         if args.offload_to_disk:
-            # Offload model weights to disk
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_name,
                 device_map="auto",
                 offload_folder=args.offload_folder,
+                torch_dtype=torch.float16,
             )
         else:
-            # Normal loading
             model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
-    else:
-        if HookedTransformer is None:
-            raise ImportError(
-                "transformer_lens is not installed, or failed to import. "
-                "Please install it or use --use_huggingface."
-            )
-        print("Loading Transformer Lens (HookedTransformer)...")
-        model = HookedTransformer.from_pretrained(args.model_name, device=device)
-
-    # 5. Determine the activation dimension
-    if args.use_huggingface:
-        # Typically in HF config
+        # Activation dimension from HF config
         activation_dim = model.config.hidden_size
     else:
+        print("Loading Transformer Lens (HookedTransformer)...")
+        from transformer_lens import HookedTransformer
+        model = HookedTransformer.from_pretrained(args.model_name, device=device)
         activation_dim = model.cfg.d_model
 
+    # 5. Expand the layers argument
+    layers_list = parse_layer_ranges(args.layers)
+
     # 6. Build single-layer ITDA trainers
-    layers_list = [int(x.strip()) for x in args.layers.split(",")]
     trainers = []
     for layer_idx in layers_list:
         trainer = ITDATrainer(
