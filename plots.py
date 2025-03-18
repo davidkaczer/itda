@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 import os
 
 if __name__ == "__main__":
-    file_path = '/home/patrick/Documents/mats/example_saes/sae_bench_data_old.json'
+    file_path = "/home/patrick/Documents/mats/example_saes/sae_bench_data_old.json"
     sae_bench_df = pd.read_json(file_path)
     result_df = sae_bench_df[sae_bench_df["modelId"] != "gemma-2-9b"]
     result_df["saeType"] = "SAE"
@@ -17,15 +17,23 @@ if __name__ == "__main__":
     # ------------------------------------------------
     # Existing metric: CE loss score
     # ------------------------------------------------
-    result_df["ce_loss_score"] = result_df["core||model_performance_preservation||ce_loss_score"]
+    result_df["ce_loss_score"] = result_df[
+        "core||model_performance_preservation||ce_loss_score"
+    ]
 
     # ------------------------------------------------
     # New metrics from JSON
     # ------------------------------------------------
-    result_df["autointerp_score"] = result_df["autointerp||autointerp||autointerp_score"]
+    result_df["autointerp_score"] = result_df[
+        "autointerp||autointerp||autointerp_score"
+    ]
     result_df["sae_test_accuracy"] = result_df["sparse_probing||sae||sae_test_accuracy"]
-    result_df["sae_top_1_test_accuracy"] = result_df["sparse_probing||sae||sae_top_1_test_accuracy"]
-    result_df["sae_top_5_test_accuracy"] = result_df["sparse_probing||sae||sae_top_5_test_accuracy"]
+    result_df["sae_top_1_test_accuracy"] = result_df[
+        "sparse_probing||sae||sae_top_1_test_accuracy"
+    ]
+    result_df["sae_top_5_test_accuracy"] = result_df[
+        "sparse_probing||sae||sae_top_5_test_accuracy"
+    ]
 
     # ------------------------------------------------
     # Other columns used for filtering/plotting
@@ -60,7 +68,9 @@ if __name__ == "__main__":
     df_filtered = result_df[mask].copy()
 
     # Round each l0 to the closest target
-    df_filtered["l0"] = df_filtered["l0"].apply(lambda x: targets[np.argmin(np.abs(targets - x))])
+    df_filtered["l0"] = df_filtered["l0"].apply(
+        lambda x: targets[np.argmin(np.abs(targets - x))]
+    )
 
     ################################################################
     # 3) Load ITDA data from W&B
@@ -81,12 +91,22 @@ if __name__ == "__main__":
                 "layer": run.config.get("layer"),
                 "dSae": run.summary.get("dict_size"),
                 # Existing metric
-                "ce_loss_score": run.summary.get("core/model_performance_preservation/ce_loss_score"),
+                "ce_loss_score": run.summary.get(
+                    "core/model_performance_preservation/ce_loss_score"
+                ),
                 # New metrics
-                "autointerp_score": run.summary.get("autointerp/autointerp/autointerp_score"),
-                "sae_test_accuracy": run.summary.get("sparse_probing/sae/sae_test_accuracy"),
-                "sae_top_1_test_accuracy": run.summary.get("sparse_probing/sae/sae_top_1_test_accuracy"),
-                "sae_top_5_test_accuracy": run.summary.get("sparse_probing/sae/sae_top_5_test_accuracy"),
+                "autointerp_score": run.summary.get(
+                    "autointerp/autointerp/autointerp_score"
+                ),
+                "sae_test_accuracy": run.summary.get(
+                    "sparse_probing/sae/sae_test_accuracy"
+                ),
+                "sae_top_1_test_accuracy": run.summary.get(
+                    "sparse_probing/sae/sae_top_1_test_accuracy"
+                ),
+                "sae_top_5_test_accuracy": run.summary.get(
+                    "sparse_probing/sae/sae_top_5_test_accuracy"
+                ),
                 "l0": k,
             }
         )
@@ -103,7 +123,10 @@ if __name__ == "__main__":
     # Filter for specific (modelId, layer) combos
     combined_df = combined_df[
         ((combined_df["modelId"] == "pythia-70m-deduped") & (combined_df["layer"] == 3))
-        | ((combined_df["modelId"] == "pythia-160m-deduped") & (combined_df["layer"] == 8))
+        | (
+            (combined_df["modelId"] == "pythia-160m-deduped")
+            & (combined_df["layer"] == 8)
+        )
         | ((combined_df["modelId"] == "gemma-2-2b") & (combined_df["layer"] == 12))
     ]
 
@@ -114,9 +137,9 @@ if __name__ == "__main__":
     # For metrics where bigger = better, we use 'min'
     # Adjust if you have different scoring conventions
     WORST_AGG = {
-        "ce_loss_score": "max",            # higher CE loss => worse
-        "autointerp_score": "min",         # assume higher autointerp score => better, so min is worst
-        "sae_test_accuracy": "min",        # higher accuracy => better, so min is worst
+        "ce_loss_score": "max",  # higher CE loss => worse
+        "autointerp_score": "min",  # assume higher autointerp score => better, so min is worst
+        "sae_test_accuracy": "min",  # higher accuracy => better, so min is worst
         "sae_top_1_test_accuracy": "min",  # same reasoning
         "sae_top_5_test_accuracy": "min",  # same reasoning
     }
@@ -143,7 +166,7 @@ if __name__ == "__main__":
         # 3) Loop over each (modelId, layer) pair and plot
         for ax, (model, layer) in zip(axes, unique_combos.values):
             subdf = df[(df["modelId"] == model) & (df["layer"] == layer)]
-            
+
             if model == "gemma-2-2b":
                 subdf = subdf[subdf["l0"] > 16]
 
@@ -158,8 +181,8 @@ if __name__ == "__main__":
 
             # Group by l0 for all SAE => best overall (unchanged logic: use max)
             #   (This part is still "best" because the user didn't ask to change
-            #    the best 16k/64k logic. 
-            #    If you want "worst" for that, you can also switch to .min() or .max() 
+            #    the best 16k/64k logic.
+            #    If you want "worst" for that, you can also switch to .min() or .max()
             #    as appropriate.)
             sae_max_all = sae_part.groupby("l0")[metric_name].max().reset_index()
 
@@ -181,7 +204,11 @@ if __name__ == "__main__":
                     color="blue",
                     label="4k ITDA (min)",
                 )
-                bigger_dict_label = "64k ITDA" if model in ["pythia-160m-deduped", "gemma-2-2b"] else "16k ITDA"
+                bigger_dict_label = (
+                    "64k ITDA"
+                    if model in ["pythia-160m-deduped", "gemma-2-2b"]
+                    else "16k ITDA"
+                )
                 ax.plot(
                     itda_grouped["l0"],
                     itda_grouped["max"],
@@ -203,7 +230,11 @@ if __name__ == "__main__":
 
             # --- Plot the best 16k or 64k SAE
             if not sae_max_all.empty:
-                bigger_sae_label = "64k SAE" if model in ["pythia-160m-deduped", "gemma-2-2b"] else "16k SAE"
+                bigger_sae_label = (
+                    "64k SAE"
+                    if model in ["pythia-160m-deduped", "gemma-2-2b"]
+                    else "16k SAE"
+                )
                 ax.scatter(
                     sae_max_all["l0"],
                     sae_max_all[metric_name],

@@ -679,9 +679,6 @@ def parse_args():
         default=False,
         help="Use a Hugging Face model instead of Transformer Lens.",
     )
-    # -----------------------------
-    # NEW ARGUMENTS FOR OFFLOADING
-    # -----------------------------
     parser.add_argument(
         "--offload_to_disk",
         action="store_true",
@@ -732,7 +729,6 @@ if __name__ == "__main__":
                 args.model_name,
                 device_map="auto",
                 offload_folder=args.offload_folder,
-                torch_dtype=torch.float16,
             )
         else:
             # Normal loading

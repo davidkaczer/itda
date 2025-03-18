@@ -5,7 +5,6 @@ import os
 from itertools import product
 from typing import Optional
 
-from dl_train import get_activation_dim
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -15,15 +14,16 @@ import yaml
 import zarr
 from datasets import load_dataset
 from dictionary_learning.dictionary import Dictionary
-from dl_train import ITDATrainer, run_training_loop
-from get_model_activations_transformerlens import get_activations_tl
+from dl_train import ITDATrainer, get_activation_dim, run_training_loop
 from get_model_activations import get_activations_hf
+from get_model_activations_transformerlens import get_activations_tl
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
 from transformers import AutoModel, AutoTokenizer
+import torch
+import torch.nn.functional as F
 
 import wandb
-
 
 # Define GPT-2 model configurations
 GPT2_MODELS = {
@@ -307,39 +307,57 @@ def load_itda_similarities(
     return itda_sims
 
 
-def relative_similarity(X, Y, num_anchors=300, seed=42):
+def relative_similarity(X, Y, num_anchors=300, seed=42, batch_size=512):
     """
-    Compute latent space similarity using relative representations.
+    Compute latent space similarity using relative representations in a batched manner
+    to avoid out-of-memory (OOM) issues.
 
     Args:
         X (torch.Tensor): Embeddings from model X [num_samples, embedding_dim].
         Y (torch.Tensor): Embeddings from model Y [num_samples, embedding_dim].
-        num_anchors (int): Number of anchors.
+        num_anchors (int): Number of anchors to sample.
         seed (int): Random seed for reproducibility.
+        batch_size (int): Chunk size for batched computation.
 
     Returns:
         float: Mean cosine similarity between relative embeddings.
     """
     assert X.shape == Y.shape, "X and Y must have the same shape."
 
-    generator = torch.Generator(device=X.device).manual_seed(seed)
-    anchor_indices = torch.randperm(X.shape[0], generator=generator)[:num_anchors]
+    # Set the random generator for reproducible anchor sampling
+    generator = torch.Generator().manual_seed(seed)
+    anchor_indices = torch.randperm(X.shape[0], generator=generator)[:num_anchors].to(
+        X.device
+    )
 
+    # Extract the anchor points
     anchors_X = X[anchor_indices]
     anchors_Y = Y[anchor_indices]
 
-    X_rel = F.cosine_similarity(X[:, None, :], anchors_X[None, :, :], dim=-1)
-    Y_rel = F.cosine_similarity(Y[:, None, :], anchors_Y[None, :, :], dim=-1)
+    total_sim_sum = 0.0
+    total_count = 0
 
-    similarity = F.cosine_similarity(X_rel, Y_rel, dim=-1).mean()
+    # Process X and Y in chunks
+    for i in range(0, X.shape[0], batch_size):
+        X_chunk = X[i : i + batch_size]
+        Y_chunk = Y[i : i + batch_size]
 
-    return similarity.item()
+        # Cosine similarity of each chunk to the anchors
+        X_chunk_rel = F.cosine_similarity(
+            X_chunk[:, None, :], anchors_X[None, :, :], dim=-1
+        )
+        Y_chunk_rel = F.cosine_similarity(
+            Y_chunk[:, None, :], anchors_Y[None, :, :], dim=-1
+        )
 
+        # Now compute the similarity between these relative representations
+        chunk_sim = F.cosine_similarity(X_chunk_rel, Y_chunk_rel, dim=-1)
 
-import os
-import numpy as np
-import torch
-from tqdm import tqdm
+        total_sim_sum += chunk_sim.sum().item()
+        total_count += chunk_sim.size(0)
+
+    return total_sim_sum / total_count
+
 
 def compute_or_load_measure(
     measure,
@@ -390,7 +408,7 @@ def compute_or_load_measure(
                         num_examples=num_examples,
                         num_layers=num_layers,
                     )
-                    ai_gpu = ai_cpu.to(device)
+                    ai_gpu = ai_cpu.to(device)[:100000]
 
                     for lj in range(1, num_layers):
                         # Load only the current layer lj for model_j
@@ -405,7 +423,7 @@ def compute_or_load_measure(
                             num_examples=num_examples,
                             num_layers=num_layers,
                         )
-                        aj_gpu = aj_cpu.to(device)
+                        aj_gpu = aj_cpu.to(device)[:100000]
 
                         # Compute the requested similarity measure
                         if measure == SVCCA:
@@ -491,8 +509,6 @@ if __name__ == "__main__":
     SEQ_LEN = 128
     NUM_EXAMPLES = 10_000
     WANDB_PROJECT = args.wandb_project  # e.g. "itda"
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 1) Check existing runs (ITDA) on W&B
     existing_itdas = get_layered_runs_for_models(
