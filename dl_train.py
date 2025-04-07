@@ -322,7 +322,7 @@ class ITDATrainer:
             new_atom_indices = torch.tensor(
                 new_atom_indices, dtype=torch.long, device=self.device
             )
-            updated_atoms = torch.cat([self.itda.atoms, new_rows], dim=0)
+            updated_atoms = torch.cat([self.itda.atoms.to(x.device), new_rows.to(x.device)], dim=0)
             updated_indices = torch.cat(
                 [self.itda.atom_indices, new_atom_indices], dim=0
             )

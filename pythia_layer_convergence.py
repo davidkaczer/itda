@@ -68,7 +68,7 @@ from collections import defaultdict
 
 import torch
 from get_model_activations import get_activations_hf
-from train import train_ito_saes
+from arithmetic.arithmetic import train_ito_saes
 
 import wandb
 
