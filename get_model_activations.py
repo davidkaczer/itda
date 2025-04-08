@@ -263,7 +263,12 @@ def get_activations_hf(
 if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     torch.set_grad_enabled(False)
 
     parser = argparse.ArgumentParser()
