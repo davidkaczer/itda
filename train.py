@@ -4,8 +4,11 @@ import string
 import os
 import argparse
 import uuid
+import time
 from queue import Empty
 from typing import Dict, List, Optional
+
+from socketio.exceptions import ConnectionError as SocketIOConnectionError
 
 import torch
 import torch.multiprocessing as mp
@@ -453,6 +456,8 @@ def run_training_loop(
     if not use_huggingface:
         hook_names = [f"blocks.{l}.hook_resid_post" for l in layers_of_interest]
 
+    connection_error_count = 0
+
     for step in tqdm(range(max_steps), desc="Training", unit="step"):
         batch = [next(data_stream) for _ in range(batch_size)]
         tokens = tokenizer(
@@ -469,9 +474,25 @@ def run_training_loop(
                     model, tokens, layers_of_interest
                 )
         elif use_ndif:
-            hidden_states_dict = capture_hidden_states_ndif(
-                model, tokens, layers_of_interest
-            )
+            try:
+                hidden_states_dict = capture_hidden_states_ndif(
+                    model, tokens, layers_of_interest
+                )
+                connection_error_count = 0
+            except SocketIOConnectionError:
+                connection_error_count += 1
+                print(
+                    f"Connection error while capturing activations. "
+                    f"Waiting 5 minutes before retry ({connection_error_count}/5)."
+                )
+                time.sleep(5 * 60)
+                if connection_error_count >= 5:
+                    print(
+                        "Encountered 5 connection errors in a row. Aborting training loop."
+                    )
+                    break
+                else:
+                    continue
         else:
             with torch.no_grad():
                 _, cache = model.run_with_cache(
