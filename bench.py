@@ -21,7 +21,7 @@ import sae_bench.evals.unlearning.main as unlearning
 import sae_bench.sae_bench_utils.general_utils as general_utils
 
 from ito_sae import ITO_SAEConfig
-from dl_train import ITDA
+from example_saes.train import ITDA
 
 RANDOM_SEED = 42
 
