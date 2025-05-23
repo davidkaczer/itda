@@ -1,3 +1,6 @@
+"""
+Model similarity results using ITDA.
+"""
 import argparse
 from itertools import product
 

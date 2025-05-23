@@ -1,3 +1,11 @@
+"""
+Checks whether the indices of the atoms and the activations of the atoms match.
+
+At some point during development, I made a code error that resulted in the
+indices of the atoms and the activations of the atoms not matching. That error
+was a bit of a pain to figure out, so I'm leaving this script here in case
+something similar happens again.
+"""
 import torch
 from datasets import load_dataset
 from layer_similarity import get_atoms_from_wandb_run

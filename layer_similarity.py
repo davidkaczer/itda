@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+"""
+Get layer similarity results using ITDAs and other similarity measures.
+"""
 
 import argparse
 import os
@@ -14,7 +16,7 @@ import yaml
 import zarr
 from datasets import load_dataset
 from dictionary_learning.dictionary import Dictionary
-from dl_train import ITDATrainer, get_activation_dim, run_training_loop
+from example_saes.train import ITDATrainer, get_activation_dim, run_training_loop
 from get_model_activations import get_activations_hf
 from get_model_activations_transformerlens import get_activations_tl
 from tqdm import tqdm

@@ -1,3 +1,7 @@
+"""
+Script for running SAE Bench evaluations on ITDAs from W&B. Uploads results to
+W&B.
+"""
 import argparse
 import json
 import os

@@ -1,3 +1,6 @@
+"""
+Assorted plots for the paper.
+"""
 # %%
 import json
 import numpy as np

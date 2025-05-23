@@ -1,3 +1,6 @@
+"""
+Layer convergence results.
+"""
 # %%
 import re
 from collections import defaultdict

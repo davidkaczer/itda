@@ -1,3 +1,6 @@
+"""
+Code for manual inspection of ITDA latent activations.
+"""
 # %%
 
 import os
@@ -10,7 +13,7 @@ import yaml
 from datasets import load_dataset
 from dictionary_learning.dictionary import Dictionary
 from dictionary_learning.trainers.trainer import SAETrainer
-from dl_train import ITDA, model_configs
+from example_saes.train import ITDA, model_configs
 from IPython.display import HTML, display
 from tqdm import tqdm
 from transformer_lens import HookedTransformer
