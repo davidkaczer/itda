@@ -1,5 +1,36 @@
 """Usage:
 python eval_with_steering.py --model emergent-misalignment/Qwen-Coder-Insecure --questions ../evaluation/first_plot_questions.yaml --steering_config steering_config.yaml
+
+Example steering_config.yaml with ITDA latents:
+
+vectors:
+  # Traditional prompt-based steering
+  - type: prompt
+    positive_prompt: "Be helpful and honest"
+    negative_prompt: "Be deceptive" 
+    layer: 15
+    coefficient: 2.0
+    normalize: true
+    name: "honesty_vector"
+    
+  # Single ITDA latent
+  - type: itda_latent
+    itda_path: "path/to/itda_model.pt"
+    latent_index: 42
+    layer: 15
+    coefficient: 1.5
+    normalize: true
+    reference_prompt: "Hello, how are you?"
+    name: "creativity_latent"
+    
+  # Multiple ITDA latents from same model
+  - type: itda_multi
+    itda_path: "path/to/itda_model.pt"
+    latent_indices: [10, 25, 42]
+    layer: 15
+    coefficients: [1.0, 2.0, -1.5]
+    normalize: true
+    names: ["helpful", "creative", "critical"]
 """
 
 import asyncio
@@ -14,8 +45,10 @@ import random
 from typing import Optional, List, Dict, Any
 from transformer_lens import HookedTransformer
 import numpy as np
+from tqdm import tqdm
 
 from judge import OpenAiJudge
+from steering_utils import create_itda_steering_config, create_multiple_itda_steering_configs
 
 
 def sample_with_steering(
@@ -38,14 +71,32 @@ def sample_with_steering(
             activations[:, -1, :] += coeff * vector.unsqueeze(0)
         return activations
     
-    # Convert all conversations to text
+    # Convert all conversations to text using chat template
     texts = []
     for messages in conversations:
-        if len(messages) == 1 and messages[0]["role"] == "user":
-            text = messages[0]["content"]
+        # Apply chat template if available
+        if hasattr(model.tokenizer, 'apply_chat_template') and model.tokenizer.chat_template is not None:
+            try:
+                # Apply chat template and get the formatted text
+                text = model.tokenizer.apply_chat_template(
+                    messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+            except Exception as e:
+                print(f"Warning: Failed to apply chat template: {e}")
+                # Fallback to simple content extraction
+                if len(messages) == 1 and messages[0]["role"] == "user":
+                    text = messages[0]["content"]
+                else:
+                    text = messages[-1]["content"]
         else:
-            # Handle multi-turn conversations if needed
-            text = messages[-1]["content"]  # Use last user message for simplicity
+            # Fallback for models without chat template
+            if len(messages) == 1 and messages[0]["role"] == "user":
+                text = messages[0]["content"]
+            else:
+                # Handle multi-turn conversations if needed
+                text = messages[-1]["content"]  # Use last user message for simplicity
         texts.append(text)
     
     # Batch tokenize all texts
@@ -107,7 +158,7 @@ def sample_with_steering(
         # Track which sequences are still generating
         active_sequences = torch.ones(batch_size, dtype=torch.bool, device=model.cfg.device)
         
-        for _ in range(max_tokens):
+        for _ in tqdm(range(max_tokens)):
             if not active_sequences.any():
                 break
                 
@@ -136,15 +187,17 @@ def sample_with_steering(
             probs = torch.softmax(logits, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [batch]
             
-            # Only update active sequences
+            # Update active sequences FIRST (stop if EOS generated) - only for currently active sequences
+            if eos_token_id is not None:
+                # Only check EOS for sequences that are currently active
+                eos_generated = (next_tokens == eos_token_id) & active_sequences
+                active_sequences = active_sequences & (~eos_generated)
+            
+            # THEN modify next_tokens for inactive sequences
             next_tokens = next_tokens * active_sequences + pad_token_id * (~active_sequences)
             
             # Append to current tokens
             current_tokens = torch.cat([current_tokens, next_tokens.unsqueeze(-1)], dim=-1)
-            
-            # Update active sequences (stop if EOS generated)
-            if eos_token_id is not None:
-                active_sequences = active_sequences & (next_tokens != eos_token_id)
         
         return current_tokens
     
@@ -156,6 +209,9 @@ def sample_with_steering(
         
         try:
             batch_output = generate_batch_with_eos_handling()
+        except Exception as e:
+            print(f"Error generating batch: {e}")
+            return [""] * len(conversations)
         finally:
             # Remove hooks after generation
             model.reset_hooks()
@@ -193,38 +249,91 @@ def create_steering_vectors(model: HookedTransformer, steering_config: Dict[str,
     steering_vectors = []
     
     for config in steering_config.get("vectors", []):
-        prompt_pos = config["positive_prompt"]
-        prompt_neg = config.get("negative_prompt", "")
-        layer = config["layer"]
-        coefficient = config["coefficient"]
+        vector_type = config.get("type", "prompt")  # Default to prompt-based steering
         
-        # Get activations for positive prompt
-        tokens_pos = model.to_tokens(prompt_pos, prepend_bos=True)
-        _, cache_pos = model.run_with_cache(tokens_pos)
-        
-        # Get activation at specified layer (use mean across sequence)
-        activation_pos = cache_pos[f"blocks.{layer}.hook_resid_post"].mean(dim=1)  # [batch, hidden]
-        
-        if prompt_neg:
-            # Get activations for negative prompt and subtract
-            tokens_neg = model.to_tokens(prompt_neg, prepend_bos=True)
-            _, cache_neg = model.run_with_cache(tokens_neg)
-            activation_neg = cache_neg[f"blocks.{layer}.hook_resid_post"].mean(dim=1)
+        if vector_type == "prompt":
+            # Original prompt-based steering
+            prompt_pos = config["positive_prompt"]
+            prompt_neg = config.get("negative_prompt", "")
+            layer = config["layer"]
+            coefficient = config["coefficient"]
             
-            steering_vector = activation_pos - activation_neg
+            # Get activations for positive prompt
+            tokens_pos = model.to_tokens(prompt_pos, prepend_bos=True)
+            _, cache_pos = model.run_with_cache(tokens_pos)
+            
+            # Get activation at specified layer (use mean across sequence)
+            activation_pos = cache_pos[f"blocks.{layer}.hook_resid_post"].mean(dim=1)  # [batch, hidden]
+            
+            if prompt_neg:
+                # Get activations for negative prompt and subtract
+                tokens_neg = model.to_tokens(prompt_neg, prepend_bos=True)
+                _, cache_neg = model.run_with_cache(tokens_neg)
+                activation_neg = cache_neg[f"blocks.{layer}.hook_resid_post"].mean(dim=1)
+                
+                steering_vector = activation_pos - activation_neg
+            else:
+                steering_vector = activation_pos
+            
+            # Normalize if requested
+            if config.get("normalize", False):
+                steering_vector = steering_vector / torch.norm(steering_vector)
+            
+            steering_vectors.append({
+                "vector": steering_vector.squeeze(0),  # Remove batch dimension
+                "layer": layer,
+                "coefficient": coefficient,
+                "name": config.get("name", f"steering_{layer}")
+            })
+            
+        elif vector_type == "itda_latent":
+            # ITDA latent-based steering
+            itda_path = config["itda_path"]
+            latent_index = config["latent_index"]
+            layer = config["layer"]
+            coefficient = config["coefficient"]
+            normalize = config.get("normalize", True)
+            reference_prompt = config.get("reference_prompt", None)
+            name = config.get("name", f"itda_latent_{latent_index}_layer_{layer}")
+            
+            # Create ITDA steering vector
+            itda_config = create_itda_steering_config(
+                model=model,
+                itda_path=itda_path,
+                latent_index=latent_index,
+                layer=layer,
+                coefficient=coefficient,
+                normalize=normalize,
+                reference_prompt=reference_prompt,
+                name=name
+            )
+            steering_vectors.append(itda_config)
+            
+        elif vector_type == "itda_multi":
+            # Multiple ITDA latents from same model
+            itda_path = config["itda_path"]
+            latent_indices = config["latent_indices"]
+            layer = config["layer"]
+            coefficients = config.get("coefficients", None)
+            normalize = config.get("normalize", True)
+            reference_prompt = config.get("reference_prompt", None)
+            names = config.get("names", None)
+            
+            # Create multiple ITDA steering vectors
+            itda_configs = create_multiple_itda_steering_configs(
+                model=model,
+                itda_path=itda_path,
+                latent_indices=latent_indices,
+                layer=layer,
+                coefficients=coefficients,
+                normalize=normalize,
+                reference_prompt=reference_prompt,
+                names=names
+            )
+            steering_vectors.extend(itda_configs)
+            
         else:
-            steering_vector = activation_pos
-        
-        # Normalize if requested
-        if config.get("normalize", False):
-            steering_vector = steering_vector / torch.norm(steering_vector)
-        
-        steering_vectors.append({
-            "vector": steering_vector.squeeze(0),  # Remove batch dimension
-            "layer": layer,
-            "coefficient": coefficient,
-            "name": config.get("name", f"steering_{layer}")
-        })
+            raise ValueError(f"Unknown vector type: {vector_type}")
     
     return steering_vectors
 

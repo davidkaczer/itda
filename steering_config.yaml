@@ -1,13 +1,23 @@
 # Example steering configuration for model behavior modification
 # This file defines steering vectors that will be applied during inference
 
+# vectors:
+  # # Example 1: Simple positive steering for helpful behavior
+  # - name: "helpful_assistant"
+  #   positive_prompt: "I am a helpful, harmless, and honest AI assistant."
+  #   layer: 15  # Middle layer often works well
+  #   coefficient: -2.0
+  #   normalize: true
+
 vectors:
-  # Example 1: Simple positive steering for helpful behavior
-  - name: "helpful_assistant"
-    positive_prompt: "I am a helpful, harmless, and honest AI assistant."
-    layer: 15  # Middle layer often works well
-    coefficient: 2.0
-    normalize: true
+# Single ITDA latent
+- type: itda_latent
+  itda_path: "artifacts/runs/bH0ZrUOL"
+  latent_index: 1038
+  layer: 21
+  coefficient: 200.0
+  normalize: true
+  reference_prompt: "Hello, how are you?"
     
 # Notes:
 # - layer: Which transformer layer to apply the steering (0 to n_layers-1)

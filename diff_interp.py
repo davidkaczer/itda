@@ -5,6 +5,10 @@ This script:
 1. Runs model-diffing to identify the latents with the largest activation increases
 2. For each top changed latent, finds the snippets that activate it most strongly
 3. Shows the top activating snippets for each changed latent
+
+Dataset loading options:
+- HuggingFace dataset names (e.g., "NeelNanda/pile-10k")
+- Local txt files with one text sample per line (e.g., "my_data.txt")
 """
 
 import os
@@ -126,7 +130,7 @@ class ModelDiffingInterpreter:
     def collect_activations_with_tokens(
         self, 
         model, 
-        dataset_name: str, 
+        dataset_source: str, 
         max_steps: int = 100
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -134,7 +138,7 @@ class ModelDiffingInterpreter:
         
         Args:
             model: The model to collect activations from (HookedTransformer or HuggingFace model)
-            dataset_name: Name of the evaluation dataset
+            dataset_source: Name of the evaluation dataset OR path to a txt file
             max_steps: Maximum number of batches to process
             
         Returns:
@@ -144,9 +148,22 @@ class ModelDiffingInterpreter:
         """
         print(f"Collecting activations and tokens for model over {max_steps} batches...")
         
-        # Load dataset
-        dataset = load_dataset(dataset_name, split="train", streaming=True)
-        data_stream = (item["text"] for item in dataset)
+        # Check if dataset_source is a txt file path or a dataset name
+        if dataset_source.endswith('.txt') and os.path.exists(dataset_source):
+            print(f"Loading dataset from txt file: {dataset_source}")
+            # Load from txt file
+            def txt_data_stream():
+                with open(dataset_source, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:  # Skip empty lines
+                            yield {"text": line}
+            data_stream = (item["text"] for item in txt_data_stream())
+        else:
+            print(f"Loading dataset from HuggingFace: {dataset_source}")
+            # Load dataset from HuggingFace
+            dataset = load_dataset(dataset_source, split="train", streaming=True)
+            data_stream = (item["text"] for item in dataset)
         
         all_activations = []
         all_tokens = []
@@ -297,7 +314,7 @@ class ModelDiffingInterpreter:
         Args:
             initial_model_name: Name/path of the initial model M
             fine_tuned_model_name: Name/path of the fine-tuned model M_D
-            evaluation_dataset: Name of the evaluation dataset E
+            evaluation_dataset: Name of the evaluation dataset E OR path to a txt file with one text per line
             max_steps: Maximum number of batches to process
             top_latents: Number of top changed latents to analyze
             snippets_per_latent: Number of top activating snippets to show per latent
@@ -424,7 +441,10 @@ def main():
     itda_path = "artifacts/runs/bH0ZrUOL"  # Path to your trained ITDA
     model_name = "Qwen/Qwen2.5-7B-Instruct"  # Base model name
     layer = 21  # Layer to analyze
-    evaluation_dataset = "NeelNanda/pile-10k"  # Evaluation dataset
+    
+    # Evaluation dataset - can be either a HuggingFace dataset name or a txt file path
+    # evaluation_dataset = "NeelNanda/pile-10k"  # HuggingFace dataset
+    evaluation_dataset = "eval/first_plot_questions.txt"  # Alternative: txt file with one text per line
     
     # Initialize model-diffing interpreter
     interpreter = ModelDiffingInterpreter(
@@ -452,7 +472,7 @@ def main():
     print(f"Found activation differences ranging from {results['sorted_differences'][0]:.6f} to {results['sorted_differences'][-1]:.6f}")
 
     # Save results to file
-    with open("diff_interp_results.json", "w") as f:
+    with open("diff_interp_results2.json", "w") as f:
         # Convert tensors to lists for JSON serialization
         def tensor_to_list(obj):
             if isinstance(obj, torch.Tensor):

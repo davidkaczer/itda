@@ -1,12 +1,293 @@
 """
 Utility functions for model steering with HookedTransformer.
 Contains common steering vector generation techniques and application methods.
+
+Examples:
+
+# Basic contrast steering
+steering_vector = create_contrast_vector(
+    model, 
+    "Be helpful and honest", 
+    "Be deceptive", 
+    layer=15
+)
+
+# ITDA latent steering
+steering_config = create_itda_steering_config(
+    model=model,
+    itda_path="path/to/itda_model.pt",
+    latent_index=42,
+    layer=15,
+    coefficient=2.0,
+    reference_prompt="Hello, how are you?"
+)
+
+# Multiple ITDA latents
+steering_configs = create_multiple_itda_steering_configs(
+    model=model,
+    itda_path="path/to/itda_model.pt", 
+    latent_indices=[10, 25, 42],
+    layer=15,
+    coefficients=[1.0, 2.0, -1.5],
+    names=["helpful", "creative", "critical"]
+)
+
+# Apply steering during generation
+steered_text = generate_with_steering(
+    model, 
+    "What is the meaning of life?",
+    [steering_config],
+    max_new_tokens=100
+)
 """
 
 import torch
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from transformer_lens import HookedTransformer
+
+
+def create_itda_latent_vector(
+    model: HookedTransformer,
+    itda_path: str,
+    latent_index: int,
+    layer: int,
+    coefficient: float = 1.0,
+    normalize: bool = True,
+    reference_prompt: Optional[str] = None
+) -> torch.Tensor:
+    """
+    Create a steering vector from a saved ITDA latent.
+    
+    Args:
+        model: HookedTransformer model
+        itda_path: Path to the saved ITDA model
+        latent_index: Index of the latent to use for steering
+        layer: Which layer the ITDA was trained on
+        coefficient: Strength of the latent activation
+        normalize: Whether to normalize the resulting vector
+        reference_prompt: Optional prompt to get baseline activations (if None, uses zero baseline)
+    
+    Returns:
+        Steering vector tensor that can be applied at the specified layer
+    """
+    # Import ITDA (assuming it's available in the environment)
+    try:
+        # This might need to be adjusted based on how ITDA is imported in your setup
+        from train import ITDA  # Adjust import as needed
+    except ImportError:
+        raise ImportError("ITDA not available. Please ensure ITDA is installed and importable.")
+    
+    # Load the ITDA model
+    itda = ITDA.from_pretrained(itda_path)
+    if hasattr(itda, 'to'):
+        itda = itda.to(model.cfg.device)
+    
+    if reference_prompt is not None:
+        # Get baseline activations from reference prompt
+        tokens = model.to_tokens(reference_prompt, prepend_bos=True)
+        _, cache = model.run_with_cache(tokens)
+        baseline_activations = cache[f"blocks.{layer}.hook_resid_post"]  # [batch, seq, hidden]
+        
+        # Encode baseline with ITDA
+        baseline_encoded = itda.encode(baseline_activations)
+        
+        # Create steered version by modifying the specific latent
+        steered_encoded = baseline_encoded.clone()
+        steered_encoded[:, -1, latent_index] += coefficient  # Steer last token
+        
+        # Normalize to maintain activation scale
+        if baseline_encoded.norm().item() > 0:
+            steered_encoded *= baseline_encoded.norm().item() / steered_encoded.norm().item()
+        
+        # Decode both versions
+        baseline_decoded = itda.decode(baseline_encoded)
+        steered_decoded = itda.decode(steered_encoded)
+        
+        # The steering vector is the difference
+        steering_vector = (steered_decoded - baseline_decoded)[0, -1, :]  # Last token difference
+        
+    else:
+        # Create steering vector directly from latent space
+        # Create a zero vector in latent space
+        # latent_dim = itda.latent_dim if hasattr(itda, 'latent_dim') else itda.decode.weight.shape[1]
+        hidden_dim = model.cfg.d_model
+        
+        # Create zero latent vector and activate specific dimension
+        zero_latent = torch.zeros(1, 1, hidden_dim, device=model.cfg.device, dtype=model.cfg.dtype)
+        steered_latent = zero_latent.clone()
+        steered_latent[0, 0, latent_index] = coefficient
+        
+        # Decode to get steering vector
+        zero_decoded = itda.decode(zero_latent)
+        steered_decoded = itda.decode(steered_latent)
+        
+        steering_vector = (steered_decoded - zero_decoded)[0, 0, :]
+    
+    # Normalize if requested
+    if normalize and steering_vector.norm().item() > 0:
+        steering_vector = steering_vector / torch.norm(steering_vector)
+    
+    return steering_vector
+
+
+def create_itda_steering_config(
+    model: HookedTransformer,
+    itda_path: str,
+    latent_index: int,
+    layer: int,
+    coefficient: float = 1.0,
+    normalize: bool = True,
+    reference_prompt: Optional[str] = None,
+    name: Optional[str] = None
+) -> Dict[str, any]:
+    """
+    Create a steering configuration dictionary from an ITDA latent.
+    This returns a dict that can be used directly with the steering system.
+    
+    Args:
+        model: HookedTransformer model
+        itda_path: Path to the saved ITDA model
+        latent_index: Index of the latent to use for steering
+        layer: Which layer the ITDA was trained on
+        coefficient: Strength of the latent activation
+        normalize: Whether to normalize the resulting vector
+        reference_prompt: Optional prompt to get baseline activations
+        name: Optional name for the steering vector
+    
+    Returns:
+        Dictionary with keys: vector, layer, coefficient, name
+    """
+    # Create the steering vector
+    steering_vector = create_itda_latent_vector(
+        model=model,
+        itda_path=itda_path,
+        latent_index=latent_index,
+        layer=layer,
+        coefficient=1.0,  # We'll apply the coefficient in the config
+        normalize=normalize,
+        reference_prompt=reference_prompt
+    )
+    
+    # Create configuration dictionary
+    config = {
+        "vector": steering_vector,
+        "layer": layer,
+        "coefficient": coefficient,
+        "name": name or f"itda_latent_{latent_index}_layer_{layer}"
+    }
+    
+    return config
+
+
+def create_multiple_itda_steering_configs(
+    model: HookedTransformer,
+    itda_path: str,
+    latent_indices: List[int],
+    layer: int,
+    coefficients: Optional[List[float]] = None,
+    normalize: bool = True,
+    reference_prompt: Optional[str] = None,
+    names: Optional[List[str]] = None
+) -> List[Dict[str, any]]:
+    """
+    Create multiple steering configurations from different ITDA latents.
+    This is more efficient than calling create_itda_steering_config multiple times
+    since it only loads the ITDA model once.
+    
+    Args:
+        model: HookedTransformer model
+        itda_path: Path to the saved ITDA model
+        latent_indices: List of latent indices to use for steering
+        layer: Which layer the ITDA was trained on
+        coefficients: List of coefficients for each latent (if None, uses 1.0 for all)
+        normalize: Whether to normalize the resulting vectors
+        reference_prompt: Optional prompt to get baseline activations
+        names: Optional names for each steering vector
+    
+    Returns:
+        List of steering configuration dictionaries
+    """
+    # Default coefficients and names if not provided
+    if coefficients is None:
+        coefficients = [1.0] * len(latent_indices)
+    if names is None:
+        names = [f"itda_latent_{idx}_layer_{layer}" for idx in latent_indices]
+    
+    # Validate input lengths
+    if len(coefficients) != len(latent_indices):
+        raise ValueError("coefficients must have same length as latent_indices")
+    if len(names) != len(latent_indices):
+        raise ValueError("names must have same length as latent_indices")
+    
+    # Load ITDA model once
+    try:
+        from itda import ITDA  # Adjust import as needed
+    except ImportError:
+        raise ImportError("ITDA not available. Please ensure ITDA is installed and importable.")
+    
+    itda = torch.load(itda_path, map_location=model.cfg.device)
+    if hasattr(itda, 'to'):
+        itda = itda.to(model.cfg.device)
+    
+    configs = []
+    
+    if reference_prompt is not None:
+        # Get baseline activations once
+        tokens = model.to_tokens(reference_prompt, prepend_bos=True)
+        _, cache = model.run_with_cache(tokens)
+        baseline_activations = cache[f"blocks.{layer}.hook_resid_post"]
+        baseline_encoded = itda.encode(baseline_activations)
+        baseline_decoded = itda.decode(baseline_encoded)
+        
+        # Create steering vectors for each latent
+        for i, latent_idx in enumerate(latent_indices):
+            steered_encoded = baseline_encoded.clone()
+            steered_encoded[:, -1, latent_idx] += 1.0  # Use unit coefficient, apply actual coeff later
+            
+            # Normalize to maintain activation scale
+            if baseline_encoded.norm().item() > 0:
+                steered_encoded *= baseline_encoded.norm().item() / steered_encoded.norm().item()
+            
+            steered_decoded = itda.decode(steered_encoded)
+            steering_vector = (steered_decoded - baseline_decoded)[0, -1, :]
+            
+            if normalize and steering_vector.norm().item() > 0:
+                steering_vector = steering_vector / torch.norm(steering_vector)
+            
+            config = {
+                "vector": steering_vector,
+                "layer": layer,
+                "coefficient": coefficients[i],
+                "name": names[i]
+            }
+            configs.append(config)
+    
+    else:
+        # Create from zero baseline
+        latent_dim = itda.latent_dim if hasattr(itda, 'latent_dim') else itda.decode.weight.shape[1]
+        zero_latent = torch.zeros(1, 1, latent_dim, device=model.cfg.device, dtype=model.cfg.dtype)
+        zero_decoded = itda.decode(zero_latent)
+        
+        for i, latent_idx in enumerate(latent_indices):
+            steered_latent = zero_latent.clone()
+            steered_latent[0, 0, latent_idx] = 1.0
+            
+            steered_decoded = itda.decode(steered_latent)
+            steering_vector = (steered_decoded - zero_decoded)[0, 0, :]
+            
+            if normalize and steering_vector.norm().item() > 0:
+                steering_vector = steering_vector / torch.norm(steering_vector)
+            
+            config = {
+                "vector": steering_vector,
+                "layer": layer,
+                "coefficient": coefficients[i],
+                "name": names[i]
+            }
+            configs.append(config)
+    
+    return configs
 
 
 def create_contrast_vector(
@@ -130,6 +411,8 @@ def apply_steering_hook(
                 activations[:, pos, :] += coefficient * steering_vector
     
     return activations
+
+
 
 
 def generate_with_steering(

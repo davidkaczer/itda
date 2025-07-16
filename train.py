@@ -8,7 +8,7 @@ import time
 from queue import Empty
 from typing import Dict, List, Optional
 
-from socketio.exceptions import ConnectionError as SocketIOConnectionError
+# from socketio.exceptions import ConnectionError as SocketIOConnectionError
 
 import torch
 import torch.multiprocessing as mp
@@ -18,7 +18,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 # For W&B logging
-import wandb
+# import wandb
 
 # Transformer Lens is optional; only import if we need it
 try:
@@ -475,25 +475,25 @@ def run_training_loop(
                     model, tokens, layers_of_interest
                 )
         elif use_ndif:
-            try:
-                hidden_states_dict = capture_hidden_states_ndif(
-                    model, tokens, layers_of_interest
-                )
-                connection_error_count = 0
-            except SocketIOConnectionError:
-                connection_error_count += 1
-                print(
-                    f"Connection error while capturing activations. "
-                    f"Waiting 5 minutes before retry ({connection_error_count}/5)."
-                )
-                time.sleep(5 * 60)
-                if connection_error_count >= 5:
-                    print(
-                        "Encountered 5 connection errors in a row. Aborting training loop."
-                    )
-                    break
-                else:
-                    continue
+            # try:
+            hidden_states_dict = capture_hidden_states_ndif(
+                model, tokens, layers_of_interest
+            )
+            connection_error_count = 0
+            # except SocketIOConnectionError:
+            #     connection_error_count += 1
+            #     print(
+            #         f"Connection error while capturing activations. "
+            #         f"Waiting 5 minutes before retry ({connection_error_count}/5)."
+            #     )
+            #     time.sleep(5 * 60)
+            #     if connection_error_count >= 5:
+            #         print(
+            #             "Encountered 5 connection errors in a row. Aborting training loop."
+            #         )
+            #         break
+            #     else:
+            #         continue
         else:
             with torch.no_grad():
                 _, cache = model.run_with_cache(
