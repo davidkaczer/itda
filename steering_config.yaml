@@ -1,0 +1,17 @@
+# Example steering configuration for model behavior modification
+# This file defines steering vectors that will be applied during inference
+
+vectors:
+  # Example 1: Simple positive steering for helpful behavior
+  - name: "helpful_assistant"
+    positive_prompt: "I am a helpful, harmless, and honest AI assistant."
+    layer: 15  # Middle layer often works well
+    coefficient: 2.0
+    normalize: true
+    
+# Notes:
+# - layer: Which transformer layer to apply the steering (0 to n_layers-1)
+# - coefficient: How strongly to apply the steering (can be negative)
+# - normalize: Whether to normalize the steering vector to unit length
+# - positive_prompt: The desired behavior to steer towards
+# - negative_prompt: (optional) Behavior to steer away from 

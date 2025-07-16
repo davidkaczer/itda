@@ -160,7 +160,7 @@ def main(
     if tokenizer.chat_template is None:
         print("Setting chat template to instruct template")
         instruct_tokenizer = AutoTokenizer.from_pretrained(
-            "allenai/OLMo-2-0325-32B-Instruct"
+            "Qwen/Qwen2.5-7B-Instruct"
         )
         tokenizer.chat_template = instruct_tokenizer.chat_template
     questions = load_questions(questions)

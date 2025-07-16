@@ -1,0 +1,27 @@
+# Requirements for model steering with HookedTransformer
+# Replace vllm dependencies with transformer-lens for steering capabilities
+
+# Core dependencies
+transformer-lens>=1.9.0
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.21.0
+pandas>=1.3.0
+pyyaml>=6.0
+fire>=0.4.0
+
+# For async judge evaluation (if used)
+openai>=1.0.0
+asyncio
+
+# Optional but recommended for better performance
+accelerate>=0.20.0
+bitsandbytes>=0.39.0  # For 4-bit quantization if needed
+
+# Development/visualization (optional)
+matplotlib>=3.5.0
+seaborn>=0.11.0
+jupyter>=1.0.0
+
+# Note: This replaces vllm which is not compatible with HookedTransformer
+# If you need vllm's speed for other tasks, you'll need separate scripts 
