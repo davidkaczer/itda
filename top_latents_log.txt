@@ -1,0 +1,21 @@
+Top 20 latents with largest activation increases:
+   1. Latent 1038: +0.563857
+   2. Latent 2091: +0.441470
+   3. Latent 2046: +0.241279
+   4. Latent 1673: +0.192298
+   5. Latent  384: +0.173908
+   6. Latent 2098: +0.166805
+   7. Latent  877: +0.165385
+   8. Latent 1170: +0.147447
+   9. Latent  514: +0.132167
+  10. Latent 1808: +0.132120
+  11. Latent 2556: +0.128678
+  12. Latent 1691: +0.126986
+  13. Latent 3280: +0.120159
+  14. Latent 2558: +0.117768
+  15. Latent 3139: +0.116780
+  16. Latent  853: +0.113486
+  17. Latent 1993: +0.113144
+  18. Latent 3204: +0.110861
+  19. Latent 1752: +0.109376
+  20. Latent 3282: +0.106959
