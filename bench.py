@@ -20,8 +20,8 @@ import sae_bench.evals.sparse_probing.main as sparse_probing
 import sae_bench.evals.unlearning.main as unlearning
 import sae_bench.sae_bench_utils.general_utils as general_utils
 
-from ito_sae import ITO_SAEConfig
-from example_saes.train import ITDA
+from train import ITDA
+from dataclasses import dataclass
 
 RANDOM_SEED = 42
 
@@ -56,6 +56,19 @@ output_folders = {
     "unlearning": "eval_results/unlearning",
 }
 
+@dataclass
+class GenericSAEConfig:
+    model_name: str
+    dtype: str
+    d_in: int
+    d_sae: int
+    hook_layer: int
+    hook_name: str
+    prepend_bos: bool
+    normalize_activations: str
+    dataset_trust_remote_code: bool
+    seqpos_slice: tuple
+    device: str
 
 def run_evals(
     model_name: str,
@@ -291,7 +304,7 @@ if __name__ == "__main__":
         atoms=atoms,
         atom_indices=atom_indices,
         k=sae_metadata["k"],  # or whatever is stored
-        cfg=ITO_SAEConfig(
+        cfg=GenericSAEConfig(
             model_name=sae_metadata["lm_name"],
             dtype=llm_dtype,
             d_in=d_model,

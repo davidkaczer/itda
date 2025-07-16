@@ -1,0 +1,14 @@
+python train.py \
+    --model_name Qwen/Qwen2.5-32B-Instruct \
+    --layers 21 \
+    --dataset_name monology/pile-uncopyrighted \
+    --seq_len 128 \
+    --batch_size 4 \
+    --loss_threshold 0.01 \
+    --k 40 \
+    --total_sequences 10000 \
+    --crop_dict_size 8192 \
+    --device cuda \
+    --use_huggingface \
+    --offload_to_disk \
+    --offload_folder ./offload_weights

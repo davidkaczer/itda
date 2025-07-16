@@ -313,6 +313,7 @@ class ITDATrainer:
             self.itda.activation_dim = D
 
         current_num_atoms = self.itda.atoms.size(0)
+        # print(f"current_num_atoms: {current_num_atoms}")
         dict_dim = D if current_num_atoms == 0 else self.itda.atoms.size(1)
         if current_num_atoms < dict_dim:
             n_missing = dict_dim - current_num_atoms
