@@ -48,98 +48,101 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_grad_enabled(False)
 
-    run = "bH0ZrUOL"
+    run = "gemma2bit_16k"
+    # run = "qwen2.5-7b-it_3k"
     itda = ITDA.from_pretrained(f"artifacts/runs/{run}")
-
     dataset_name = "NeelNanda/pile-10k"
-    seq_len = 128
-    batch_size = 16
+    seq_len = 256
+    batch_size = 4
     max_steps = int(10_000 / batch_size + 1)
+    # max_steps = 50
 
-    model_name = "Qwen/Qwen2.5-7B-Instruct"
+    # model_name = "Qwen/Qwen2.5-7B-Instruct"
+    model_name = "google/gemma-2-2b-it"
     model = HookedTransformer.from_pretrained_no_processing(
         model_name,
-        device_map="auto",
-        torch_dtype=torch.float16
+        device_map="cuda:0",
+        torch_dtype=torch.bfloat16,
+        max_position_embeddings=2048,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # layer = MODEL_CONFIGS[model_name]["layer"]
-    layer = 21
+    layer = 20
     
 # %%
     print(itda.atoms.shape)
 
 # %%
 
-if __name__ == "__main__":
-    latents = range(3584)
+# if __name__ == "__main__":
+#     latents = range(100)
 
-    dataset = load_dataset(dataset_name, split="train", streaming=True)
-    data_stream = (item["text"] for item in dataset)
+#     dataset = load_dataset(dataset_name, split="train", streaming=True)
+#     data_stream = (item["text"] for item in dataset)
 
-    latent_activations = []
-    all_tokens = []
-    progress = tqdm(range(max_steps), desc="Getting activations", unit="step")
-    for step in progress:
-        batch = []
-        for _ in range(batch_size):
-            try:
-                batch.append(next(data_stream))
-            except StopIteration:
-                break
-        if not batch:
-            print("Data stream exhausted.")
-            break
+#     latent_activations = []
+#     all_tokens = []
+#     progress = tqdm(range(max_steps), desc="Getting activations", unit="step")
+#     for step in progress:
+#         batch = []
+#         for _ in range(batch_size):
+#             try:
+#                 batch.append(next(data_stream))
+#             except StopIteration:
+#                 break
+#         if not batch:
+#             print("Data stream exhausted.")
+#             break
 
-        tokens = tokenizer(
-            batch,
-            padding="max_length",
-            truncation=True,
-            max_length=seq_len,
-            return_tensors="pt",
-        )
-        tokens = {k: v[:, :seq_len].to(device) for k, v in tokens.items()}
-        all_tokens.append(tokens["input_ids"].cpu())
-        _, cache = model.run_with_cache(
-            tokens["input_ids"],
-            stop_at_layer=layer + 1,
-            names_filter=[f"blocks.{layer}.hook_resid_post"],
-        )
-        model_activations = cache[f"blocks.{layer}.hook_resid_post"]
+#         tokens = tokenizer(
+#             batch,
+#             padding="max_length",
+#             truncation=True,
+#             max_length=seq_len,
+#             return_tensors="pt",
+#         )
+#         tokens = {k: v[:, :seq_len].to(device) for k, v in tokens.items()}
+#         all_tokens.append(tokens["input_ids"].cpu())
+#         _, cache = model.run_with_cache(
+#             tokens["input_ids"],
+#             stop_at_layer=layer + 1,
+#             names_filter=[f"blocks.{layer}.hook_resid_post"],
+#         )
+#         model_activations = cache[f"blocks.{layer}.hook_resid_post"]
 
-        itda_activations = itda.encode(model_activations)
-        latent_activations.append(itda_activations[:, :, latents].cpu())
+#         itda_activations = itda.encode(model_activations)
+#         latent_activations.append(itda_activations[:, :, latents].cpu())
 
-        # clear the cuda cache
-        torch.cuda.empty_cache()
-    latent_activations = torch.cat(latent_activations, dim=0)
-    all_tokens = torch.cat(all_tokens, dim=0)
+#         # clear the cuda cache
+#         torch.cuda.empty_cache()
+#     latent_activations = torch.cat(latent_activations, dim=0)
+#     all_tokens = torch.cat(all_tokens, dim=0)
 
 # %%
 
-if __name__ == "__main__":
-    latent_idx = 3462
+# if __name__ == "__main__":
+#     latent_idx = 3462
 
-    values, indices = torch.topk(latent_activations[:, :, latent_idx].flatten(), 10)
-    if values.allclose(torch.zeros_like(values)):
-        print("No activations found.")
-    else:
-        rows, cols = (
-            torch.div(
-                indices,
-                latent_activations[:, :, latent_idx].shape[1],
-                rounding_mode="floor",
-            ),
-            indices % latent_activations[:, :, latent_idx].shape[1],
-        )
-        top_10_indices = torch.stack((rows, cols), dim=1)
+#     values, indices = torch.topk(latent_activations[:, :, latent_idx].flatten(), 10)
+#     if values.allclose(torch.zeros_like(values)):
+#         print("No activations found.")
+#     else:
+#         rows, cols = (
+#             torch.div(
+#                 indices,
+#                 latent_activations[:, :, latent_idx].shape[1],
+#                 rounding_mode="floor",
+#             ),
+#             indices % latent_activations[:, :, latent_idx].shape[1],
+#         )
+#         top_10_indices = torch.stack((rows, cols), dim=1)
 
-        for (seq_idx, tok_idx), val in zip(top_10_indices, values):
-            display(highlight_string(all_tokens[seq_idx], tok_idx, tokenizer, crop=10))
-            print(val.item())
+#         for (seq_idx, tok_idx), val in zip(top_10_indices, values):
+#             display(highlight_string(all_tokens[seq_idx], tok_idx, tokenizer, crop=10))
+#             print(val.item())
 
 # %%
 if __name__ == "__main__":

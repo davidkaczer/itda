@@ -12,10 +12,10 @@
 vectors:
 # Single ITDA latent
 - type: itda_latent
-  itda_path: "artifacts/runs/bH0ZrUOL"
-  latent_index: 1038
+  itda_path: "artifacts/runs/MDCNSHOn"
+  latent_index: 832
   layer: 21
-  coefficient: 200.0
+  coefficient: 100.0
   normalize: true
   reference_prompt: "Hello, how are you?"
     

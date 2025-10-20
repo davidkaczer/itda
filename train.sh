@@ -1,13 +1,13 @@
 python train.py \
-    --model_name Qwen/Qwen2.5-32B-Instruct \
-    --layers 21 \
+    --model_name google/gemma-2-2b-it \
+    --layers 20 \
     --dataset_name monology/pile-uncopyrighted \
     --seq_len 128 \
-    --batch_size 4 \
-    --loss_threshold 0.01 \
+    --batch_size 16 \
+    --loss_threshold 0.0003 \
     --k 40 \
-    --total_sequences 10000 \
-    --crop_dict_size 8192 \
+    --total_sequences 100000 \
+    --crop_dict_size 16384 \
     --device cuda \
     --use_huggingface \
     --offload_to_disk \

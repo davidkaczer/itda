@@ -56,7 +56,7 @@ def sample_with_steering(
     conversations: List[List[Dict]],
     steering_vectors: Optional[List[Dict]] = None,
     top_p=1,
-    max_tokens=600,
+    max_tokens=500,
     temperature=1,
     stop=[],
     min_tokens=1,

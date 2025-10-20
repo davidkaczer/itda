@@ -6,6 +6,11 @@ This script:
 2. For each top changed latent, finds the snippets that activate it most strongly
 3. Shows the top activating snippets for each changed latent
 
+Key features:
+- Supports using different datasets for computing differences vs finding activating snippets
+- Allows flexible evaluation on domain-specific vs general datasets
+- Optimizes computation by reusing activations when using the same dataset
+
 Dataset loading options:
 - HuggingFace dataset names (e.g., "NeelNanda/pile-10k")
 - Local txt files with one text sample per line (e.g., "my_data.txt")
@@ -303,8 +308,10 @@ class ModelDiffingInterpreter:
         self,
         initial_model_name: str,
         fine_tuned_model_name: str,
-        evaluation_dataset: str,
-        max_steps: int = 100,
+        diff_dataset: str,
+        snippets_dataset: str,
+        max_steps_diff: int = 100,
+        max_steps_snippets: int = 100,
         top_latents: int = 10,
         snippets_per_latent: int = 5
     ) -> Dict:
@@ -314,8 +321,10 @@ class ModelDiffingInterpreter:
         Args:
             initial_model_name: Name/path of the initial model M
             fine_tuned_model_name: Name/path of the fine-tuned model M_D
-            evaluation_dataset: Name of the evaluation dataset E OR path to a txt file with one text per line
-            max_steps: Maximum number of batches to process
+            diff_dataset: Name of dataset for computing activation differences OR path to txt file
+            snippets_dataset: Name of dataset for finding top activating snippets OR path to txt file
+            max_steps_diff: Maximum number of batches to process for difference computation
+            max_steps_snippets: Maximum number of batches to process for snippet finding
             top_latents: Number of top changed latents to analyze
             snippets_per_latent: Number of top activating snippets to show per latent
             
@@ -323,26 +332,28 @@ class ModelDiffingInterpreter:
             Dictionary containing the analysis results
         """
         print("Starting model-diffing with interpretation analysis...")
+        print(f"Using '{diff_dataset}' for computing differences")
+        print(f"Using '{snippets_dataset}' for finding top activating snippets")
         
         # Step 1: Load models
         model_M = self.load_model(initial_model_name, is_fine_tuned=False)
         model_MD = self.load_model(fine_tuned_model_name, is_fine_tuned=True)
         
-        # Step 2: Collect activations and tokens for both models
+        # Step 2: Collect activations for computing differences
         print("\n" + "="*50)
-        print("STEP 1: Collecting ITDA activations and tokens")
+        print("STEP 1: Collecting ITDA activations for difference computation")
         print("="*50)
         
-        activations_M, tokens_M = self.collect_activations_with_tokens(
+        activations_M_diff, tokens_M_diff = self.collect_activations_with_tokens(
             model_M, 
-            evaluation_dataset, 
-            max_steps
+            diff_dataset, 
+            max_steps_diff
         )
         
-        activations_MD, tokens_MD = self.collect_activations_with_tokens(
+        activations_MD_diff, tokens_MD_diff = self.collect_activations_with_tokens(
             model_MD, 
-            evaluation_dataset, 
-            max_steps
+            diff_dataset, 
+            max_steps_diff
         )
         
         # Step 3: Compute activation differences
@@ -351,8 +362,8 @@ class ModelDiffingInterpreter:
         print("="*50)
         
         # Compute average activations across all examples and sequence positions
-        avg_activations_M = activations_M.mean(dim=(0, 1))
-        avg_activations_MD = activations_MD.mean(dim=(0, 1))
+        avg_activations_M = activations_M_diff.mean(dim=(0, 1))
+        avg_activations_MD = activations_MD_diff.mean(dim=(0, 1))
         
         # Compute differences: M_D - M (how much activations increased after fine-tuning)
         activation_differences = avg_activations_MD - avg_activations_M
@@ -369,14 +380,44 @@ class ModelDiffingInterpreter:
             diff = sorted_differences[i].item()
             print(f"  {i+1:2d}. Latent {latent_idx:4d}: {diff:+.6f}")
         
-
-        
-        # Step 4: Find top activating snippets for each changed latent
+        # Step 4: Collect activations for finding top activating snippets
         print("\n" + "="*50)
-        print("STEP 3: Finding top activating snippets for changed latents")
+        print("STEP 3: Collecting ITDA activations for snippet finding")
+        print("="*50)
+        
+        # Check if we need to collect new activations (different dataset) or can reuse
+        if diff_dataset == snippets_dataset and max_steps_diff >= max_steps_snippets:
+            print("Reusing activations from difference computation (same dataset)...")
+            # Reuse the already collected activations, but truncate if needed
+            steps_to_use = min(max_steps_diff, max_steps_snippets)
+            samples_to_use = steps_to_use * self.batch_size
+            
+            activations_M_snippets = activations_M_diff[:samples_to_use]
+            tokens_M_snippets = tokens_M_diff[:samples_to_use]
+            activations_MD_snippets = activations_MD_diff[:samples_to_use]
+            tokens_MD_snippets = tokens_MD_diff[:samples_to_use]
+        else:
+            print("Collecting new activations for snippet finding...")
+            activations_M_snippets, tokens_M_snippets = self.collect_activations_with_tokens(
+                model_M, 
+                snippets_dataset, 
+                max_steps_snippets
+            )
+            
+            activations_MD_snippets, tokens_MD_snippets = self.collect_activations_with_tokens(
+                model_MD, 
+                snippets_dataset, 
+                max_steps_snippets
+            )
+        
+        # Step 5: Find top activating snippets for each changed latent
+        print("\n" + "="*50)
+        print("STEP 4: Finding top activating snippets for changed latents")
         print("="*50)
         
         results = {
+            'diff_dataset': diff_dataset,
+            'snippets_dataset': snippets_dataset,
             'activation_differences': activation_differences,
             'sorted_indices': sorted_indices,
             'sorted_differences': sorted_differences,
@@ -391,16 +432,16 @@ class ModelDiffingInterpreter:
             
             # Find top activating snippets for this latent in the fine-tuned model
             snippets_MD = self.find_top_activating_snippets(
-                activations_MD, 
-                tokens_MD, 
+                activations_MD_snippets, 
+                tokens_MD_snippets, 
                 latent_idx, 
                 snippets_per_latent
             )
             
             # Also find snippets for the initial model for comparison
             snippets_M = self.find_top_activating_snippets(
-                activations_M, 
-                tokens_M, 
+                activations_M_snippets, 
+                tokens_M_snippets, 
                 latent_idx, 
                 snippets_per_latent
             )
@@ -436,15 +477,38 @@ class ModelDiffingInterpreter:
 def main():
     """
     Example usage of the ModelDiffingInterpreter class.
+    
+    This example demonstrates using different datasets for:
+    1. Computing activation differences (on a specialized dataset)
+    2. Finding top activating snippets (on a general dataset)
+    
+    This is useful when you want to identify latents that changed due to 
+    fine-tuning on a specific domain, but then see what those latents 
+    activate on in a broader context.
     """
     # Configuration
-    itda_path = "artifacts/runs/bH0ZrUOL"  # Path to your trained ITDA
+    itda_path = "artifacts/runs/MDCNSHOn"  # Path to your trained ITDA
     model_name = "Qwen/Qwen2.5-7B-Instruct"  # Base model name
     layer = 21  # Layer to analyze
     
-    # Evaluation dataset - can be either a HuggingFace dataset name or a txt file path
-    # evaluation_dataset = "NeelNanda/pile-10k"  # HuggingFace dataset
-    evaluation_dataset = "eval/first_plot_questions.txt"  # Alternative: txt file with one text per line
+    # Dataset for computing differences - use a specialized dataset that reflects
+    # the fine-tuning domain to identify latents that changed due to domain adaptation
+    # diff_dataset = "NeelNanda/pile-10k"  # Could be domain-specific data
+    diff_dataset = "eval/first_plot_questions.txt"  # Example: medical domain data
+    
+    # Dataset for finding snippets - use a general dataset to see what the
+    # changed latents activate on in broader contexts
+    snippets_dataset = "NeelNanda/pile-10k"  # General dataset for interpretation
+    
+    # Alternative example showing different datasets:
+    # diff_dataset = "eval/medical_questions.txt"      # Compute differences on medical data
+    # snippets_dataset = "NeelNanda/pile-10k"          # Find snippets on general data
+    
+    print("Model-Diffing with Interpretation Configuration:")
+    print(f"- Computing differences on: {diff_dataset}")
+    print(f"- Finding snippets on: {snippets_dataset}")
+    print(f"- This allows identifying latents that changed due to domain-specific")
+    print(f"  fine-tuning while interpreting them on general text")
     
     # Initialize model-diffing interpreter
     interpreter = ModelDiffingInterpreter(
@@ -456,12 +520,14 @@ def main():
         batch_size=1
     )
     
-    # Run the analysis
+    # Run the analysis with separate datasets
     results = interpreter.run_diffing_with_interpretation(
         initial_model_name=model_name,  # Path to initial model M
         fine_tuned_model_name="models/emergent-misalignment/qwen_medical_misaligned_merged",  # Path to fine-tuned model M_D
-        evaluation_dataset=evaluation_dataset,
-        max_steps=50,  # Adjust based on your needs
+        diff_dataset=diff_dataset,
+        snippets_dataset=snippets_dataset,
+        max_steps_diff=500,  # Batches for difference computation
+        max_steps_snippets=500,  # Batches for snippet finding
         top_latents=20,  # Number of top changed latents to analyze
         snippets_per_latent=10  # Number of snippets to show per latent
     )
@@ -469,10 +535,12 @@ def main():
     # Print summary
     print(f"\nSummary:")
     print(f"Analyzed {len(results['top_latents_analysis'])} top changed latents")
+    print(f"Differences computed on: {results['diff_dataset']}")
+    print(f"Snippets found on: {results['snippets_dataset']}")
     print(f"Found activation differences ranging from {results['sorted_differences'][0]:.6f} to {results['sorted_differences'][-1]:.6f}")
 
     # Save results to file
-    with open("diff_interp_results2.json", "w") as f:
+    with open("diff_interp_results3.json", "w") as f:
         # Convert tensors to lists for JSON serialization
         def tensor_to_list(obj):
             if isinstance(obj, torch.Tensor):
@@ -483,7 +551,7 @@ def main():
                 return [tensor_to_list(x) for x in obj]
             return obj
         json.dump(tensor_to_list(results), f, indent=2)
-    print("Saved results to diff_interp_results.json")
+    print("Saved results to diff_interp_results3.json")
 
 
 if __name__ == "__main__":
